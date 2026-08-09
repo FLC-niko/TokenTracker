@@ -1062,6 +1062,10 @@ async function* readCodexObjects(filePath, diagnostics, fileIndex, options = {})
   yield* reader(filePath, diagnostics, fileIndex, options);
 }
 
+function isRecoverableGroupedReadError(error) {
+  return ["ENOENT", "EACCES", "EPERM", "EISDIR", "EIO", "ESTALE"].includes(error?.code);
+}
+
 async function* iterateCodexObjects(filePaths, diagnostics, options = {}) {
   if (filePaths.length <= 1) {
     for await (const record of readCodexObjects(filePaths[0], diagnostics, 0, options)) {
@@ -1075,11 +1079,18 @@ async function* iterateCodexObjects(filePaths, diagnostics, options = {}) {
   // suppress byte-semantically identical records from different files so the
   // cumulative baseline is established exactly once.
   const records = [];
+  let scannedFiles = 0;
   for (let fileIndex = 0; fileIndex < filePaths.length; fileIndex += 1) {
-    for await (const record of readCodexObjects(filePaths[fileIndex], diagnostics, fileIndex)) {
-      records.push(record);
+    try {
+      for await (const record of readCodexObjects(filePaths[fileIndex], diagnostics, fileIndex)) {
+        records.push(record);
+      }
+      scannedFiles += 1;
+    } catch (error) {
+      if (!isRecoverableGroupedReadError(error)) throw error;
     }
   }
+  if (!scannedFiles) throw new Error("all grouped Codex rollout files failed during read");
   records.sort((a, b) => {
     const aTimestamp = typeof a.obj?.timestamp === "string" ? a.obj.timestamp : "";
     const bTimestamp = typeof b.obj?.timestamp === "string" ? b.obj.timestamp : "";

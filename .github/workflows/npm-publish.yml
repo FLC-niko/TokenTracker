@@ -48,6 +48,8 @@ jobs:
           echo "version=$PACKAGE_VERSION" >> "$GITHUB_OUTPUT"
           PARENT_VERSION=$(git show HEAD^:package.json 2>/dev/null | node -e \
             "let s='';process.stdin.on('data',d=>s+=d).on('end',()=>{const v=JSON.parse(s).version;if(typeof v!=='string'||!v)throw new Error('parent package version is missing');process.stdout.write(v)})")
+          node -e "const {assertReleaseVersion}=require('./scripts/version-files.cjs');assertReleaseVersion(process.argv[1],'package.json version');assertReleaseVersion(process.argv[2],'parent package.json version')" \
+            "$PACKAGE_VERSION" "$PARENT_VERSION"
           if [ "$PARENT_VERSION" = "$PACKAGE_VERSION" ]; then
             echo "eligible=false" >> "$GITHUB_OUTPUT"
             echo "package.json version did not change in this tested commit; skipping publish."

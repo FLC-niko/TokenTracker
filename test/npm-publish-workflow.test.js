@@ -2,6 +2,7 @@ const assert = require("node:assert/strict");
 const { test } = require("node:test");
 const fs = require("node:fs");
 const path = require("node:path");
+const { assertReleaseVersion } = require("../scripts/version-files.cjs");
 
 const WORKFLOW_PATH = path.join(
   __dirname,
@@ -98,6 +99,11 @@ test("workflow checks version before publishing", () => {
     content.includes("npm registry lookup failed without a confirmed E404"),
     "other registry failures must stop publication",
   );
+  assert.ok(
+    content.includes("assertReleaseVersion(process.argv[1]") &&
+      content.includes("assertReleaseVersion(process.argv[2]"),
+    "current and parent package versions must be validated before npm lookup",
+  );
 });
 
 test("workflow skip notices are reason-specific and avoid expression injection", () => {
@@ -109,6 +115,14 @@ test("workflow skip notices are reason-specific and avoid expression injection",
     !content.includes('run: echo "v${{ steps.version-check.outputs.version }}'),
     "step outputs must not be interpolated directly into shell source",
   );
+});
+
+test("publish version validation rejects malformed current and parent versions", () => {
+  assert.equal(assertReleaseVersion("0.88.3", "current"), "0.88.3");
+  for (const invalid of ["", "v0.88.3", "0.88", "0.88.3-beta.1", "01.2.3"]) {
+    assert.throws(() => assertReleaseVersion(invalid, "current"), /stable x\.y\.z/);
+    assert.throws(() => assertReleaseVersion(invalid, "parent"), /stable x\.y\.z/);
+  }
 });
 
 test("workflow builds dashboard before publish", () => {

@@ -1,4 +1,5 @@
 use std::fs;
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::sync::Mutex;
@@ -111,6 +112,9 @@ fn run_command_with_timeout(
     description: &str,
     timeout: Duration,
 ) -> Result<Output, String> {
+    // xdg-mime is commonly a shell script. Isolate its whole process tree so
+    // timing out the parent cannot leave a helper running after app startup.
+    command.process_group(0);
     command.stdout(Stdio::piped()).stderr(Stdio::piped());
     let mut child = command
         .spawn()
@@ -127,7 +131,13 @@ fn run_command_with_timeout(
                     .map_err(|error| format!("failed to collect {description} output: {error}"));
             }
             None if Instant::now() >= deadline => {
-                let _ = child.kill();
+                let process_group = -(child.id() as libc::pid_t);
+                // SAFETY: the child was spawned as the leader of a new process
+                // group, and a negative pid targets that exact group on Unix.
+                let group_result = unsafe { libc::kill(process_group, libc::SIGKILL) };
+                if group_result != 0 {
+                    let _ = child.kill();
+                }
                 let _ = child.wait();
                 return Err(format!(
                     "{description} timed out after {} ms",
@@ -186,7 +196,14 @@ pub fn ensure_appimage_protocol_registration() -> Result<bool, String> {
         Duration::from_secs(3),
     )?;
     let registered = String::from_utf8_lossy(&query.stdout).trim().to_string();
-    if !query.status.success() || registered != desktop_name {
+    if !query.status.success() {
+        return Err(format!(
+            "xdg-mime verification exited with {}: {}",
+            query.status,
+            String::from_utf8_lossy(&query.stderr).trim()
+        ));
+    }
+    if registered != desktop_name {
         return Err(format!(
             "protocol registration did not read back (expected {desktop_name}, got {registered:?})"
         ));
@@ -218,14 +235,41 @@ mod appimage_registration_tests {
 
     #[test]
     fn command_timeout_terminates_a_stuck_process() {
+        let pid_path = std::env::temp_dir().join(format!(
+            "tokentracker-timeout-child-{}.pid",
+            std::process::id()
+        ));
+        let _ = fs::remove_file(&pid_path);
         let started = Instant::now();
-        let result = run_command_with_timeout(
-            Command::new("sh").args(["-c", "sleep 2"]),
-            "timeout probe",
-            Duration::from_millis(50),
-        );
+        let mut command = Command::new("sh");
+        command
+            .args(["-c", "sleep 10 & echo $! > \"$1\"; wait", "sh"])
+            .arg(&pid_path);
+        let result =
+            run_command_with_timeout(&mut command, "timeout probe", Duration::from_millis(250));
         assert!(result.unwrap_err().contains("timed out"));
-        assert!(started.elapsed() < Duration::from_secs(1));
+        assert!(started.elapsed() < Duration::from_secs(2));
+
+        let descendant_pid: libc::pid_t = fs::read_to_string(&pid_path)
+            .expect("background child pid should be recorded before timeout")
+            .trim()
+            .parse()
+            .expect("background child pid should be numeric");
+        let gone_by = Instant::now() + Duration::from_secs(1);
+        loop {
+            // SAFETY: signal 0 only probes whether this recorded pid exists.
+            let exists = unsafe { libc::kill(descendant_pid, 0) } == 0
+                || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM);
+            if !exists {
+                break;
+            }
+            assert!(
+                Instant::now() < gone_by,
+                "background child survived timeout"
+            );
+            thread::sleep(Duration::from_millis(25));
+        }
+        let _ = fs::remove_file(pid_path);
     }
 }
 

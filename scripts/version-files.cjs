@@ -1,6 +1,15 @@
 const fs = require('fs');
 const path = require('path');
 
+const RELEASE_VERSION_PATTERN = /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$/;
+
+function assertReleaseVersion(version, label = 'Version') {
+  if (typeof version !== 'string' || !RELEASE_VERSION_PATTERN.test(version)) {
+    throw new Error(`${label} must be a stable x.y.z version, got ${JSON.stringify(version)}`);
+  }
+  return version;
+}
+
 const VERSION_FILES = [
   {
     label: 'package.json',
@@ -178,4 +187,10 @@ function findVersionMismatches(root, version) {
     .map(({ label, version: actual }) => ({ label, expected: version, actual }));
 }
 
-module.exports = { readCanonicalVersion, collectVersionEntries, syncVersions, findVersionMismatches };
+module.exports = {
+  assertReleaseVersion,
+  readCanonicalVersion,
+  collectVersionEntries,
+  syncVersions,
+  findVersionMismatches,
+};

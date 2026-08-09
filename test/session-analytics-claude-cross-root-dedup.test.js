@@ -205,6 +205,8 @@ test("Claude cross-root union counts a shared prefix once and both divergent tai
 test("Claude and Codex keep a surviving mirror when another grouped path vanishes", async () => {
   await withTmp(async (tmp) => {
     const missing = path.join(tmp, "unmounted", `${UUID_A}.jsonl`);
+    const readFailure = path.join(tmp, "read-failure");
+    fs.mkdirSync(readFailure);
     const claudeRow = {
       type: "assistant",
       sessionId: UUID_A,
@@ -225,6 +227,8 @@ test("Claude and Codex keep a surviving mirror when another grouped path vanishe
     );
     const claudeSession = await scanClaudeSession([missing, claude]);
     assert.equal(claudeSession.total_tokens, 9);
+    const claudeAfterOpenFailure = await scanClaudeSession([readFailure, claude]);
+    assert.equal(claudeAfterOpenFailure.total_tokens, 9);
 
     const codexRows = [
       { timestamp: "2026-08-08T03:01:00Z", type: "session_meta", payload: { id: UUID_A, cwd: "/repo", model_provider: "openai" } },
@@ -234,6 +238,8 @@ test("Claude and Codex keep a surviving mirror when another grouped path vanishe
     const codex = seedRoot(tmp, "codex-native", UUID_A, 1_000_000, `${codexRows.map(JSON.stringify).join("\n")}\n`);
     const codexSession = await scanCodexSession([missing, codex]);
     assert.equal(codexSession.total_tokens, 11);
+    const codexAfterOpenFailure = await scanCodexSession([readFailure, codex]);
+    assert.equal(codexAfterOpenFailure.total_tokens, 11);
   });
 });
 
