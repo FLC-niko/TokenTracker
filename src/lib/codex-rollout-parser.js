@@ -1081,10 +1081,12 @@ async function* iterateCodexObjects(filePaths, diagnostics, options = {}) {
   const records = [];
   let scannedFiles = 0;
   for (let fileIndex = 0; fileIndex < filePaths.length; fileIndex += 1) {
+    const fileRecords = [];
     try {
       for await (const record of readCodexObjects(filePaths[fileIndex], diagnostics, fileIndex)) {
-        records.push(record);
+        fileRecords.push(record);
       }
+      for (const record of fileRecords) records.push(record);
       scannedFiles += 1;
     } catch (error) {
       if (!isRecoverableGroupedReadError(error)) throw error;

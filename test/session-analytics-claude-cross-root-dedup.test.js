@@ -24,6 +24,7 @@ const assert = require("node:assert/strict");
 const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
+const { Readable } = require("node:stream");
 
 const {
   analyticsEntryStatKey,
@@ -240,6 +241,47 @@ test("Claude and Codex keep a surviving mirror when another grouped path vanishe
     assert.equal(codexSession.total_tokens, 11);
     const codexAfterOpenFailure = await scanCodexSession([readFailure, codex]);
     assert.equal(codexAfterOpenFailure.total_tokens, 11);
+  });
+});
+
+test("Codex discards records staged before a grouped mirror fails mid-read", async () => {
+  await withTmp(async (tmp) => {
+    const usage = (input, output) => ({
+      input_tokens: input,
+      cached_input_tokens: 0,
+      cache_creation_input_tokens: 0,
+      output_tokens: output,
+      reasoning_output_tokens: 0,
+      total_tokens: input + output,
+    });
+    const rows = (input, output, suffix) => [
+      { timestamp: `2026-08-08T04:00:0${suffix}Z`, type: "session_meta", payload: { id: UUID_A, cwd: "/repo", model_provider: "openai" } },
+      { timestamp: `2026-08-08T04:00:1${suffix}Z`, type: "turn_context", payload: { turn_id: `turn-${suffix}`, cwd: "/repo", model: "gpt-test" } },
+      { timestamp: `2026-08-08T04:00:2${suffix}Z`, type: "event_msg", payload: { type: "token_count", info: { last_token_usage: usage(input, output), total_token_usage: usage(input, output) } } },
+    ];
+    const poisonedRows = rows(900, 99, "0");
+    const survivingRows = rows(8, 3, "1");
+    const broken = seedRoot(tmp, "codex-broken", UUID_A, 1_000_000, `${poisonedRows.map(JSON.stringify).join("\n")}\n`);
+    const survivor = seedRoot(tmp, "codex-survivor", UUID_A, 2_000_000, `${survivingRows.map(JSON.stringify).join("\n")}\n`);
+    const originalCreateReadStream = fs.createReadStream;
+    fs.createReadStream = function createFailingReadStream(filePath, options) {
+      if (filePath !== broken) return originalCreateReadStream.call(this, filePath, options);
+      return Readable.from((async function* failAfterCompleteRows() {
+        yield Buffer.from(`${poisonedRows.map(JSON.stringify).join("\n")}\n`);
+        const error = new Error("simulated stale mount after a partial read");
+        error.code = "ESTALE";
+        throw error;
+      })());
+    };
+
+    try {
+      const session = await scanCodexSession([broken, survivor]);
+      assert.equal(session.total_tokens, 11, "the failed mirror's staged usage must not leak into the union");
+      assert.equal(session.tokens.input_tokens, 8);
+      assert.equal(session.tokens.output_tokens, 3);
+    } finally {
+      fs.createReadStream = originalCreateReadStream;
+    }
   });
 });
 
