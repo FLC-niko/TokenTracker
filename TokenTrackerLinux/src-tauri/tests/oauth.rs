@@ -147,5 +147,8 @@ fn appimage_desktop_entry_registers_the_callback_and_quotes_the_path() {
 
 #[test]
 fn appimage_desktop_entry_rejects_control_characters() {
-    assert_eq!(appimage_desktop_entry(Path::new("/tmp/bad\nname.AppImage")), None);
+    assert_eq!(
+        appimage_desktop_entry(Path::new("/tmp/bad\nname.AppImage")),
+        None
+    );
 }

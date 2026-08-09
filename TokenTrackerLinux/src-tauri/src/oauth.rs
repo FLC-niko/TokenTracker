@@ -125,11 +125,7 @@ pub fn ensure_appimage_protocol_registration() -> Result<bool, String> {
         .map_err(|error| format!("failed to write {}: {error}", desktop_path.display()))?;
 
     let status = Command::new("xdg-mime")
-        .args([
-            "default",
-            desktop_name,
-            "x-scheme-handler/tokentracker",
-        ])
+        .args(["default", desktop_name, "x-scheme-handler/tokentracker"])
         .status()
         .map_err(|error| format!("failed to run xdg-mime: {error}"))?;
     if !status.success() {
