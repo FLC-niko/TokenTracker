@@ -250,8 +250,19 @@ function finalizeRecord(record) {
   return record;
 }
 
+function readableSessionPaths(filePath) {
+  const candidates = (Array.isArray(filePath) ? filePath : [filePath]).filter(Boolean);
+  const readable = candidates.filter((value) => sessionFileStatKey(value));
+  if (!readable.length) {
+    throw new Error("session files vanished before they could be scanned");
+  }
+  return readable;
+}
+
 async function scanClaudeSession(filePath) {
-  const filePaths = (Array.isArray(filePath) ? filePath : [filePath]).filter(Boolean);
+  // Native and WSL mounts can disappear independently after discovery. Keep
+  // the surviving mirror instead of dropping the whole logical session.
+  const filePaths = readableSessionPaths(filePath);
   const primaryFilePath = filePaths[0] || String(filePath || "");
   const tokens = emptyTotals();
   // One logical cross-root group is cached and scanned as a unit, so widening
@@ -377,7 +388,7 @@ async function scanClaudeSession(filePath) {
 }
 
 async function scanCodexDeliverySignals(filePath) {
-  const filePaths = (Array.isArray(filePath) ? filePath : [filePath]).filter(Boolean);
+  const filePaths = readableSessionPaths(filePath);
   const bounds = emptyBounds();
   let turns = 0;
   let editTurns = 0;
@@ -456,7 +467,7 @@ async function scanCodexDeliverySignals(filePath) {
 }
 
 async function scanCodexSession(filePath) {
-  const filePaths = (Array.isArray(filePath) ? filePath : [filePath]).filter(Boolean);
+  const filePaths = readableSessionPaths(filePath);
   const primaryFilePath = filePaths[0] || String(filePath || "");
   const [parsed, signals] = await Promise.all([
     parseCodexRolloutFile(filePaths, { seenTokenEvents: new Set() }),
@@ -1034,8 +1045,8 @@ function loadCodexTitleIndex(filePath) {
 // touching updates.jsonl on some partial flushes).
 function analyticsEntryStatKey(source, filePath) {
   const filePaths = (Array.isArray(filePath) ? filePath : [filePath]).filter(Boolean);
-  const sessionStats = filePaths.map((value) => sessionFileStatKey(value));
-  if (sessionStats.some((value) => !value)) return null;
+  const sessionStats = filePaths.map((value) => sessionFileStatKey(value) || "missing");
+  if (sessionStats.every((value) => value === "missing")) return null;
   const sessionStat = sessionStats.join("|");
   if (source === "codex") {
     const titleStats = filePaths.map((value) => (
@@ -1446,4 +1457,5 @@ module.exports = {
   sessionsToCsv,
   providerRoots,
   dedupeClaudeFilesAcrossRoots,
+  analyticsEntryStatKey,
 };

@@ -26,6 +26,7 @@ const os = require("node:os");
 const path = require("node:path");
 
 const {
+  analyticsEntryStatKey,
   dedupeClaudeFilesAcrossRoots,
   scanClaudeSession,
   scanCodexSession,
@@ -194,9 +195,45 @@ test("Claude cross-root union counts a shared prefix once and both divergent tai
 
     const session = await scanClaudeSession([native, wsl]);
     assert.equal(session.turns, 1);
+    assert.equal(session.retry_turns, 0, "the shared prompt must be hash-deduped");
     assert.equal(session.tokens.input_tokens, 60);
     assert.equal(session.tokens.output_tokens, 6);
     assert.equal(session.total_tokens, 66);
+  });
+});
+
+test("Claude and Codex keep a surviving mirror when another grouped path vanishes", async () => {
+  await withTmp(async (tmp) => {
+    const missing = path.join(tmp, "unmounted", `${UUID_A}.jsonl`);
+    const claudeRow = {
+      type: "assistant",
+      sessionId: UUID_A,
+      cwd: "/repo",
+      timestamp: "2026-08-08T03:00:00Z",
+      message: {
+        id: "m-survivor",
+        model: "claude-test",
+        usage: { input_tokens: 7, output_tokens: 2 },
+        content: [],
+      },
+    };
+    const claude = seedRoot(tmp, "claude-native", UUID_A, 1_000_000, `${JSON.stringify(claudeRow)}\n`);
+    assert.match(
+      analyticsEntryStatKey("claude", [missing, claude]),
+      /^missing\|/,
+      "one missing mirror must invalidate the cache without dropping the surviving group",
+    );
+    const claudeSession = await scanClaudeSession([missing, claude]);
+    assert.equal(claudeSession.total_tokens, 9);
+
+    const codexRows = [
+      { timestamp: "2026-08-08T03:01:00Z", type: "session_meta", payload: { id: UUID_A, cwd: "/repo", model_provider: "openai" } },
+      { timestamp: "2026-08-08T03:01:01Z", type: "turn_context", payload: { turn_id: "turn-1", cwd: "/repo", model: "gpt-test" } },
+      { timestamp: "2026-08-08T03:01:02Z", type: "event_msg", payload: { type: "token_count", info: { last_token_usage: { input_tokens: 8, output_tokens: 3, total_tokens: 11 } } } },
+    ];
+    const codex = seedRoot(tmp, "codex-native", UUID_A, 1_000_000, `${codexRows.map(JSON.stringify).join("\n")}\n`);
+    const codexSession = await scanCodexSession([missing, codex]);
+    assert.equal(codexSession.total_tokens, 11);
   });
 });
 

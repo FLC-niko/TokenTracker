@@ -85,6 +85,30 @@ test("workflow checks version before publishing", () => {
     content.includes("outputs.eligible == 'true'"),
     "publish steps must require an exact version-changing commit"
   );
+  assert.ok(content.includes("set -euo pipefail"), "provenance checks must fail closed");
+  assert.ok(
+    !content.includes("JSON.parse(s).version||'')}catch{}})\" || true"),
+    "parent version lookup must not swallow checkout or JSON errors",
+  );
+  assert.ok(
+    content.includes('r?.error?.code') && content.includes('= "E404"'),
+    "only a confirmed npm E404 may be treated as unpublished",
+  );
+  assert.ok(
+    content.includes("npm registry lookup failed without a confirmed E404"),
+    "other registry failures must stop publication",
+  );
+});
+
+test("workflow skip notices are reason-specific and avoid expression injection", () => {
+  const content = loadWorkflow();
+  assert.ok(content.includes("Skip unchanged-version commit"));
+  assert.ok(content.includes("Skip already-published version"));
+  assert.ok(content.includes("PACKAGE_VERSION: ${{ steps.version-check.outputs.version }}"));
+  assert.ok(
+    !content.includes('run: echo "v${{ steps.version-check.outputs.version }}'),
+    "step outputs must not be interpolated directly into shell source",
+  );
 });
 
 test("workflow builds dashboard before publish", () => {

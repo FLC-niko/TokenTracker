@@ -43,21 +43,31 @@ jobs:
       - name: Verify version commit and check npm
         id: version-check
         run: |
+          set -euo pipefail
           PACKAGE_VERSION=$(node -p "require('./package.json').version")
           echo "version=$PACKAGE_VERSION" >> "$GITHUB_OUTPUT"
           PARENT_VERSION=$(git show HEAD^:package.json 2>/dev/null | node -e \
-            "let s='';process.stdin.on('data',d=>s+=d).on('end',()=>{try{process.stdout.write(JSON.parse(s).version||'')}catch{}})" || true)
+            "let s='';process.stdin.on('data',d=>s+=d).on('end',()=>{const v=JSON.parse(s).version;if(typeof v!=='string'||!v)throw new Error('parent package version is missing');process.stdout.write(v)})")
           if [ "$PARENT_VERSION" = "$PACKAGE_VERSION" ]; then
             echo "eligible=false" >> "$GITHUB_OUTPUT"
-            echo "exists=true" >> "$GITHUB_OUTPUT"
             echo "package.json version did not change in this tested commit; skipping publish."
             exit 0
           fi
           echo "eligible=true" >> "$GITHUB_OUTPUT"
-          if npm view tokentracker-cli@"$PACKAGE_VERSION" version 2>/dev/null; then
+          npm_result=$(mktemp)
+          npm_error=$(mktemp)
+          trap 'rm -f "$npm_result" "$npm_error"' EXIT
+          if npm view tokentracker-cli@"$PACKAGE_VERSION" version --json >"$npm_result" 2>"$npm_error"; then
             echo "exists=true" >> "$GITHUB_OUTPUT"
           else
-            echo "exists=false" >> "$GITHUB_OUTPUT"
+            lookup_code=$(node -e "const fs=require('fs');try{const r=JSON.parse(fs.readFileSync(process.argv[1],'utf8'));process.stdout.write(r?.error?.code||'')}catch{}" "$npm_result")
+            if [ "$lookup_code" = "E404" ]; then
+              echo "exists=false" >> "$GITHUB_OUTPUT"
+            else
+              cat "$npm_error" >&2
+              echo "npm registry lookup failed without a confirmed E404" >&2
+              exit 1
+            fi
           fi
 
       - name: Install root dependencies
@@ -85,9 +95,17 @@ jobs:
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
 
-      - name: Skip notice
-        if: steps.version-check.outputs.eligible != 'true' || steps.version-check.outputs.exists == 'true'
-        run: echo "v${{ steps.version-check.outputs.version }} already published, skipping."
+      - name: Skip unchanged-version commit
+        if: steps.version-check.outputs.eligible != 'true'
+        env:
+          PACKAGE_VERSION: ${{ steps.version-check.outputs.version }}
+        run: printf 'v%s was not changed by this commit; skipping publish.\n' "$PACKAGE_VERSION"
+
+      - name: Skip already-published version
+        if: steps.version-check.outputs.eligible == 'true' && steps.version-check.outputs.exists == 'true'
+        env:
+          PACKAGE_VERSION: ${{ steps.version-check.outputs.version }}
+        run: printf 'v%s is already published; skipping.\n' "$PACKAGE_VERSION"
 
       # Notify homebrew-tokentracker tap to bump the Formula immediately.
       # If HOMEBREW_DISPATCH_TOKEN is not set, this step silently no-ops and

@@ -1,7 +1,9 @@
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Output, Stdio};
 use std::sync::Mutex;
+use std::thread;
+use std::time::{Duration, Instant};
 
 use tauri::{AppHandle, Manager, Url};
 
@@ -86,14 +88,55 @@ pub fn appimage_desktop_entry(appimage: &Path) -> Option<String> {
     ))
 }
 
-fn user_applications_dir() -> Option<PathBuf> {
-    if let Some(value) = std::env::var_os("XDG_DATA_HOME").filter(|value| !value.is_empty()) {
-        return Some(PathBuf::from(value).join("applications"));
+fn applications_dir(xdg_data_home: Option<PathBuf>, home: Option<PathBuf>) -> Option<PathBuf> {
+    if let Some(value) = xdg_data_home.filter(|value| value.is_absolute()) {
+        return Some(value.join("applications"));
     }
-    std::env::var_os("HOME")
+    home.filter(|value| value.is_absolute())
+        .map(|value| value.join(".local/share/applications"))
+}
+
+fn user_applications_dir() -> Option<PathBuf> {
+    let xdg_data_home = std::env::var_os("XDG_DATA_HOME")
         .filter(|value| !value.is_empty())
-        .map(PathBuf::from)
-        .map(|home| home.join(".local/share/applications"))
+        .map(PathBuf::from);
+    let home = std::env::var_os("HOME")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from);
+    applications_dir(xdg_data_home, home)
+}
+
+fn run_command_with_timeout(
+    command: &mut Command,
+    description: &str,
+    timeout: Duration,
+) -> Result<Output, String> {
+    command.stdout(Stdio::piped()).stderr(Stdio::piped());
+    let mut child = command
+        .spawn()
+        .map_err(|error| format!("failed to run {description}: {error}"))?;
+    let deadline = Instant::now() + timeout;
+    loop {
+        match child
+            .try_wait()
+            .map_err(|error| format!("failed while waiting for {description}: {error}"))?
+        {
+            Some(_) => {
+                return child
+                    .wait_with_output()
+                    .map_err(|error| format!("failed to collect {description} output: {error}"));
+            }
+            None if Instant::now() >= deadline => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(format!(
+                    "{description} timed out after {} ms",
+                    timeout.as_millis()
+                ));
+            }
+            None => thread::sleep(Duration::from_millis(25)),
+        }
+    }
 }
 
 /// Register the custom callback scheme for a directly launched AppImage.
@@ -124,18 +167,24 @@ pub fn ensure_appimage_protocol_registration() -> Result<bool, String> {
         .and_then(|()| fs::rename(&temporary, &desktop_path))
         .map_err(|error| format!("failed to write {}: {error}", desktop_path.display()))?;
 
-    let status = Command::new("xdg-mime")
-        .args(["default", desktop_name, "x-scheme-handler/tokentracker"])
-        .status()
-        .map_err(|error| format!("failed to run xdg-mime: {error}"))?;
-    if !status.success() {
-        return Err(format!("xdg-mime exited with {status}"));
+    let registration = run_command_with_timeout(
+        Command::new("xdg-mime").args(["default", desktop_name, "x-scheme-handler/tokentracker"]),
+        "xdg-mime registration",
+        Duration::from_secs(3),
+    )?;
+    if !registration.status.success() {
+        return Err(format!(
+            "xdg-mime registration exited with {}: {}",
+            registration.status,
+            String::from_utf8_lossy(&registration.stderr).trim()
+        ));
     }
 
-    let query = Command::new("xdg-mime")
-        .args(["query", "default", "x-scheme-handler/tokentracker"])
-        .output()
-        .map_err(|error| format!("failed to verify xdg-mime registration: {error}"))?;
+    let query = run_command_with_timeout(
+        Command::new("xdg-mime").args(["query", "default", "x-scheme-handler/tokentracker"]),
+        "xdg-mime verification",
+        Duration::from_secs(3),
+    )?;
     let registered = String::from_utf8_lossy(&query.stdout).trim().to_string();
     if !query.status.success() || registered != desktop_name {
         return Err(format!(
@@ -143,6 +192,41 @@ pub fn ensure_appimage_protocol_registration() -> Result<bool, String> {
         ));
     }
     Ok(true)
+}
+
+#[cfg(test)]
+mod appimage_registration_tests {
+    use super::*;
+
+    #[test]
+    fn relative_xdg_data_home_falls_back_to_absolute_home() {
+        assert_eq!(
+            applications_dir(
+                Some(PathBuf::from("relative-data")),
+                Some(PathBuf::from("/home/dev")),
+            ),
+            Some(PathBuf::from("/home/dev/.local/share/applications"))
+        );
+        assert_eq!(
+            applications_dir(
+                Some(PathBuf::from("/data/dev")),
+                Some(PathBuf::from("/home/dev"))
+            ),
+            Some(PathBuf::from("/data/dev/applications"))
+        );
+    }
+
+    #[test]
+    fn command_timeout_terminates_a_stuck_process() {
+        let started = Instant::now();
+        let result = run_command_with_timeout(
+            Command::new("sh").args(["-c", "sleep 2"]),
+            "timeout probe",
+            Duration::from_millis(50),
+        );
+        assert!(result.unwrap_err().contains("timed out"));
+        assert!(started.elapsed() < Duration::from_secs(1));
+    }
 }
 
 pub fn callback_url(base: &str, code: &str) -> Option<String> {
