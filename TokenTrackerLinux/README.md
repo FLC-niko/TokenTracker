@@ -99,12 +99,10 @@ Google/GitHub sign-in needs `http://127.0.0.1:17680/auth/callback`, so if
 something else already holds 17680 the app falls back to a random port and OAuth
 will not complete until 17680 is free again.
 
-> **AppImage caveat:** the `tokentracker://` deep-link scheme is registered by the
-> installed `.desktop` file, which the Arch package installs but a bare AppImage
-> does not. This only affects the custom-scheme callback path; the loopback
-> redirect above is what the browser flow actually uses, so sign-in still works.
-> Use the Arch package (or install the AppImage with a tool like `appimaged`) if
-> you need the `tokentracker://` handler.
+The AppImage registers a per-user `.desktop` handler for the
+`tokentracker://` OAuth callback on first launch and refreshes it whenever the
+AppImage moves. This requires `xdg-mime` (normally provided by `xdg-utils`). The
+Arch package installs the equivalent handler system-wide.
 
 ## Logs
 

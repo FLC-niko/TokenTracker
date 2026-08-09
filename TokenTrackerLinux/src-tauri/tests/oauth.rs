@@ -1,5 +1,8 @@
+use std::path::Path;
+
 use tokentracker_linux::oauth::{
-    callback_url, is_allowed_oauth_url, parse_auth_callback, PendingAuthCode,
+    appimage_desktop_entry, callback_url, is_allowed_oauth_url, parse_auth_callback,
+    PendingAuthCode,
 };
 
 #[test]
@@ -126,4 +129,23 @@ fn pending_auth_code_is_consumed_once_and_latest_wins() {
 
     assert_eq!(pending.take().as_deref(), Some("second"));
     assert_eq!(pending.take(), None);
+}
+
+#[test]
+fn appimage_desktop_entry_registers_the_callback_and_quotes_the_path() {
+    let entry = appimage_desktop_entry(Path::new(
+        "/home/dev/Token Tracker 100%/$`\"\\/TokenTracker-linux.AppImage",
+    ))
+    .expect("valid AppImage path");
+
+    assert!(entry.contains(
+        "Exec=\"/home/dev/Token Tracker 100%%/\\$\\`\\\"\\\\/TokenTracker-linux.AppImage\" %u"
+    ));
+    assert!(entry.contains("MimeType=x-scheme-handler/tokentracker;"));
+    assert!(entry.contains("X-AppImage-Integrate=false"));
+}
+
+#[test]
+fn appimage_desktop_entry_rejects_control_characters() {
+    assert_eq!(appimage_desktop_entry(Path::new("/tmp/bad\nname.AppImage")), None);
 }

@@ -235,6 +235,9 @@ fn main() {
             tray::show_main_window(app);
         }))
         .setup(move |app| {
+            if let Err(error) = oauth::ensure_appimage_protocol_registration() {
+                eprintln!("[TokenTracker] AppImage OAuth callback registration failed: {error}");
+            }
             tray::install(app)?;
 
             for arg in &initial_args {

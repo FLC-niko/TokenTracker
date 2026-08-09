@@ -52,7 +52,9 @@ const wsl = require("./wsl-probe");
 // v10 adds Grok Build sessions (~/.grok/sessions/**/updates.jsonl), scanned
 // from turn_completed.usage + tool_call metadata. Bump so Claude/Codex rows
 // stay valid while Grok entries appear on the next full rebuild.
-const SIDECAR_VERSION = 10;
+// v11 groups native/WSL copies of one logical Claude/Codex session and scans
+// their union, deduping shared records while retaining divergent tails.
+const SIDECAR_VERSION = 11;
 const EDIT_TOOLS = new Set([
   "apply_patch",
   "edit",
@@ -249,20 +251,12 @@ function finalizeRecord(record) {
 }
 
 async function scanClaudeSession(filePath) {
-  const input = fs.createReadStream(filePath, { encoding: "utf8" });
-  const lines = readline.createInterface({ input, crlfDelay: Infinity });
+  const filePaths = (Array.isArray(filePath) ? filePath : [filePath]).filter(Boolean);
+  const primaryFilePath = filePaths[0] || String(filePath || "");
   const tokens = emptyTotals();
-  // Per-file, deliberately. rollout.js persists its dedup set across files to
-  // catch cross-file duplicates, but that is only sound there because it owns a
-  // single global total. Here each file becomes an independently cached row, so
-  // a cross-file set would make a row's tokens depend on which other files were
-  // scanned first — and the incremental cache reuses rows without replaying
-  // that state. Measured cost of the per-file scope on real data: 808 assistant
-  // messages appear in more than one file (fork/resume replays history into a
-  // new session file), inflating per-session tokens by ~1.5% in aggregate.
-  // Fixing it needs a deterministic owner (e.g. earliest started_at) plus
-  // message keys persisted per row — a sidecar redesign, not a one-liner. Do
-  // NOT "fix" this by widening the set without solving the cache interaction.
+  // One logical cross-root group is cached and scanned as a unit, so widening
+  // this set across that group stays deterministic. Unrelated files (including
+  // same-UUID siblings inside one root) are never grouped here.
   const seenMessages = new Set();
   const bounds = emptyBounds();
   // The basename keeps grouping stable for files that never write a sessionId
@@ -270,7 +264,7 @@ async function scanClaudeSession(filePath) {
   // session_id — otherwise non-session logs under ~/.claude/projects (e.g.
   // skill-injections.jsonl, journal.jsonl) yield `claude --resume journal`,
   // a command that always fails.
-  let rawSessionId = path.basename(filePath, ".jsonl");
+  let rawSessionId = path.basename(primaryFilePath, ".jsonl");
   let observedSessionId = null;
   let cwd = null;
   let model = "unknown";
@@ -290,56 +284,72 @@ async function scanClaudeSession(filePath) {
   }
   let lastPromptFingerprint = null;
 
-  for await (const line of lines) {
-    let obj;
-    try { obj = JSON.parse(line); } catch { continue; }
-    updateBounds(bounds, obj.timestamp || obj.message?.timestamp);
-    if (typeof obj.sessionId === "string" && obj.sessionId) {
-      rawSessionId = obj.sessionId;
-      observedSessionId = obj.sessionId;
-    }
-    if (typeof obj.cwd === "string" && obj.cwd) cwd = obj.cwd;
-    // Claude writes its own generated one-line summary as an "ai-title" record.
-    // It is agent-authored metadata (not the raw prompt body); keep the latest.
-    if (obj.type === "ai-title" && typeof obj.aiTitle === "string") {
-      const cleaned = cleanSessionTitle(obj.aiTitle);
-      if (cleaned) aiTitle = cleaned;
-      continue;
-    }
-    if (obj.type === "user") {
-      const prompt = extractClaudePrompt(obj);
-      if (!prompt) continue;
-      const fingerprint = promptFingerprint(prompt);
-      if (lastPromptFingerprint && fingerprint === lastPromptFingerprint) retryTurns += 1;
-      lastPromptFingerprint = fingerprint;
-      closeTurn();
-      turns += 1;
-      continue;
-    }
-    if (obj.type !== "assistant" || !obj.message) continue;
-    const dedupKey = claudeMessageDedupKey(obj);
-    if (dedupKey && seenMessages.has(dedupKey)) continue;
-    if (dedupKey) seenMessages.add(dedupKey);
-    // Claude writes internal summary/observer messages with model
-    // "<synthetic>". They are not a billable model and can appear after the
-    // real assistant messages in the same session. Keep the latest real
-    // model instead of letting that marker overwrite it.
-    const candidateModel = normalizeSessionModel(obj.message.model);
-    if (candidateModel) model = candidateModel;
-    addTotals(tokens, tokenTotals(obj.message.usage));
-    const content = Array.isArray(obj.message.content) ? obj.message.content : [];
-    for (const block of content) {
-      if (!block || block.type !== "tool_use") continue;
-      const name = String(block.name || "").toLowerCase();
-      if (EDIT_TOOLS.has(name)) currentHadEdit = true;
-      if (name === "agent" || name === "task") {
-        subagentCalls += 1;
-        const subtype = typeof block.input?.subagent_type === "string"
-          ? block.input.subagent_type.trim().slice(0, 64)
-          : "unspecified";
-        subagentTypes.set(subtype || "unspecified", (subagentTypes.get(subtype || "unspecified") || 0) + 1);
+  // A native path and a WSL path can expose the same logical session with a
+  // shared prefix and different tails. Scan every tail, but suppress records
+  // already present in an earlier root. Hashes stay in-memory only, preserving
+  // the metadata-only persistence contract.
+  const priorRecordHashes = new Set();
+  for (const currentFilePath of filePaths) {
+    const currentRecordHashes = new Set();
+    const input = fs.createReadStream(currentFilePath, { encoding: "utf8" });
+    const lines = readline.createInterface({ input, crlfDelay: Infinity });
+    for await (const line of lines) {
+      if (filePaths.length > 1) {
+        const recordHash = crypto.createHash("sha256").update(line).digest("base64url");
+        if (priorRecordHashes.has(recordHash)) continue;
+        currentRecordHashes.add(recordHash);
+      }
+      let obj;
+      try { obj = JSON.parse(line); } catch { continue; }
+      updateBounds(bounds, obj.timestamp || obj.message?.timestamp);
+      if (typeof obj.sessionId === "string" && obj.sessionId) {
+        rawSessionId = obj.sessionId;
+        observedSessionId = obj.sessionId;
+      }
+      if (typeof obj.cwd === "string" && obj.cwd) cwd = obj.cwd;
+      // Claude writes its own generated one-line summary as an "ai-title" record.
+      // It is agent-authored metadata (not the raw prompt body); keep the latest.
+      if (obj.type === "ai-title" && typeof obj.aiTitle === "string") {
+        const cleaned = cleanSessionTitle(obj.aiTitle);
+        if (cleaned) aiTitle = cleaned;
+        continue;
+      }
+      if (obj.type === "user") {
+        const prompt = extractClaudePrompt(obj);
+        if (!prompt) continue;
+        const fingerprint = promptFingerprint(prompt);
+        if (lastPromptFingerprint && fingerprint === lastPromptFingerprint) retryTurns += 1;
+        lastPromptFingerprint = fingerprint;
+        closeTurn();
+        turns += 1;
+        continue;
+      }
+      if (obj.type !== "assistant" || !obj.message) continue;
+      const dedupKey = claudeMessageDedupKey(obj);
+      if (dedupKey && seenMessages.has(dedupKey)) continue;
+      if (dedupKey) seenMessages.add(dedupKey);
+      // Claude writes internal summary/observer messages with model
+      // "<synthetic>". They are not a billable model and can appear after the
+      // real assistant messages in the same session. Keep the latest real
+      // model instead of letting that marker overwrite it.
+      const candidateModel = normalizeSessionModel(obj.message.model);
+      if (candidateModel) model = candidateModel;
+      addTotals(tokens, tokenTotals(obj.message.usage));
+      const content = Array.isArray(obj.message.content) ? obj.message.content : [];
+      for (const block of content) {
+        if (!block || block.type !== "tool_use") continue;
+        const name = String(block.name || "").toLowerCase();
+        if (EDIT_TOOLS.has(name)) currentHadEdit = true;
+        if (name === "agent" || name === "task") {
+          subagentCalls += 1;
+          const subtype = typeof block.input?.subagent_type === "string"
+            ? block.input.subagent_type.trim().slice(0, 64)
+            : "unspecified";
+          subagentTypes.set(subtype || "unspecified", (subagentTypes.get(subtype || "unspecified") || 0) + 1);
+        }
       }
     }
+    for (const recordHash of currentRecordHashes) priorRecordHashes.add(recordHash);
   }
   closeTurn();
   return finalizeRecord({
@@ -352,7 +362,7 @@ async function scanClaudeSession(filePath) {
     // wrote one — the UI then falls back to the project name.
     title: aiTitle,
     source: "claude",
-    project_key: projectKey(cwd, filePath),
+    project_key: projectKey(cwd, primaryFilePath),
     project_ref: cwd || null,
     model,
     ...bounds,
@@ -367,9 +377,8 @@ async function scanClaudeSession(filePath) {
 }
 
 async function scanCodexDeliverySignals(filePath) {
+  const filePaths = (Array.isArray(filePath) ? filePath : [filePath]).filter(Boolean);
   const bounds = emptyBounds();
-  const input = fs.createReadStream(filePath, { encoding: "utf8" });
-  const lines = readline.createInterface({ input, crlfDelay: Infinity });
   let turns = 0;
   let editTurns = 0;
   let retryTurns = 0;
@@ -394,34 +403,46 @@ async function scanCodexDeliverySignals(filePath) {
     turns += 1;
   }
 
-  for await (const line of lines) {
-    let obj;
-    try { obj = JSON.parse(line); } catch { continue; }
-    updateBounds(bounds, obj.timestamp);
-    if (obj.type === "turn_context") {
-      hasTurnContext = true;
-      beginTurn(String(obj.payload?.turn_id || obj.timestamp || turns + 1));
-      continue;
+  const priorRecordHashes = new Set();
+  for (const currentFilePath of filePaths) {
+    const currentRecordHashes = new Set();
+    const input = fs.createReadStream(currentFilePath, { encoding: "utf8" });
+    const lines = readline.createInterface({ input, crlfDelay: Infinity });
+    for await (const line of lines) {
+      if (filePaths.length > 1) {
+        const recordHash = crypto.createHash("sha256").update(line).digest("base64url");
+        if (priorRecordHashes.has(recordHash)) continue;
+        currentRecordHashes.add(recordHash);
+      }
+      let obj;
+      try { obj = JSON.parse(line); } catch { continue; }
+      updateBounds(bounds, obj.timestamp);
+      if (obj.type === "turn_context") {
+        hasTurnContext = true;
+        beginTurn(String(obj.payload?.turn_id || obj.timestamp || turns + 1));
+        continue;
+      }
+      const prompt = extractCodexPrompt(obj);
+      if (prompt) {
+        const fingerprint = promptFingerprint(prompt);
+        if (lastPromptFingerprint && fingerprint === lastPromptFingerprint) retryTurns += 1;
+        lastPromptFingerprint = fingerprint;
+        if (!hasTurnContext) beginTurn(String(obj.timestamp || turns + 1));
+        continue;
+      }
+      if (obj.type !== "response_item") continue;
+      const toolNames = extractCodexSignalTools(obj.payload);
+      if (!toolNames.length) continue;
+      if (!currentTurnOpen) beginTurn(String(obj.timestamp || turns + 1));
+      if (toolNames.some((name) => EDIT_TOOLS.has(name))) currentHadEdit = true;
+      for (const name of toolNames) {
+        if (!CODEX_SUBAGENT_TOOLS.has(name)) continue;
+        subagentCalls += 1;
+        const displayName = name === "multi_agent_v1__spawn_agent" ? "spawn_agent" : name;
+        subagentTypes.set(displayName, (subagentTypes.get(displayName) || 0) + 1);
+      }
     }
-    const prompt = extractCodexPrompt(obj);
-    if (prompt) {
-      const fingerprint = promptFingerprint(prompt);
-      if (lastPromptFingerprint && fingerprint === lastPromptFingerprint) retryTurns += 1;
-      lastPromptFingerprint = fingerprint;
-      if (!hasTurnContext) beginTurn(String(obj.timestamp || turns + 1));
-      continue;
-    }
-    if (obj.type !== "response_item") continue;
-    const toolNames = extractCodexSignalTools(obj.payload);
-    if (!toolNames.length) continue;
-    if (!currentTurnOpen) beginTurn(String(obj.timestamp || turns + 1));
-    if (toolNames.some((name) => EDIT_TOOLS.has(name))) currentHadEdit = true;
-    for (const name of toolNames) {
-      if (!CODEX_SUBAGENT_TOOLS.has(name)) continue;
-      subagentCalls += 1;
-      const displayName = name === "multi_agent_v1__spawn_agent" ? "spawn_agent" : name;
-      subagentTypes.set(displayName, (subagentTypes.get(displayName) || 0) + 1);
-    }
+    for (const recordHash of currentRecordHashes) priorRecordHashes.add(recordHash);
   }
   closeTurn();
   return {
@@ -435,9 +456,11 @@ async function scanCodexDeliverySignals(filePath) {
 }
 
 async function scanCodexSession(filePath) {
+  const filePaths = (Array.isArray(filePath) ? filePath : [filePath]).filter(Boolean);
+  const primaryFilePath = filePaths[0] || String(filePath || "");
   const [parsed, signals] = await Promise.all([
-    parseCodexRolloutFile(filePath),
-    scanCodexDeliverySignals(filePath),
+    parseCodexRolloutFile(filePaths, { seenTokenEvents: new Set() }),
+    scanCodexDeliverySignals(filePaths),
   ]);
   const parsedModel = normalizeSessionModel(parsed.model);
   const provider = normalizeSessionModel(parsed.provider);
@@ -450,16 +473,17 @@ async function scanCodexSession(filePath) {
   // Codex's own thread title from session_index.jsonl (Codex-authored
   // metadata, keyed by session id). Null when Codex never named the thread —
   // the UI then falls back to the project name.
-  const titleIndex = loadCodexTitleIndex(filePath);
-  const title = (parsed.sessionId && titleIndex.get(parsed.sessionId)) || null;
+  const title = parsed.sessionId
+    ? filePaths.map(loadCodexTitleIndex).map((index) => index.get(parsed.sessionId)).find(Boolean) || null
+    : null;
   return finalizeRecord({
     version: SIDECAR_VERSION,
-    session_hash: sessionHash("codex", parsed.sessionId || filePath),
+    session_hash: sessionHash("codex", parsed.sessionId || primaryFilePath),
     session_id: parsed.sessionId || null,
     // Local-only: stripped in summarizeSessions before any cloud/CSV export.
     title,
     source: "codex",
-    project_key: projectKey(parsed.cwd, filePath),
+    project_key: projectKey(parsed.cwd, primaryFilePath),
     project_ref: parsed.cwd || null,
     model,
     ...signals.bounds,
@@ -795,7 +819,10 @@ function providerRoots(home, providerDir, env, deps = {}) {
   return [...new Set(roots)];
 }
 
-// Collapse the same Claude session discovered under more than one root.
+// Group one logical session discovered under more than one root. A group is
+// scanned as a unit so identical prefixes count once while divergent tails are
+// both retained. Same-UUID siblings inside one Claude root stay separate: the
+// path alone cannot prove which one a file in another root mirrors.
 //
 // Codex gets this from its session-id pass below; Claude only ever had per-file
 // message dedup (`claudeMessageDedupKey` inside `scanClaudeSession`), which
@@ -809,13 +836,9 @@ function providerRoots(home, providerDir, env, deps = {}) {
 // single-install machines are unaffected, and two same-named files inside one
 // tree stay distinct (unproven identity must not delete a session). A basename
 // without a session UUID never participates either.
-function dedupeClaudeFilesAcrossRoots(groups) {
+function groupClaudeFilesAcrossRoots(groups) {
   const rootGroups = (groups || []).filter((group) => Array.isArray(group) && group.length > 0);
-  if (rootGroups.length <= 1) return [...new Set(rootGroups[0] || [])];
-
-  const mtimeOf = (filePath) => {
-    try { return fs.statSync(filePath).mtimeMs; } catch { return -Infinity; }
-  };
+  if (rootGroups.length <= 1) return [...new Set(rootGroups[0] || [])].map((filePath) => [filePath]);
   const sessionIdOf = (filePath) =>
     path.basename(filePath).match(/^([0-9a-f-]{36})\.jsonl$/i)?.[1] || null;
 
@@ -836,31 +859,85 @@ function dedupeClaudeFilesAcrossRoots(groups) {
     }
   }
 
-  // Preserve root order for everything kept, so native precedence is stable.
+  const groupedBySession = new Map();
+  for (const group of rootGroups) {
+    for (const filePath of group) {
+      const id = sessionIdOf(filePath);
+      if (!id || ambiguous.has(id)) continue;
+      if (!groupedBySession.has(id)) groupedBySession.set(id, []);
+      const paths = groupedBySession.get(id);
+      if (!paths.includes(filePath)) paths.push(filePath);
+    }
+  }
+
+  // Preserve root order and the first path as the representative cache key.
   const ordered = [];
-  const winnerBySession = new Map();
+  const emitted = new Set();
   for (const group of rootGroups) {
     for (const filePath of group) {
       const id = sessionIdOf(filePath);
       if (!id || ambiguous.has(id)) {
-        if (!ordered.includes(filePath)) ordered.push(filePath);
+        if (!emitted.has(filePath)) {
+          ordered.push([filePath]);
+          emitted.add(filePath);
+        }
         continue;
       }
-      const previous = winnerBySession.get(id);
-      if (previous === undefined) {
-        winnerBySession.set(id, filePath);
-        ordered.push(filePath);
-        continue;
-      }
-      if (previous === filePath) continue;
-      // Same session in an earlier root: keep the newer file, mirroring Codex.
-      if (mtimeOf(filePath) > mtimeOf(previous)) {
-        winnerBySession.set(id, filePath);
-        ordered[ordered.indexOf(previous)] = filePath;
-      }
+      if (emitted.has(id)) continue;
+      ordered.push(groupedBySession.get(id) || [filePath]);
+      emitted.add(id);
     }
   }
-  return [...new Set(ordered)];
+  return ordered;
+}
+
+function sameFileContent(filePaths) {
+  if (!Array.isArray(filePaths) || filePaths.length <= 1) return true;
+  try {
+    const first = fs.readFileSync(filePaths[0]);
+    return filePaths.slice(1).every((filePath) => {
+      const candidate = fs.readFileSync(filePath);
+      return candidate.length === first.length && candidate.equals(first);
+    });
+  } catch {
+    return false;
+  }
+}
+
+// Compatibility helper used by focused discovery tests and callers that only
+// need a flat list. Only byte-identical mirrors collapse; divergent copies are
+// all returned so no transcript tail is discarded.
+function dedupeClaudeFilesAcrossRoots(groups) {
+  const mtimeOf = (filePath) => {
+    try { return fs.statSync(filePath).mtimeMs; } catch { return -Infinity; }
+  };
+  const out = [];
+  for (const filePaths of groupClaudeFilesAcrossRoots(groups)) {
+    if (filePaths.length <= 1 || !sameFileContent(filePaths)) {
+      out.push(...filePaths);
+      continue;
+    }
+    out.push(filePaths.reduce((winner, candidate) => (
+      mtimeOf(candidate) > mtimeOf(winner) ? candidate : winner
+    )));
+  }
+  return [...new Set(out)];
+}
+
+function groupCodexFiles(filePaths) {
+  const ordered = [];
+  const bySession = new Map();
+  for (const filePath of [...new Set(filePaths || [])]) {
+    const id = path.basename(filePath).match(/([0-9a-f-]{36})\.jsonl$/i)?.[1] || filePath;
+    let group = bySession.get(id);
+    if (!group) {
+      group = [];
+      bySession.set(id, group);
+      ordered.push(group);
+    }
+    group.push(filePath);
+  }
+  return ordered;
 }
 
 async function discoverSessionFiles(home, env = process.env, deps = {}) {
@@ -873,26 +950,17 @@ async function discoverSessionFiles(home, env = process.env, deps = {}) {
     Promise.all(codexRoots.map((r) => listRolloutFilesDeep(path.join(r, "archived_sessions")))),
     listGrokSessionFiles(path.join(grokHome, "sessions")),
   ]);
-  const allClaude = dedupeClaudeFilesAcrossRoots(claudeGroups);
+  const allClaude = groupClaudeFilesAcrossRoots(claudeGroups);
   const codex = [...new Set(codexGroups.flat())];
   const archived = [...new Set(archivedGroups.flat())];
   // Claude Memory stores thousands of background observer transcripts beside
   // real Claude Code sessions. They contain <synthetic>/haiku bookkeeping and
   // no user coding outcome, so scanning them both slows the card dramatically
   // and dilutes its efficiency metrics.
-  const claude = allClaude.filter((filePath) => !filePath
+  const claude = allClaude.filter((filePaths) => !filePaths.some((filePath) => filePath
     .split(path.sep)
-    .some((segment) => segment.endsWith(CLAUDE_MEM_OBSERVER_PROJECT_SUFFIX)));
-  const codexBySession = new Map();
-  const mtimeOf = (filePath) => {
-    try { return fs.statSync(filePath).mtimeMs; } catch { return -Infinity; }
-  };
-  for (const filePath of [...codex, ...archived]) {
-    const id = path.basename(filePath).match(/([0-9a-f-]{36})\.jsonl$/i)?.[1] || filePath;
-    const previous = codexBySession.get(id);
-    if (!previous || mtimeOf(filePath) > mtimeOf(previous)) codexBySession.set(id, filePath);
-  }
-  return { claude, codex: [...codexBySession.values()], grok };
+    .some((segment) => segment.endsWith(CLAUDE_MEM_OBSERVER_PROJECT_SUFFIX))));
+  return { claude, codex: groupCodexFiles([...codex, ...archived]), grok };
 }
 
 function filesSignature(files) {
@@ -907,9 +975,10 @@ function filesSignature(files) {
 }
 
 function sessionFileCacheKey(source, filePath) {
+  const filePaths = (Array.isArray(filePath) ? filePath : [filePath]).filter(Boolean);
   return crypto
     .createHash("sha256")
-    .update(`${source}\0${path.resolve(filePath)}`)
+    .update(`${source}\0${filePaths.map((value) => path.resolve(value)).join("\0")}`)
     .digest("hex")
     .slice(0, 24);
 }
@@ -964,13 +1033,19 @@ function loadCodexTitleIndex(filePath) {
 // Grok titles live in sibling summary.json (and signals can change without
 // touching updates.jsonl on some partial flushes).
 function analyticsEntryStatKey(source, filePath) {
-  const sessionStat = sessionFileStatKey(filePath);
-  if (!sessionStat) return sessionStat;
+  const filePaths = (Array.isArray(filePath) ? filePath : [filePath]).filter(Boolean);
+  const sessionStats = filePaths.map((value) => sessionFileStatKey(value));
+  if (sessionStats.some((value) => !value)) return null;
+  const sessionStat = sessionStats.join("|");
   if (source === "codex") {
-    return `${sessionStat}|title-index:${sessionFileStatKey(codexTitleIndexPathFor(filePath)) || "missing"}`;
+    const titleStats = filePaths.map((value) => (
+      sessionFileStatKey(codexTitleIndexPathFor(value)) || "missing"
+    ));
+    return `${sessionStat}|title-index:${titleStats.join("|")}`;
   }
   if (source === "grok") {
-    return `${sessionStat}|summary:${sessionFileStatKey(grokSummaryPathFor(filePath)) || "missing"}|signals:${sessionFileStatKey(grokSignalsPathFor(filePath)) || "missing"}`;
+    const primary = filePaths[0];
+    return `${sessionStat}|summary:${sessionFileStatKey(grokSummaryPathFor(primary)) || "missing"}|signals:${sessionFileStatKey(grokSignalsPathFor(primary)) || "missing"}`;
   }
   return sessionStat;
 }
@@ -1011,9 +1086,9 @@ async function buildSessionAnalyticsInternal({ home = os.homedir(), force = fals
   // per-file dependency check below on the next refresh. Grok titles/metadata
   // live in sibling summary.json / signals.json next to updates.jsonl.
   const signature = filesSignature([
-    ...discovered.claude,
-    ...discovered.codex,
-    ...discovered.codex.map(codexTitleIndexPathFor).filter(Boolean),
+    ...discovered.claude.flat(),
+    ...discovered.codex.flat(),
+    ...discovered.codex.flat().map(codexTitleIndexPathFor).filter(Boolean),
     ...discovered.grok,
     ...discovered.grok.map(grokSummaryPathFor),
     ...discovered.grok.map(grokSignalsPathFor),
@@ -1035,8 +1110,8 @@ async function buildSessionAnalyticsInternal({ home = os.homedir(), force = fals
   const nextFiles = {};
   const sessions = [];
   const entries = [
-    ...discovered.claude.map((filePath) => ({ source: "claude", filePath, scan: scanClaudeSession })),
-    ...discovered.codex.map((filePath) => ({ source: "codex", filePath, scan: scanCodexSession })),
+    ...discovered.claude.map((filePaths) => ({ source: "claude", filePath: filePaths, scan: scanClaudeSession })),
+    ...discovered.codex.map((filePaths) => ({ source: "codex", filePath: filePaths, scan: scanCodexSession })),
     ...discovered.grok.map((filePath) => ({ source: "grok", filePath, scan: scanGrokSession })),
   ];
   // Files we could not turn into a row (permission denied, half-written line,

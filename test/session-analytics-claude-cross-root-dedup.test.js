@@ -25,24 +25,34 @@ const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
 
-const { dedupeClaudeFilesAcrossRoots } = require("../src/lib/session-analytics");
+const {
+  dedupeClaudeFilesAcrossRoots,
+  scanClaudeSession,
+  scanCodexSession,
+} = require("../src/lib/session-analytics");
 
 function withTmp(fn) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "tt-claude-roots-"));
   try {
-    return fn(dir);
-  } finally {
+    const result = fn(dir);
+    if (result && typeof result.then === "function") {
+      return result.finally(() => fs.rmSync(dir, { recursive: true, force: true }));
+    }
     fs.rmSync(dir, { recursive: true, force: true });
+    return result;
+  } catch (error) {
+    fs.rmSync(dir, { recursive: true, force: true });
+    throw error;
   }
 }
 
 // One session file per root, same basename UUID -> the same session reachable
 // under two path spellings.
-function seedRoot(base, name, uuid, mtimeMs) {
+function seedRoot(base, name, uuid, mtimeMs, content = "{}\n") {
   const dir = path.join(base, name, "projects", "-Users-dev-app");
   fs.mkdirSync(dir, { recursive: true });
   const filePath = path.join(dir, `${uuid}.jsonl`);
-  fs.writeFileSync(filePath, "{}\n");
+  fs.writeFileSync(filePath, content);
   if (mtimeMs) fs.utimesSync(filePath, mtimeMs / 1000, mtimeMs / 1000);
   return filePath;
 }
@@ -147,5 +157,80 @@ test("ordering follows the root order so native precedence is stable", () => {
     const wslB = seedRoot(tmp, "wsl", UUID_B, 1_000_000);
 
     assert.deepEqual(dedupeClaudeFilesAcrossRoots([[nativeA], [wslB]]), [nativeA, wslB]);
+  });
+});
+
+test("divergent same-UUID Claude copies are retained instead of choosing by mtime", () => {
+  withTmp((tmp) => {
+    const native = seedRoot(tmp, "native", UUID_A, 1_000_000, "{\"native\":true}\n");
+    const wsl = seedRoot(tmp, "wsl", UUID_A, 2_000_000, "{\"wsl\":true}\n");
+
+    assert.deepEqual(dedupeClaudeFilesAcrossRoots([[native], [wsl]]), [native, wsl]);
+  });
+});
+
+test("Claude cross-root union counts a shared prefix once and both divergent tails", async () => {
+  await withTmp(async (tmp) => {
+    const row = (id, input, output, timestamp) => ({
+      type: "assistant",
+      sessionId: UUID_A,
+      cwd: "/repo",
+      timestamp,
+      message: {
+        id,
+        model: "claude-test",
+        usage: { input_tokens: input, output_tokens: output },
+        content: [],
+      },
+    });
+    const common = [
+      { type: "user", sessionId: UUID_A, cwd: "/repo", timestamp: "2026-08-08T01:00:00Z", message: { content: "go" } },
+      row("m-common", 10, 1, "2026-08-08T01:00:01Z"),
+    ];
+    const nativeRows = [...common, row("m-native", 20, 2, "2026-08-08T01:00:02Z")];
+    const wslRows = [...common, row("m-wsl", 30, 3, "2026-08-08T01:00:03Z")];
+    const native = seedRoot(tmp, "native", UUID_A, 1_000_000, `${nativeRows.map(JSON.stringify).join("\n")}\n`);
+    const wsl = seedRoot(tmp, "wsl", UUID_A, 2_000_000, `${wslRows.map(JSON.stringify).join("\n")}\n`);
+
+    const session = await scanClaudeSession([native, wsl]);
+    assert.equal(session.turns, 1);
+    assert.equal(session.tokens.input_tokens, 60);
+    assert.equal(session.tokens.output_tokens, 6);
+    assert.equal(session.total_tokens, 66);
+  });
+});
+
+test("Codex cross-root union counts duplicate token events once and divergent tails", async () => {
+  await withTmp(async (tmp) => {
+    const usage = (input, output) => ({
+      input_tokens: input,
+      cached_input_tokens: 0,
+      cache_creation_input_tokens: 0,
+      output_tokens: output,
+      reasoning_output_tokens: 0,
+      total_tokens: input + output,
+    });
+    const common = [
+      { timestamp: "2026-08-08T02:00:00Z", type: "session_meta", payload: { id: UUID_A, cwd: "/repo", model_provider: "openai" } },
+      { timestamp: "2026-08-08T02:00:01Z", type: "turn_context", payload: { turn_id: "turn-1", cwd: "/repo", model: "gpt-test" } },
+      { timestamp: "2026-08-08T02:00:02Z", type: "event_msg", payload: { type: "user_message", message: "go" } },
+      { timestamp: "2026-08-08T02:00:03Z", type: "event_msg", payload: { type: "token_count", info: { last_token_usage: usage(100, 10), total_token_usage: usage(100, 10) } } },
+    ];
+    const nativeRows = [
+      ...common,
+      { timestamp: "2026-08-08T02:00:04Z", type: "event_msg", payload: { type: "token_count", info: { last_token_usage: usage(20, 2), total_token_usage: usage(120, 12) } } },
+    ];
+    const wslRows = [
+      ...common,
+      { timestamp: "2026-08-08T02:00:05Z", type: "event_msg", payload: { type: "token_count", info: { last_token_usage: usage(30, 3), total_token_usage: usage(130, 13) } } },
+    ];
+    const native = seedRoot(tmp, "native", UUID_A, 1_000_000, `${nativeRows.map(JSON.stringify).join("\n")}\n`);
+    const wsl = seedRoot(tmp, "wsl", UUID_A, 2_000_000, `${wslRows.map(JSON.stringify).join("\n")}\n`);
+
+    const session = await scanCodexSession([native, wsl]);
+    assert.equal(session.tokens.input_tokens, 150);
+    assert.equal(session.tokens.output_tokens, 15);
+    assert.equal(session.total_tokens, 165);
+    assert.equal(session.turns, 1);
   });
 });

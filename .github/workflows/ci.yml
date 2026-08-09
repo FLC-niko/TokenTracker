@@ -8,7 +8,10 @@ on:
 
 concurrency:
   group: ci-${{ github.ref }}
-  cancel-in-progress: true
+  # A main commit that changes package.json is the immutable npm candidate.
+  # Cancelling it lets a later, same-version commit publish code that never
+  # existed at the version bump SHA. Keep main runs; only supersede PR runs.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 permissions:
   contents: read

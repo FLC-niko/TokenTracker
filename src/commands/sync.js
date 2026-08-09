@@ -458,10 +458,12 @@ async function cmdSync(argv, context = {}) {
     process.stderr.write(await recordSyncSkip(trackerDir, lockPath));
     return;
   }
-  await clearSyncSkip(trackerDir);
-
   let progress = null;
   try {
+    // Marker cleanup can fail for reasons other than ENOENT (permissions, or a
+    // directory replacing the expected file). Keep it inside the lease's
+    // try/finally so an auxiliary diagnostic never strands the sync lock.
+    await clearSyncSkip(trackerDir);
     progress = !opts.auto ? createProgress({ stream: process.stdout }) : null;
     const configPath = path.join(trackerDir, "config.json");
     const cursorsPath = path.join(trackerDir, "cursors.json");

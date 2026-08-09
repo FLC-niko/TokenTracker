@@ -1233,7 +1233,11 @@ async function parseOpencodeIncremental({
     const size = Number.isFinite(st.size) ? st.size : 0;
     const mtimeMs = Number.isFinite(st.mtimeMs) ? st.mtimeMs : 0;
     const unchanged =
-      prev && prev.inode === inode && prev.size === size && prev.mtimeMs === mtimeMs;
+      prev &&
+      prev.inode === inode &&
+      prev.size === size &&
+      prev.mtimeMs === mtimeMs &&
+      prev.opencodeForkRepairVersion === 1;
     if (unchanged) {
       filesProcessed += 1;
       if (cb) {
@@ -1287,6 +1291,7 @@ async function parseOpencodeIncremental({
       mtimeMs,
       lastTotals: result.lastTotals,
       messageKey: result.messageKey || null,
+      opencodeForkRepairVersion: 1,
       updatedAt: new Date().toISOString(),
     };
 
@@ -1300,6 +1305,7 @@ async function parseOpencodeIncremental({
         messageKey: result.messageKey,
         totals: result.lastTotals,
         fingerprint: result.fingerprint || null,
+        dedupedForkCopy: result.dedupedForkCopy === true,
       });
     }
 
@@ -2630,16 +2636,41 @@ async function parseOpencodeMessageFile({
   // `Session.fork` re-materialises the parent's prefix under new message ids in
   // a new session — count it once (issue #426, see deriveOpencodeMessageFingerprint).
   const fingerprint = deriveOpencodeMessageFingerprint({ msg, totals: currentTotals, source });
-  if (!lastTotals && isOpencodeForkCopy(fingerprintIndex, fingerprint, messageKey)) {
-    return { messageKey, lastTotals: null, fingerprint, eventsAggregated: 0, shouldUpdate: false };
+  if (isOpencodeForkCopy(fingerprintIndex, fingerprint, messageKey)) {
+    if (lastTotals && prev?.dedupedForkCopy !== true) {
+      repairCountedOpencodeForkCopy({
+        msg,
+        totals: lastTotals,
+        source,
+        hourlyState,
+        touchedBuckets,
+        projectState,
+        projectTouchedBuckets,
+        projectRef,
+        projectKey,
+      });
+    }
+    return {
+      messageKey,
+      lastTotals: currentTotals,
+      fingerprint,
+      dedupedForkCopy: true,
+      eventsAggregated: 0,
+      shouldUpdate: prev?.dedupedForkCopy !== true || !lastTotals,
+    };
   }
 
-  const delta = diffGeminiTotals(currentTotals, lastTotals);
+  // A formerly deduped copy can become a genuinely distinct in-place update.
+  // Its prior totals were removed from the buckets, so re-add the full current
+  // snapshot instead of only the delta from the suppressed value.
+  const effectiveLastTotals = prev?.dedupedForkCopy === true ? null : lastTotals;
+  const delta = diffGeminiTotals(currentTotals, effectiveLastTotals);
   if (!delta || isAllZeroUsage(delta)) {
     return {
       messageKey,
       lastTotals: currentTotals,
       fingerprint,
+      dedupedForkCopy: false,
       eventsAggregated: 0,
       shouldUpdate: true,
     };
@@ -2686,6 +2717,7 @@ async function parseOpencodeMessageFile({
     messageKey,
     lastTotals: currentTotals,
     fingerprint,
+    dedupedForkCopy: false,
     eventsAggregated: 1,
     shouldUpdate: true,
   };
@@ -3276,13 +3308,15 @@ function deriveOpencodeMessageFingerprint({ msg, totals, source }) {
   return crypto.createHash("sha256").update(raw).digest("base64url").slice(0, 22);
 }
 
-// `fingerprint -> messageKey` for the messages already counted in this cursor
-// namespace. Rebuilt per parse run; entries written before this version carry no
-// fingerprint and simply do not participate (no retroactive rewrite of history).
+// `fingerprint -> messageKey` for counted messages in this cursor namespace.
+// Rebuilt per parse run. Pre-#426 entries are fingerprinted as they are read;
+// the first claims ownership and later cross-session matches are retracted from
+// persisted buckets once. Tombstoned copies never claim ownership themselves.
 function buildOpencodeFingerprintIndex(messageIndex) {
   const byFingerprint = new Map();
   if (!messageIndex || typeof messageIndex !== "object") return byFingerprint;
   for (const [key, entry] of Object.entries(messageIndex)) {
+    if (entry?.dedupedForkCopy === true) continue;
     const fingerprint = entry && typeof entry.fingerprint === "string" ? entry.fingerprint : null;
     if (fingerprint && !byFingerprint.has(fingerprint)) byFingerprint.set(fingerprint, key);
   }
@@ -3314,13 +3348,25 @@ function isOpencodeForkCopy(fingerprintIndex, fingerprint, messageKey) {
 // cursor untouched. A falsy `fingerprint` means "unknown" and preserves whatever
 // the entry already carried; a new one releases the old claim so a stale
 // mid-stream snapshot cannot shadow an unrelated message later.
-function recordOpencodeMessage({ messageIndex, fingerprintIndex, messageKey, totals, fingerprint }) {
+function recordOpencodeMessage({
+  messageIndex,
+  fingerprintIndex,
+  messageKey,
+  totals,
+  fingerprint,
+  dedupedForkCopy = false,
+}) {
   if (!messageIndex || !messageKey) return;
   const prev = messageIndex[messageKey];
   const prevTotals = prev && typeof prev.lastTotals === "object" ? prev.lastTotals : null;
   const prevFingerprint = prev && typeof prev.fingerprint === "string" ? prev.fingerprint : null;
   const nextFingerprint = fingerprint || prevFingerprint;
-  if (sameGeminiTotals(totals, prevTotals) && prevFingerprint === nextFingerprint) return;
+  const prevDeduped = prev?.dedupedForkCopy === true;
+  if (
+    sameGeminiTotals(totals, prevTotals) &&
+    prevFingerprint === nextFingerprint &&
+    prevDeduped === Boolean(dedupedForkCopy)
+  ) return;
 
   if (fingerprintIndex && prevFingerprint && prevFingerprint !== nextFingerprint) {
     if (fingerprintIndex.get(prevFingerprint) === messageKey) {
@@ -3329,10 +3375,50 @@ function recordOpencodeMessage({ messageIndex, fingerprintIndex, messageKey, tot
   }
   const entry = { lastTotals: totals, updatedAt: new Date().toISOString() };
   if (nextFingerprint) entry.fingerprint = nextFingerprint;
+  if (dedupedForkCopy) entry.dedupedForkCopy = true;
   messageIndex[messageKey] = entry;
-  if (fingerprintIndex && nextFingerprint && !fingerprintIndex.has(nextFingerprint)) {
+  if (
+    fingerprintIndex &&
+    nextFingerprint &&
+    !dedupedForkCopy &&
+    !fingerprintIndex.has(nextFingerprint)
+  ) {
     fingerprintIndex.set(nextFingerprint, messageKey);
   }
+}
+
+function repairCountedOpencodeForkCopy({
+  msg,
+  totals,
+  source,
+  hourlyState,
+  touchedBuckets,
+  projectState,
+  projectTouchedBuckets,
+  projectRef,
+  projectKey,
+}) {
+  const timestampMs = coerceEpochMs(msg?.time?.completed) || coerceEpochMs(msg?.time?.created);
+  if (!timestampMs) return false;
+  const bucketStart = toUtcHalfHourStart(new Date(timestampMs).toISOString());
+  if (!bucketStart) return false;
+  const model = normalizeModelInput(msg?.modelID || msg?.model || msg?.modelId) || DEFAULT_MODEL;
+  const counted = { ...totals, conversation_count: 1 };
+  const bucket = getHourlyBucket(hourlyState, source, model, bucketStart);
+  subtractTotals(bucket.totals, counted);
+  touchedBuckets.add(bucketKey(source, model, bucketStart));
+  if (projectKey && projectState && projectTouchedBuckets) {
+    const projectBucket = getProjectBucket(
+      projectState,
+      projectKey,
+      source,
+      bucketStart,
+      projectRef,
+    );
+    subtractTotals(projectBucket.totals, counted);
+    projectTouchedBuckets.add(projectBucketKey(projectKey, source, bucketStart));
+  }
+  return true;
 }
 
 function getHourlyBucket(state, source, model, hourStart) {
@@ -4390,19 +4476,53 @@ async function parseOpencodeDbIncremental({
       continue;
     }
 
-    // A fork copy of an already-counted turn contributes nothing — skip it
-    // outright so it never claims an index entry of its own (issue #426).
+    // A fork copy of an already-counted turn contributes nothing. Existing
+    // pre-#426 cursor entries were already added to hourly/project buckets;
+    // retract those once, then persist a tombstone so a later sync is a no-op.
     const fingerprint = deriveOpencodeMessageFingerprint({
       msg,
       totals: currentTotals,
       source: defaultSource,
     });
-    if (!lastTotals && isOpencodeForkCopy(fingerprintIndex, fingerprint, messageKey)) {
+    if (isOpencodeForkCopy(fingerprintIndex, fingerprint, messageKey)) {
+      let projectContext = null;
+      if (lastTotals && prev?.dedupedForkCopy !== true && projectEnabled) {
+        projectContext = await resolveProjectContextForDb({
+          msg,
+          dbPath,
+          projectMetaCache,
+          publicRepoCache,
+          publicRepoResolver,
+          projectState,
+        });
+      }
+      if (lastTotals && prev?.dedupedForkCopy !== true) {
+        repairCountedOpencodeForkCopy({
+          msg,
+          totals: lastTotals,
+          source: defaultSource,
+          hourlyState,
+          touchedBuckets,
+          projectState,
+          projectTouchedBuckets,
+          projectRef: projectContext?.projectRef || null,
+          projectKey: projectContext?.projectKey || null,
+        });
+      }
+      recordOpencodeMessage({
+        messageIndex,
+        fingerprintIndex,
+        messageKey,
+        totals: currentTotals,
+        fingerprint,
+        dedupedForkCopy: true,
+      });
       messagesProcessed += 1;
       continue;
     }
 
-    const delta = diffGeminiTotals(currentTotals, lastTotals);
+    const effectiveLastTotals = prev?.dedupedForkCopy === true ? null : lastTotals;
+    const delta = diffGeminiTotals(currentTotals, effectiveLastTotals);
     if (!delta || isAllZeroUsage(delta)) {
       // Refresh the index even without a delta: normalization may have changed,
       // and pre-#426 entries need their fingerprint backfilled so a fork taken
@@ -4413,6 +4533,7 @@ async function parseOpencodeDbIncremental({
         messageKey,
         totals: currentTotals,
         fingerprint,
+        dedupedForkCopy: false,
       });
       messagesProcessed += 1;
       if (cb) {
@@ -4476,6 +4597,7 @@ async function parseOpencodeDbIncremental({
       messageKey,
       totals: currentTotals,
       fingerprint,
+      dedupedForkCopy: false,
     });
     messagesProcessed += 1;
     eventsAggregated += 1;

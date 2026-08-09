@@ -246,3 +246,20 @@ test("sync clears a stale skip marker once the lock is acquired again", async ()
     assert.equal(await exists(markerPath), false);
   });
 });
+
+test("sync releases its lock when stale skip marker cleanup fails", async () => {
+  await withTempHome(async (home) => {
+    const trackerDir = path.join(home, ".tokentracker", "tracker");
+    await fs.mkdir(path.join(trackerDir, "sync.skip.json"), { recursive: true });
+
+    await assert.rejects(cmdSync(["--auto"]), (error) => (
+      error?.code === "EISDIR" || error?.code === "EPERM"
+    ));
+
+    assert.equal(
+      await exists(path.join(trackerDir, "sync.lock")),
+      false,
+      "marker cleanup errors must not strand the acquired sync lease",
+    );
+  });
+});

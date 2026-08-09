@@ -185,6 +185,75 @@ test("parseOpencodeDbIncremental dedupes a fork discovered in a LATER sync run",
   });
 });
 
+test("parseOpencodeDbIncremental repairs fork copies counted before fingerprints existed", async () => {
+  await withTmp(async (tmp) => {
+    const queuePath = path.join(tmp, "queue.jsonl");
+    const cursors = newCursors();
+    const base = Date.parse(HOUR);
+    const parent = msg({
+      id: "msg_parent",
+      sessionID: "ses_parent",
+      created: base + 1000,
+      input: 1000,
+      output: 100,
+    });
+    const fork = msg({
+      id: "msg_fork",
+      sessionID: "ses_fork",
+      created: base + 1000,
+      input: 1000,
+      output: 100,
+    });
+
+    await parseOpencodeDbIncremental({
+      dbMessages: [parent],
+      cursors,
+      queuePath,
+      source: "opencode",
+      cursorKey: "opencode",
+    });
+
+    // Recreate the state shipped before #426: both session/message ids were
+    // present and both snapshots had already been added to the same bucket.
+    const parentEntry = cursors.opencode.messages["ses_parent|msg_parent"];
+    cursors.opencode.messages["ses_fork|msg_fork"] = {
+      lastTotals: { ...parentEntry.lastTotals },
+      fingerprint: parentEntry.fingerprint,
+      updatedAt: new Date().toISOString(),
+    };
+    const bucket = Object.values(cursors.hourly.buckets)[0];
+    for (const key of Object.keys(bucket.totals)) bucket.totals[key] *= 2;
+    bucket.queuedKey = null;
+
+    const repaired = await parseOpencodeDbIncremental({
+      dbMessages: [parent, fork],
+      cursors,
+      queuePath,
+      source: "opencode",
+      cursorKey: "opencode",
+    });
+    assert.equal(repaired.eventsAggregated, 0);
+    assert.equal((await queueTotals(queuePath)).input_tokens, 1000);
+    assert.equal((await queueTotals(queuePath)).output_tokens, 100);
+    assert.equal(bucket.totals.conversation_count, 1);
+    assert.equal(
+      cursors.opencode.messages["ses_fork|msg_fork"].dedupedForkCopy,
+      true,
+    );
+
+    const afterRepair = await queueTotals(queuePath);
+    await parseOpencodeDbIncremental({
+      dbMessages: [parent, fork],
+      cursors,
+      queuePath,
+      source: "opencode",
+      cursorKey: "opencode",
+    });
+    assert.deepEqual(await queueTotals(queuePath), afterRepair, "repair must be idempotent");
+    assert.equal(bucket.totals.conversation_count, 1);
+  });
+});
+
 test("parseOpencodeDbIncremental dedupes a fork seen BEFORE its parent (order independence)", async () => {
   await withTmp(async (tmp) => {
     const queuePath = path.join(tmp, "queue.jsonl");

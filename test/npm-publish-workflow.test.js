@@ -10,6 +10,7 @@ const WORKFLOW_PATH = path.join(
   "workflows",
   "npm-publish.yml"
 );
+const CI_WORKFLOW_PATH = path.join(__dirname, "..", ".github", "workflows", "ci.yml");
 
 function loadWorkflow() {
   return fs.readFileSync(WORKFLOW_PATH, "utf8");
@@ -27,6 +28,14 @@ test("workflow triggers only after canonical CI completes on main", () => {
   assert.ok(
     content.includes("branches: [main]"),
     "should target main branch only"
+  );
+});
+
+test("canonical CI never cancels an in-flight main version commit", () => {
+  const content = fs.readFileSync(CI_WORKFLOW_PATH, "utf8");
+  assert.ok(
+    content.includes("cancel-in-progress: ${{ github.event_name == 'pull_request' }}"),
+    "main CI runs must survive later pushes so npm remains pinned to the version commit",
   );
 });
 
@@ -50,6 +59,7 @@ test("successful push CI gates publish and the exact tested SHA is checked out",
     content.includes("ref: ${{ github.event.workflow_run.head_sha }}"),
     "publish must build the exact commit that passed CI"
   );
+  assert.ok(content.includes("fetch-depth: 2"), "publish must inspect the tested commit's parent");
   assert.ok(!content.includes("\n  test:"), "must not maintain a weaker duplicate test job");
 });
 
@@ -66,6 +76,14 @@ test("workflow checks version before publishing", () => {
   assert.ok(
     content.includes("npm view tokentracker-cli"),
     "should check if version already exists on npm"
+  );
+  assert.ok(
+    content.includes("git show HEAD^:package.json"),
+    "only the tested commit that changed package.json may publish"
+  );
+  assert.ok(
+    content.includes("outputs.eligible == 'true'"),
+    "publish steps must require an exact version-changing commit"
   );
 });
 
