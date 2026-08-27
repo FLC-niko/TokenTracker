@@ -1215,8 +1215,10 @@ function formatCopilotLines({ token, otel, sessionStore, appDb }) {
   const appDbState = appDb?.app_db_has_file
     ? `${appDb.app_db_mode || "set"} (${(appDb.app_db_paths || []).join(", ")})`
     : `not found (${appDb?.app_db_path || "unknown"})`;
+  const otelLocation =
+    otel.otel_path || otel.otel_detected_paths?.[0] || otel.otel_default_dir;
   const usageState = otel.otel_has_files
-    ? `set (${otel.otel_path || otel.otel_default_dir})`
+    ? `set (${otelLocation})`
     : otel.otel_enabled
       ? "enabled but no files yet"
       : "unset (OTEL export not enabled)";

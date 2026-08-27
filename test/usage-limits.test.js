@@ -25,6 +25,7 @@ const {
   detectAntigravityProcess,
   fetchAntigravityLimits,
   fetchCopilotLimits,
+  describeCopilotOtelStatus,
 } = require("../src/lib/usage-limits");
 const { writeArkCodingPlanLimitsCache } = require("../src/lib/ark-coding-plan-limits");
 
@@ -308,6 +309,27 @@ function copilotTokenHex(token = makeCopilotTestToken()) {
 }
 
 describe("fetchCopilotLimits", () => {
+  it("detects VS Code Copilot files under .copilot-otel", () => {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "tokentracker-copilot-otel-status-"));
+    try {
+      const chatDir = path.join(tmp, ".copilot-otel");
+      fs.mkdirSync(chatDir, { recursive: true });
+      fs.writeFileSync(path.join(chatDir, "copilot.jsonl"), "", "utf8");
+
+      const result = describeCopilotOtelStatus({ home: tmp, env: { HOME: tmp } });
+      assert.equal(result.otel_has_files, true);
+      assert.deepEqual(result.otel_default_dirs, [
+        path.join(tmp, ".copilot", "otel"),
+        chatDir,
+      ]);
+      assert.deepEqual(result.otel_detected_paths, [
+        path.join(chatDir, "copilot.jsonl"),
+      ]);
+    } finally {
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
   it("fetches Copilot limits with a schema-v0 auth.db token", async () => {
     const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "tokentracker-copilot-limits-v0-"));
     try {

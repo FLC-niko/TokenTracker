@@ -13313,7 +13313,7 @@ async function parseCraftIncremental({
 //   COPILOT_OTEL_ENABLED=true
 //   COPILOT_OTEL_EXPORTER_TYPE=file
 //   COPILOT_OTEL_FILE_EXPORTER_PATH=$HOME/.copilot/otel/copilot-otel-...jsonl
-// We scan the default directory plus the env-overridden path.
+// We scan both known default directories plus the env-overridden path.
 // ─────────────────────────────────────────────────────────────────────────────
 
 function resolveCopilotOtelPaths(env = process.env) {
@@ -13328,12 +13328,19 @@ function resolveCopilotOtelPaths(env = process.env) {
     } catch (_e) {}
   };
   if (process.platform !== "win32" || wsl.shouldProbeNative(env)) {
-    scanDir(path.join(home, ".copilot", "otel"));
+    for (const dir of [
+      path.join(home, ".copilot", "otel"),
+      path.join(home, ".copilot-otel"),
+    ]) {
+      scanDir(dir);
+    }
   }
   if (process.platform === "win32") {
     if (wsl.shouldProbeWsl(env)) {
-      const wslDir = wsl.discoverWslHome(".copilot/otel", { env });
-      if (wslDir) scanDir(wslDir);
+      for (const providerDir of [".copilot/otel", ".copilot-otel"]) {
+        const wslDir = wsl.discoverWslHome(providerDir, { env });
+        if (wslDir) scanDir(wslDir);
+      }
     }
   }
   const explicit = env.COPILOT_OTEL_FILE_EXPORTER_PATH;
@@ -13375,7 +13382,7 @@ function pickCopilotModel(attrs) {
   return null;
 }
 
-const COPILOT_PARSER_VERSION = 2;
+const COPILOT_PARSER_VERSION = 3;
 const COPILOT_USAGE_CLAIM_RETENTION_MS = 7 * 24 * 60 * 60 * 1000;
 const COPILOT_USAGE_CLAIM_MAX_ENTRIES = 10_000;
 
@@ -13432,12 +13439,166 @@ function incrementMapCount(map, key, amount = 1) {
   map.set(key, (map.get(key) || 0) + amount);
 }
 
-function getCopilotDedupKey(record, attrs = record?.attributes || {}) {
+function getCopilotResponseId(attrs = {}) {
+  const responseId = attrs["gen_ai.response.id"];
+  return typeof responseId === "string" && responseId.trim() ? responseId.trim() : "";
+}
+
+// v2 preferred spanContext for every OTEL envelope. Chat-extension LogRecords
+// can share that nested context across several model requests, so keep the old
+// key only for the one envelope that owns top-level traceId/spanId: CLI spans.
+function getCopilotLegacyDedupKey(record, attrs = record?.attributes || {}) {
   const traceId = record?.traceId || record?.spanContext?.traceId || "";
   const spanId = record?.spanId || record?.spanContext?.spanId || "";
-  const responseId =
-    typeof attrs["gen_ai.response.id"] === "string" ? attrs["gen_ai.response.id"] : "";
+  const responseId = getCopilotResponseId(attrs);
   return traceId && spanId ? `${traceId}:${spanId}` : responseId ? `resp:${responseId}` : null;
+}
+
+function getCopilotDedupKey(record, attrs = record?.attributes || {}) {
+  const responseId = getCopilotResponseId(attrs);
+  if (!isCopilotV1ChatSpan(record)) {
+    return responseId ? `resp:${responseId}` : null;
+  }
+
+  const traceId = record?.traceId || "";
+  const spanId = record?.spanId || "";
+  return traceId && spanId
+    ? `${traceId}:${spanId}`
+    : responseId
+      ? `resp:${responseId}`
+      : null;
+}
+
+function copilotOtelAggregateKey(model, bucketStart) {
+  return JSON.stringify([model, bucketStart]);
+}
+
+function addCopilotOtelAggregate(aggregates, model, bucketStart, delta) {
+  const key = copilotOtelAggregateKey(model, bucketStart);
+  let totals = aggregates.get(key);
+  if (!totals) {
+    totals = initTotals();
+    aggregates.set(key, totals);
+  }
+  addTotals(totals, delta);
+}
+
+function copilotTotalsCover(existing, required) {
+  if (!existing || typeof existing !== "object") return false;
+  for (const field of [
+    "input_tokens",
+    "cached_input_tokens",
+    "cache_creation_input_tokens",
+    "output_tokens",
+    "reasoning_output_tokens",
+    "total_tokens",
+    "billable_total_tokens",
+    "conversation_count",
+  ]) {
+    const actual = Number(existing[field] || 0);
+    const needed = Number(required?.[field] || 0);
+    if (!Number.isFinite(actual) || !Number.isFinite(needed) || actual < needed) {
+      return false;
+    }
+  }
+  return true;
+}
+
+function extractCopilotOtelUsage(record) {
+  if (!isCopilotChatSpan(record)) return null;
+
+  const attrs = record.attributes || {};
+  const inputRaw = toNonNegativeInt(attrs["gen_ai.usage.input_tokens"]);
+  const output = toNonNegativeInt(attrs["gen_ai.usage.output_tokens"]);
+  const cacheRead = toNonNegativeInt(
+    attrs["gen_ai.usage.cache_read.input_tokens"] ??
+      attrs["gen_ai.usage.cache_read_input_tokens"] ??
+      attrs["gen_ai.usage.cached_input_tokens"],
+  );
+  // Copilot CLI: cache_write.input_tokens; Copilot Chat extension: cache_creation.input_tokens
+  const cacheWrite = toNonNegativeInt(
+    attrs["gen_ai.usage.cache_write.input_tokens"] ??
+      attrs["gen_ai.usage.cache_creation.input_tokens"] ??
+      attrs["gen_ai.usage.cache_write_input_tokens"] ??
+      attrs["gen_ai.usage.cache_creation_input_tokens"],
+  );
+  // Copilot CLI: reasoning.output_tokens; Copilot Chat extension: reasoning_tokens
+  const reasoning = toNonNegativeInt(
+    attrs["gen_ai.usage.reasoning.output_tokens"] ??
+      attrs["gen_ai.usage.reasoning_tokens"] ??
+      attrs["gen_ai.usage.reasoning_output_tokens"],
+  );
+  const reasoningClamped = Math.min(reasoning, output);
+  const outputWithoutReasoning = Math.max(0, output - reasoningClamped);
+  const cliSpan = isCopilotV1ChatSpan(record);
+  // CLI input includes both cache reads and writes. Chat-extension LogRecords
+  // expose cache creation separately, so preserve their existing input-minus-read semantics.
+  const cacheReadClamped = Math.min(cacheRead, inputRaw);
+  const cacheWriteClamped = Math.min(
+    cacheWrite,
+    Math.max(0, inputRaw - cacheReadClamped),
+  );
+  const cacheWriteForAccounting = cliSpan ? cacheWriteClamped : cacheWrite;
+  const input = Math.max(
+    0,
+    inputRaw - cacheReadClamped - (cliSpan ? cacheWriteClamped : 0),
+  );
+  const totalInteresting =
+    input +
+    outputWithoutReasoning +
+    cacheReadClamped +
+    cacheWriteForAccounting +
+    reasoningClamped;
+  if (totalInteresting === 0) return null;
+
+  // CLI Span uses endTime/startTime; Chat extension LogRecord uses hrTime/hrTimeObserved.
+  const tsMs =
+    copilotOtelTimeToMs(record.endTime) ||
+    copilotOtelTimeToMs(record.startTime) ||
+    copilotOtelTimeToMs(record.hrTime) ||
+    copilotOtelTimeToMs(record.hrTimeObserved);
+  if (!tsMs) return null;
+  const bucketStart = toUtcHalfHourStart(new Date(tsMs).toISOString());
+  if (!bucketStart) return null;
+
+  const model =
+    normalizeCopilotAppModel(pickCopilotModel(attrs)) ||
+    COPILOT_APP_DEFAULT_MODEL;
+  const cliSessionId =
+    typeof attrs["gen_ai.conversation.id"] === "string"
+      ? attrs["gen_ai.conversation.id"].trim()
+      : "";
+  const matchBase = {
+    sessionId: cliSessionId,
+    model,
+    output: outputWithoutReasoning,
+    cacheRead: cacheReadClamped,
+    cacheWrite: cacheWriteClamped,
+    reasoning: reasoningClamped,
+    tsMs,
+  };
+  return {
+    bucketStart,
+    cliSpan,
+    cliSessionId,
+    delta: {
+      input_tokens: input,
+      cached_input_tokens: cacheReadClamped,
+      cache_creation_input_tokens: cacheWriteForAccounting,
+      output_tokens: outputWithoutReasoning,
+      reasoning_output_tokens: reasoningClamped,
+      total_tokens:
+        input +
+        outputWithoutReasoning +
+        cacheReadClamped +
+        cacheWriteForAccounting +
+        reasoningClamped,
+      conversation_count: 1,
+    },
+    matchBase,
+    model,
+    tsMs,
+  };
 }
 
 function copilotUsageMatchKey({
@@ -13497,6 +13658,141 @@ function createCopilotStoreUsageMatcher(events) {
       return true;
     },
   };
+}
+
+// v2 may already have advanced the file cursor while collapsing several Chat
+// extension LogRecords that shared one nested spanContext. Recompute only that
+// envelope's historical contribution and apply the delta to the existing
+// Copilot buckets. CLI spans are deliberately left alone: their v2 key was the
+// correct top-level traceId:spanId key, and session-store adoption can coexist
+// with the OTEL parser.
+async function migrateCopilotChatLogRecordDedup({
+  files,
+  fileOffsets,
+  hourlyState,
+  touchedBuckets,
+  seenIds,
+} = {}) {
+  const trackedFiles = Object.keys(fileOffsets || {}).filter(
+    (filePath) => Number(fileOffsets[filePath]?.size) > 0,
+  );
+  if (trackedFiles.length === 0) {
+    return { applied: true, changed: false };
+  }
+
+  const availableFiles = new Set(Array.isArray(files) ? files : []);
+  if (trackedFiles.some((filePath) => !availableFiles.has(filePath))) {
+    return { applied: false, reason: "a previously parsed OTEL file is unavailable" };
+  }
+
+  const oldSeen = new Set();
+  const newSeen = new Set();
+  const oldTotals = new Map();
+  const newTotals = new Map();
+
+  for (const filePath of files) {
+    if (!Object.prototype.hasOwnProperty.call(fileOffsets, filePath)) continue;
+    const prevEntry = fileOffsets[filePath] || {};
+    const prevSize = Number(prevEntry.size) || 0;
+    if (prevSize <= 0) continue;
+
+    let stat;
+    try {
+      stat = fssync.statSync(filePath);
+    } catch (_e) {
+      return { applied: false, reason: "a previously parsed OTEL file is unreadable" };
+    }
+    if (
+      stat.size < prevSize ||
+      (typeof prevEntry.ino === "number" && stat.ino !== prevEntry.ino)
+    ) {
+      return { applied: false, reason: "a previously parsed OTEL file changed during migration" };
+    }
+
+    let stream;
+    try {
+      stream = fssync.createReadStream(filePath, {
+        encoding: "utf8",
+        start: 0,
+        end: prevSize - 1,
+      });
+      const rl = readline.createInterface({ input: stream, crlfDelay: Infinity });
+      try {
+        for await (const line of rl) {
+          if (!line || !line.trim()) continue;
+          let record;
+          try {
+            record = JSON.parse(line);
+          } catch (_e) {
+            continue;
+          }
+          const usage = extractCopilotOtelUsage(record);
+          if (!usage || usage.cliSpan) continue;
+
+          const oldKey = getCopilotLegacyDedupKey(record, record.attributes || {});
+          const oldDuplicate = oldKey && oldSeen.has(oldKey);
+          if (oldKey) oldSeen.add(oldKey);
+          if (!oldDuplicate) {
+            addCopilotOtelAggregate(
+              oldTotals,
+              usage.model,
+              usage.bucketStart,
+              usage.delta,
+            );
+          }
+
+          const newKey = getCopilotDedupKey(record, record.attributes || {});
+          const newDuplicate = newKey && newSeen.has(newKey);
+          if (newKey) newSeen.add(newKey);
+          if (!newDuplicate) {
+            addCopilotOtelAggregate(
+              newTotals,
+              usage.model,
+              usage.bucketStart,
+              usage.delta,
+            );
+          }
+        }
+      } finally {
+        rl.close();
+      }
+    } catch (_e) {
+      return { applied: false, reason: "an OTEL file could not be scanned" };
+    } finally {
+      stream?.destroy();
+    }
+  }
+
+  const keys = new Set([...oldTotals.keys(), ...newTotals.keys()]);
+  for (const key of keys) {
+    const [model, bucketStart] = JSON.parse(key);
+    const oldUsage = oldTotals.get(key) || initTotals();
+    if (!copilotTotalsCover(
+      hourlyState.buckets[bucketKey("copilot", model, bucketStart)]?.totals,
+      oldUsage,
+    )) {
+      return {
+        applied: false,
+        reason: "existing Copilot buckets do not cover the old OTEL contribution",
+      };
+    }
+  }
+
+  let changed = false;
+  for (const key of keys) {
+    const [model, bucketStart] = JSON.parse(key);
+    const oldUsage = oldTotals.get(key) || initTotals();
+    const newUsage = newTotals.get(key) || initTotals();
+    if (totalsKey(oldUsage) === totalsKey(newUsage)) continue;
+    const bucket = getHourlyBucket(hourlyState, "copilot", model, bucketStart);
+    subtractTotals(bucket.totals, oldUsage);
+    addTotals(bucket.totals, newUsage);
+    touchedBuckets.add(bucketKey("copilot", model, bucketStart));
+    changed = true;
+  }
+
+  for (const id of newSeen) seenIds.add(id);
+  return { applied: true, changed };
 }
 
 // Migration helper: stream the bytes v1 already saw (0 -> prevSize), classify
@@ -13612,12 +13908,18 @@ async function parseCopilotIncremental({
     seenIds.size > 0 || Object.keys(fileOffsetsRaw).length > 0;
   let usageClaimsComplete =
     copilotState.usageClaimsComplete === true || !hadPriorUsageHistory;
+  const files = Array.isArray(otelPaths) && otelPaths.length > 0
+    ? otelPaths
+    : resolveCopilotOtelPaths(env || process.env);
+  const hourlyState = normalizeHourlyState(cursors?.hourly);
+  const touchedBuckets = new Set();
   const migrationSkipLineHashes = new Map();
+  let cursorVersion = COPILOT_PARSER_VERSION;
   // One-shot v1->v2 migration:
   // - pure v2-only files: clear offset and re-read all skipped Chat records
   // - pure v1 CLI files: preserve offset to avoid replaying history beyond seenIds
   // - mixed files: clear offset, but skip old v1 CLI lines by hash during replay
-  if (priorVersion < COPILOT_PARSER_VERSION) {
+  if (priorVersion < 2) {
     for (const filePath of Object.keys(fileOffsets)) {
       const prevSize = Number(fileOffsets[filePath]?.size) || 0;
       const scan = await scanCopilotV1MigrationFile(filePath, prevSize);
@@ -13630,13 +13932,33 @@ async function parseCopilotIncremental({
     }
   }
 
-  const files = Array.isArray(otelPaths) && otelPaths.length > 0
-    ? otelPaths
-    : resolveCopilotOtelPaths(env || process.env);
+  // v2 used spanContext as the fallback key for Chat-extension LogRecords.
+  // Those records can share one context across multiple model requests, so
+  // repair the already-counted file prefix before switching to response.id.
+  // If the prefix cannot be verified, leave the cursor at v2 and retry on the
+  // next sync rather than replaying it with a different deduplication scheme.
+  if (priorVersion === 2) {
+    const migration = await migrateCopilotChatLogRecordDedup({
+      files,
+      fileOffsets,
+      hourlyState,
+      touchedBuckets,
+      seenIds,
+    });
+    if (!migration.applied) {
+      return {
+        recordsProcessed: 0,
+        eventsAggregated: 0,
+        bucketsQueued: 0,
+        usageClaims: recentOtelUsageEvents,
+      };
+    }
+  }
+
   if (files.length === 0) {
     cursors.copilot = {
       ...copilotState,
-      version: COPILOT_PARSER_VERSION,
+      version: cursorVersion,
       seenIds: Array.from(seenIds),
       fileOffsets,
       recentUsageEvents: recentOtelUsageEvents,
@@ -13650,9 +13972,6 @@ async function parseCopilotIncremental({
       usageClaims: recentOtelUsageEvents,
     };
   }
-
-  const hourlyState = normalizeHourlyState(cursors?.hourly);
-  const touchedBuckets = new Set();
   const cb = typeof onProgress === "function" ? onProgress : null;
   let recordsProcessed = 0;
   let eventsAggregated = 0;
@@ -13712,117 +14031,39 @@ async function parseCopilotIncremental({
       // gen_ai.response.id is per-LLM-call unique.
       const dedupKey = getCopilotDedupKey(record, attrs);
       if (dedupKey && seenIds.has(dedupKey)) continue;
-      if (skipCliSpans && isCopilotV1ChatSpan(record)) {
+      const cliSpan = isCopilotV1ChatSpan(record);
+      if (skipCliSpans && cliSpan) {
         if (dedupKey) seenIds.add(dedupKey);
         continue;
       }
 
-      const inputRaw = toNonNegativeInt(attrs["gen_ai.usage.input_tokens"]);
-      const output = toNonNegativeInt(attrs["gen_ai.usage.output_tokens"]);
-      const cacheRead = toNonNegativeInt(
-        attrs["gen_ai.usage.cache_read.input_tokens"] ??
-          attrs["gen_ai.usage.cache_read_input_tokens"] ??
-          attrs["gen_ai.usage.cached_input_tokens"],
-      );
-      // Copilot CLI: cache_write.input_tokens; Copilot Chat extension: cache_creation.input_tokens
-      const cacheWrite = toNonNegativeInt(
-        attrs["gen_ai.usage.cache_write.input_tokens"] ??
-          attrs["gen_ai.usage.cache_creation.input_tokens"] ??
-          attrs["gen_ai.usage.cache_write_input_tokens"] ??
-          attrs["gen_ai.usage.cache_creation_input_tokens"],
-      );
-      // Copilot CLI: reasoning.output_tokens; Copilot Chat extension: reasoning_tokens
-      const reasoning = toNonNegativeInt(
-        attrs["gen_ai.usage.reasoning.output_tokens"] ??
-          attrs["gen_ai.usage.reasoning_tokens"] ??
-          attrs["gen_ai.usage.reasoning_output_tokens"],
-      );
-      const reasoningClamped = Math.min(reasoning, output);
-      const outputWithoutReasoning = Math.max(0, output - reasoningClamped);
-      const cliSpan = isCopilotV1ChatSpan(record);
-      // CLI input includes both cache reads and writes. Chat-extension
-      // LogRecords expose cache creation separately, so preserve their existing
-      // input-minus-read semantics.
-      const cacheReadClamped = Math.min(cacheRead, inputRaw);
-      const cacheWriteClamped = Math.min(
-        cacheWrite,
-        Math.max(0, inputRaw - cacheReadClamped),
-      );
-      const cacheWriteForAccounting = cliSpan ? cacheWriteClamped : cacheWrite;
-      const input = Math.max(
-        0,
-        inputRaw - cacheReadClamped - (cliSpan ? cacheWriteClamped : 0),
-      );
-      const totalInteresting =
-        input +
-        outputWithoutReasoning +
-        cacheReadClamped +
-        cacheWriteForAccounting +
-        reasoningClamped;
-      if (totalInteresting === 0) continue;
-
-      // CLI Span uses endTime/startTime; Chat extension LogRecord uses hrTime/hrTimeObserved.
-      const tsMs =
-        copilotOtelTimeToMs(record.endTime) ||
-        copilotOtelTimeToMs(record.startTime) ||
-        copilotOtelTimeToMs(record.hrTime) ||
-        copilotOtelTimeToMs(record.hrTimeObserved);
-      if (!tsMs) continue;
-      const tsIso = new Date(tsMs).toISOString();
-      const bucketStart = toUtcHalfHourStart(tsIso);
-      if (!bucketStart) continue;
-
-      const model =
-        normalizeCopilotAppModel(pickCopilotModel(attrs)) ||
-        COPILOT_APP_DEFAULT_MODEL;
-      const cliSessionId =
-        typeof attrs["gen_ai.conversation.id"] === "string"
-          ? attrs["gen_ai.conversation.id"].trim()
-          : "";
-      if (cliSpan && !cliSessionId) usageClaimsComplete = false;
-      const matchBase = {
-        sessionId: cliSessionId,
-        model,
-        output: outputWithoutReasoning,
-        cacheRead: cacheReadClamped,
-        cacheWrite: cacheWriteClamped,
-        reasoning: reasoningClamped,
-        tsMs,
-      };
+      const usage = extractCopilotOtelUsage(record);
+      if (!usage) continue;
+      if (usage.cliSpan && !usage.cliSessionId) usageClaimsComplete = false;
       const matchedStoreUsage =
-        isCopilotV1ChatSpan(record) &&
+        usage.cliSpan &&
         storeUsageMatcher.consume({
-          ...matchBase,
-          input,
+          ...usage.matchBase,
+          input: usage.delta.input_tokens,
         });
       if (matchedStoreUsage) {
         if (dedupKey) seenIds.add(dedupKey);
         continue;
       }
 
-      const delta = {
-        input_tokens: input,
-        cached_input_tokens: cacheReadClamped,
-        cache_creation_input_tokens: cacheWriteForAccounting,
-        output_tokens: outputWithoutReasoning,
-        reasoning_output_tokens: reasoningClamped,
-        total_tokens:
-          input +
-          outputWithoutReasoning +
-          cacheReadClamped +
-          cacheWriteForAccounting +
-          reasoningClamped,
-        conversation_count: 1,
-      };
-
-      const bucket = getHourlyBucket(hourlyState, "copilot", model, bucketStart);
-      addTotals(bucket.totals, delta);
-      touchedBuckets.add(bucketKey("copilot", model, bucketStart));
+      const bucket = getHourlyBucket(
+        hourlyState,
+        "copilot",
+        usage.model,
+        usage.bucketStart,
+      );
+      addTotals(bucket.totals, usage.delta);
+      touchedBuckets.add(bucketKey("copilot", usage.model, usage.bucketStart));
       eventsAggregated++;
-      if (cliSpan && cliSessionId) {
+      if (usage.cliSpan && usage.cliSessionId) {
         recentOtelUsageEvents.push({
-          ...matchBase,
-          input,
+          ...usage.matchBase,
+          input: usage.delta.input_tokens,
           firstSeenAtMs: claimNowMs,
         });
       }
@@ -13864,7 +14105,7 @@ async function parseCopilotIncremental({
   cursors.hourly = hourlyState;
   cursors.copilot = {
     ...copilotState,
-    version: COPILOT_PARSER_VERSION,
+    version: cursorVersion,
     seenIds: cappedSeen,
     fileOffsets,
     recentUsageEvents: retainedRecentOtelUsageEvents,

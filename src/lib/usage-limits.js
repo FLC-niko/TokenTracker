@@ -1845,20 +1845,30 @@ function describeCopilotOtelStatus({ home, env = process.env } = {}) {
   const explicitPath = typeof env.COPILOT_OTEL_FILE_EXPORTER_PATH === "string"
     ? env.COPILOT_OTEL_FILE_EXPORTER_PATH
     : "";
-  const defaultDir = path.join(resolvedHome, ".copilot", "otel");
-  let hasFiles = false;
-  try {
-    if (fs.existsSync(defaultDir)) {
-      hasFiles = fs.readdirSync(defaultDir).some((entry) => entry.endsWith(".jsonl"));
-    }
-  } catch (_e) {}
-  if (!hasFiles && explicitPath && fs.existsSync(explicitPath)) hasFiles = true;
+  const defaultDirs = [
+    path.join(resolvedHome, ".copilot", "otel"),
+    path.join(resolvedHome, ".copilot-otel"),
+  ];
+  const detectedPaths = [];
+  for (const defaultDir of defaultDirs) {
+    try {
+      if (!fs.existsSync(defaultDir)) continue;
+      for (const entry of fs.readdirSync(defaultDir)) {
+        if (entry.endsWith(".jsonl")) {
+          detectedPaths.push(path.join(defaultDir, entry));
+        }
+      }
+    } catch (_e) {}
+  }
+  if (explicitPath && fs.existsSync(explicitPath)) detectedPaths.push(explicitPath);
   return {
     otel_enabled: enabled && (exporterType === "" || exporterType === "file"),
     otel_exporter_type: exporterType || null,
     otel_path: explicitPath || null,
-    otel_default_dir: defaultDir,
-    otel_has_files: hasFiles,
+    otel_default_dir: defaultDirs[0],
+    otel_default_dirs: defaultDirs,
+    otel_detected_paths: detectedPaths,
+    otel_has_files: detectedPaths.length > 0,
   };
 }
 
