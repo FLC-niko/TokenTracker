@@ -14360,7 +14360,10 @@ async function migrateCopilotChatLogRecordDedup({
   }
 
   const keys = new Set([...oldTotals.keys(), ...newTotals.keys()]);
-  for (const key of keys) {
+  // Only keys that existed in the v2 contribution need coverage validation.
+  // A key that exists only in newTotals is a newly recovered Chat request; its
+  // old contribution is zero, so an absent old bucket is expected.
+  for (const key of oldTotals.keys()) {
     const [model, bucketStart] = JSON.parse(key);
     const oldUsage = oldTotals.get(key) || initTotals();
     if (!copilotTotalsCover(

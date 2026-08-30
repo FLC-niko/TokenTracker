@@ -6578,6 +6578,83 @@ test("parseCopilotIncremental repairs v2 Chat deduplication before upgrading the
   }
 });
 
+test("parseCopilotIncremental migrates v2 when a recovered request creates a new bucket", async () => {
+  const tmp = await fs.mkdtemp(path.join(os.tmpdir(), "tt-copilot-v2-new-bucket-"));
+  try {
+    const otelPath = path.join(tmp, "vscode-chat.jsonl");
+    const queuePath = path.join(tmp, "queue.jsonl");
+    const first = makeCopilotChatLogRecord({
+      responseId: "v2-new-bucket-r1",
+      model: "gpt-4o-mini-2024-07-18",
+      inputTokens: 500,
+      outputTokens: 50,
+      cacheRead: 0,
+    });
+    const recovered = makeCopilotChatLogRecord({
+      responseId: "v2-new-bucket-r2",
+      model: "gpt-5.6-luna",
+      inputTokens: 800,
+      outputTokens: 90,
+      cacheRead: 0,
+    });
+    // v2 collapsed these two Chat LogRecords into the first request because
+    // they share a spanContext. v3 must recover the second model's bucket.
+    first.spanContext = { traceId: "v2-new-bucket-trace", spanId: "v2-new-bucket-span" };
+    recovered.spanContext = { traceId: "v2-new-bucket-trace", spanId: "v2-new-bucket-span" };
+    writeCopilotOtelFile(otelPath, [first, recovered]);
+    const stat = fssync.statSync(otelPath);
+    const firstModel = "gpt-4o-mini-2024-07-18";
+    const recoveredModel = "gpt-5.6-luna";
+    const hourStart = "2026-05-13T03:00:00.000Z";
+    const cursors = {
+      copilot: {
+        version: 2,
+        seenIds: ["v2-new-bucket-trace:v2-new-bucket-span"],
+        fileOffsets: {
+          [otelPath]: { size: stat.size, mtimeMs: stat.mtimeMs, ino: stat.ino },
+        },
+      },
+      hourly: {
+        version: 3,
+        buckets: {
+          [bucketKey("copilot", firstModel, hourStart)]: {
+            totals: {
+              input_tokens: 500,
+              cached_input_tokens: 0,
+              cache_creation_input_tokens: 0,
+              output_tokens: 50,
+              reasoning_output_tokens: 0,
+              total_tokens: 550,
+              billable_total_tokens: 550,
+              conversation_count: 1,
+            },
+            queuedKey: null,
+          },
+        },
+        groupQueued: {},
+      },
+    };
+
+    const result = await parseCopilotIncremental({
+      otelPaths: [otelPath],
+      cursors,
+      queuePath,
+    });
+    assert.equal(result.eventsAggregated, 0, "migration should process the historical prefix");
+    assert.equal(cursors.copilot.version, 3, "migration should advance the cursor");
+
+    const recoveredBucket = cursors.hourly.buckets[
+      bucketKey("copilot", recoveredModel, hourStart)
+    ];
+    assert.equal(recoveredBucket.totals.input_tokens, 800);
+    assert.equal(recoveredBucket.totals.output_tokens, 90);
+    assert.equal(recoveredBucket.totals.total_tokens, 890);
+    assert.equal(recoveredBucket.totals.conversation_count, 1);
+  } finally {
+    await fs.rm(tmp, { recursive: true, force: true });
+  }
+});
+
 test("parseCopilotIncremental reads short cache_creation + reasoning_tokens keys (Chat extension)", async () => {
   const tmp = await fs.mkdtemp(path.join(os.tmpdir(), "tt-copilot-"));
   try {
