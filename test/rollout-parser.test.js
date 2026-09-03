@@ -6234,9 +6234,7 @@ test("resolveVsCodeCopilotChatSessionPaths discovers stable and Insiders workspa
       "chatSessions",
     );
     const insidersDir = path.join(
-      tmp,
-      "Library",
-      "Application Support",
+      appData,
       "Code - Insiders",
       "User",
       "workspaceStorage",
