@@ -14269,16 +14269,18 @@ async function migrateCopilotChatLogRecordDedup({
   touchedBuckets,
   seenIds,
 } = {}) {
+  // A v2 cursor can retain an offset for a rotated or deleted OTEL file that
+  // is no longer returned by discovery. Its historical contribution cannot be
+  // reconciled, but the stale offset must not block migration of new files.
+  const availableFiles = new Set(Array.isArray(files) ? files : []);
+  for (const filePath of Object.keys(fileOffsets || {})) {
+    if (!availableFiles.has(filePath)) delete fileOffsets[filePath];
+  }
   const trackedFiles = Object.keys(fileOffsets || {}).filter(
     (filePath) => Number(fileOffsets[filePath]?.size) > 0,
   );
   if (trackedFiles.length === 0) {
     return { applied: true, changed: false };
-  }
-
-  const availableFiles = new Set(Array.isArray(files) ? files : []);
-  if (trackedFiles.some((filePath) => !availableFiles.has(filePath))) {
-    return { applied: false, reason: "a previously parsed OTEL file is unavailable" };
   }
 
   const oldSeen = new Set();

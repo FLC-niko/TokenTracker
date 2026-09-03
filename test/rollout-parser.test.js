@@ -6655,6 +6655,65 @@ test("parseCopilotIncremental migrates v2 when a recovered request creates a new
   }
 });
 
+test("parseCopilotIncremental prunes deleted v2 files before processing new files", async () => {
+  const tmp = await fs.mkdtemp(path.join(os.tmpdir(), "tt-copilot-v2-deleted-file-"));
+  try {
+    const oldPath = path.join(tmp, "copilot-otel-old.jsonl");
+    const newPath = path.join(tmp, "copilot-otel-new.jsonl");
+    const queuePath = path.join(tmp, "queue.jsonl");
+    const oldRecord = makeCopilotChatLogRecord({
+      responseId: "v2-deleted-old",
+      inputTokens: 400,
+      outputTokens: 40,
+      cacheRead: 0,
+    });
+    oldRecord.spanContext = { traceId: "v2-deleted-trace", spanId: "v2-deleted-span" };
+    writeCopilotOtelFile(oldPath, [oldRecord]);
+    const oldStat = fssync.statSync(oldPath);
+
+    writeCopilotOtelFile(newPath, [
+      makeCopilotChatLogRecord({
+        responseId: "v2-new-file",
+        model: "gpt-5.6-luna",
+        inputTokens: 700,
+        outputTokens: 80,
+        cacheRead: 0,
+      }),
+    ]);
+    await fs.rm(oldPath);
+
+    const cursors = {
+      copilot: {
+        version: 2,
+        seenIds: ["v2-deleted-trace:v2-deleted-span"],
+        fileOffsets: {
+          [oldPath]: { size: oldStat.size, mtimeMs: oldStat.mtimeMs, ino: oldStat.ino },
+        },
+      },
+    };
+    const result = await parseCopilotIncremental({
+      otelPaths: [newPath],
+      cursors,
+      queuePath,
+    });
+
+    assert.equal(result.eventsAggregated, 1, "the newly discovered file should be processed");
+    assert.equal(cursors.copilot.version, 3, "migration should advance past the deleted file");
+    assert.equal(cursors.copilot.fileOffsets[oldPath], undefined);
+    assert.equal(cursors.copilot.fileOffsets[newPath].size, fssync.statSync(newPath).size);
+
+    const [bucket] = (await readJsonLines(queuePath)).filter(
+      (entry) => entry.source === "copilot",
+    );
+    assert.equal(bucket.model, "gpt-5.6-luna");
+    assert.equal(bucket.input_tokens, 700);
+    assert.equal(bucket.output_tokens, 80);
+    assert.equal(bucket.total_tokens, 780);
+  } finally {
+    await fs.rm(tmp, { recursive: true, force: true });
+  }
+});
+
 test("parseCopilotIncremental reads short cache_creation + reasoning_tokens keys (Chat extension)", async () => {
   const tmp = await fs.mkdtemp(path.join(os.tmpdir(), "tt-copilot-"));
   try {
