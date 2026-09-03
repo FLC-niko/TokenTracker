@@ -6213,10 +6213,20 @@ test("resolveCopilotOtelPaths discovers both Copilot default locations", async (
 test("resolveVsCodeCopilotChatSessionPaths discovers stable and Insiders workspace sessions", async () => {
   const tmp = await fs.mkdtemp(path.join(os.tmpdir(), "tt-vscode-copilot-paths-"));
   try {
+    let appData;
+    let resolverEnv;
+    if (process.platform === "darwin") {
+      appData = path.join(tmp, "Library", "Application Support");
+      resolverEnv = { HOME: tmp };
+    } else if (process.platform === "win32") {
+      appData = path.join(tmp, "AppData", "Roaming");
+      resolverEnv = { USERPROFILE: tmp, APPDATA: appData };
+    } else {
+      appData = path.join(tmp, ".config");
+      resolverEnv = { HOME: tmp, XDG_CONFIG_HOME: appData };
+    }
     const stableDir = path.join(
-      tmp,
-      "Library",
-      "Application Support",
+      appData,
       "Code",
       "User",
       "workspaceStorage",
@@ -6240,7 +6250,7 @@ test("resolveVsCodeCopilotChatSessionPaths discovers stable and Insiders workspa
     await fs.writeFile(path.join(stableDir, "ignored.txt"), "", "utf8");
 
     assert.deepEqual(
-      resolveVsCodeCopilotChatSessionPaths({ HOME: tmp }),
+      resolveVsCodeCopilotChatSessionPaths(resolverEnv),
       [path.join(stableDir, "stable.jsonl"), path.join(insidersDir, "insiders.json")].sort(),
     );
   } finally {
