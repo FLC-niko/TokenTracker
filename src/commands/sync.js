@@ -38,6 +38,7 @@ const {
   resolveKiroBasePath,
   resolveHermesPath,
   resolveCopilotOtelPaths,
+  resolveVsCodeCopilotChatSessionPaths,
   normalizeCopilotDbPath,
   uniqueCopilotDbPaths,
   coalesceCopilotDbStatesByIdentity,
@@ -68,6 +69,7 @@ const {
   copilotOtelCursorHasLegacyCliUsage,
   pruneCopilotUsageClaims,
   parseCopilotIncremental,
+  parseVsCodeCopilotChatIncremental,
   parseCopilotSessionStoreIncremental,
   parseCopilotAppDbIncremental,
   resolveKimiWireFiles,
@@ -2685,6 +2687,44 @@ async function cmdSync(argv, context = {}) {
         copilotResult = mergeParseResult(copilotResult, copilotStoreResult);
       } catch (err) {
         warnProviderParseFailure("Copilot App/CLI session store", err, opts);
+      }
+    }
+
+    // ── VS Code Copilot Chat persisted workspace sessions ──
+    // The Chat extension can be routed through a custom endpoint without
+    // emitting ~/.copilot OTEL or session-store rows. Its exact token counts
+    // are persisted in workspaceStorage/*/chatSessions/*.jsonl (or legacy
+    // .json snapshots), so parse that source after the legacy Copilot readers.
+    const vscodeCopilotChatPaths = copilotSourceAllowed
+      ? resolveVsCodeCopilotChatSessionPaths(process.env)
+      : [];
+    const hasTrackedVsCodeCopilotChatFiles =
+      cursors?.copilotVsCode?.files &&
+      Object.keys(cursors.copilotVsCode.files).length > 0;
+    if (
+      copilotSourceAllowed &&
+      (vscodeCopilotChatPaths.length > 0 || hasTrackedVsCodeCopilotChatFiles)
+    ) {
+      if (progress?.enabled) {
+        progress.start(`Parsing VS Code Copilot ${renderBar(0)} | buckets 0`);
+      }
+      try {
+        const vscodeCopilotResult = await parseVsCodeCopilotChatIncremental({
+          sessionPaths: vscodeCopilotChatPaths,
+          cursors,
+          queuePath,
+          env: process.env,
+          onProgress: (p) => {
+            if (!progress?.enabled) return;
+            const pct = p.total > 0 ? p.index / p.total : 1;
+            progress.update(
+              `Parsing VS Code Copilot ${renderBar(pct)} ${formatNumber(p.index)}/${formatNumber(p.total)} files | buckets ${formatNumber(p.bucketsQueued)}`,
+            );
+          },
+        });
+        copilotResult = mergeParseResult(copilotResult, vscodeCopilotResult);
+      } catch (err) {
+        warnProviderParseFailure("VS Code Copilot", err, opts);
       }
     }
 
