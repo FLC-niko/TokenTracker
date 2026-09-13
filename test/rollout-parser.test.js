@@ -6710,6 +6710,7 @@ test("parseVsCodeCopilotChatIncremental prunes deleted files but keeps unreadabl
 
 test("parseVsCodeCopilotChatIncremental bounds JSONL cursor overlap and strips request content", async () => {
   const tmp = await fs.mkdtemp(path.join(os.tmpdir(), "tt-vscode-copilot-bounded-"));
+  let sessionHandle;
   try {
     const sessionPath = path.join(tmp, "session.jsonl");
     const queuePath = path.join(tmp, "queue.jsonl");
@@ -6724,9 +6725,11 @@ test("parseVsCodeCopilotChatIncremental bounds JSONL cursor overlap and strips r
       response: "private response content that must not enter cursor state",
     }));
     const raw = JSON.stringify({ kind: 0, v: { requests } }) + "\n";
-    await fs.writeFile(sessionPath, raw, "utf8");
+    // Keep fixture mutations on the descriptor opened before any parser reads.
+    sessionHandle = await fs.open(sessionPath, "wx+");
+    await sessionHandle.write(raw, 0, "utf8");
     const fixedMtime = new Date(Date.parse("2026-09-02T10:00:00.000Z"));
-    await fs.utimes(sessionPath, fixedMtime, fixedMtime);
+    await sessionHandle.utimes(fixedMtime, fixedMtime);
     const cursors = {};
 
     const result = await parseVsCodeCopilotChatIncremental({
@@ -6762,8 +6765,9 @@ test("parseVsCodeCopilotChatIncremental bounds JSONL cursor overlap and strips r
     }));
     const rewrittenRaw = JSON.stringify({ kind: 0, v: { requests: rewrittenRequests } }) + "\n";
     assert.equal(rewrittenRaw.length, raw.length);
-    await fs.writeFile(sessionPath, rewrittenRaw, "utf8");
-    await fs.utimes(sessionPath, fixedMtime, fixedMtime);
+    await sessionHandle.truncate(0);
+    await sessionHandle.write(rewrittenRaw, 0, "utf8");
+    await sessionHandle.utimes(fixedMtime, fixedMtime);
     const rewritten = await parseVsCodeCopilotChatIncremental({
       sessionPaths: [sessionPath],
       cursors,
@@ -6777,18 +6781,17 @@ test("parseVsCodeCopilotChatIncremental bounds JSONL cursor overlap and strips r
 
     // Once an old request falls out of the overlap, a late field patch must
     // not recreate its usage and double the historical bucket.
-    const appendHandle = await fs.open(sessionPath, "a");
     const beforeLatePatch = await parseVsCodeCopilotChatIncremental({
       sessionPaths: [sessionPath],
       cursors,
       queuePath,
     });
     assert.equal(beforeLatePatch.eventsAggregated, 0);
-    await appendHandle.write(
+    await sessionHandle.write(
       JSON.stringify({ kind: 1, k: ["requests", 0, "completionTokens"], v: 6 }) + "\n",
+      Buffer.byteLength(rewrittenRaw),
       "utf8",
     );
-    await appendHandle.close();
     const latePatch = await parseVsCodeCopilotChatIncremental({
       sessionPaths: [sessionPath],
       cursors,
@@ -6800,6 +6803,7 @@ test("parseVsCodeCopilotChatIncremental bounds JSONL cursor overlap and strips r
     );
     assert.equal(bucket?.totals?.total_tokens, requests.length * 56);
   } finally {
+    await sessionHandle?.close();
     await fs.rm(tmp, { recursive: true, force: true });
   }
 });

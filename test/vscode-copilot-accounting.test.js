@@ -16,8 +16,9 @@ async function request(handler, endpoint) {
   return JSON.parse(body);
 }
 
-test('VS Code aggregate input survives parser, real pricing and local API without claiming a full cost', async () => {
+test('VS Code aggregate input survives parser, real pricing and local API without claiming a full cost', async (t) => {
   const tmp = await fs.mkdtemp(path.join(os.tmpdir(), 'tt-vscode-accounting-'));
+  t.mock.method(os, "homedir", () => tmp);
   try {
     const sessionPath = path.join(tmp, 'session.json');
     const queuePath = path.join(tmp, 'queue.jsonl');
