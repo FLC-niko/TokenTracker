@@ -6777,11 +6777,18 @@ test("parseVsCodeCopilotChatIncremental bounds JSONL cursor overlap and strips r
 
     // Once an old request falls out of the overlap, a late field patch must
     // not recreate its usage and double the historical bucket.
-    await fs.appendFile(
-      sessionPath,
+    const appendHandle = await fs.open(sessionPath, "a");
+    const beforeLatePatch = await parseVsCodeCopilotChatIncremental({
+      sessionPaths: [sessionPath],
+      cursors,
+      queuePath,
+    });
+    assert.equal(beforeLatePatch.eventsAggregated, 0);
+    await appendHandle.write(
       JSON.stringify({ kind: 1, k: ["requests", 0, "completionTokens"], v: 6 }) + "\n",
       "utf8",
     );
+    await appendHandle.close();
     const latePatch = await parseVsCodeCopilotChatIncremental({
       sessionPaths: [sessionPath],
       cursors,
