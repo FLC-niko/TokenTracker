@@ -6469,10 +6469,9 @@ test("parseVsCodeCopilotChatIncremental replays JSONL patches and ignores offici
     );
     assert.equal(firstRows.some((row) => row.model === "auto"), false);
     assert.equal(firstRows.some((row) => row.input_tokens === 9999), false);
-    // promptTokens is an aggregate input count with no cache split in this
-    // source. It remains visible in total_tokens, but only the proven output
-    // portion is eligible for the per-token cost calculation.
-    assert.equal(computeRowCost(luna), 20 * 1.2 / 1_000_000);
+    // Unknown input is preserved explicitly; no complete cost is available.
+    assert.equal(luna.unclassified_input_tokens, 100);
+    assert.equal(computeRowCost(luna), null);
 
     await fs.appendFile(
       sessionPath,
@@ -6535,21 +6534,27 @@ test("parseVsCodeCopilotChatIncremental reads legacy JSON snapshots and reconcil
     );
     assert.equal(rows.at(-1).total_tokens, 525);
 
-    const firstStat = await fs.stat(sessionPath);
-    await fs.writeFile(
-      sessionPath,
-      JSON.stringify({
-        requests: [
-          { requestId: "json-1", modelId: "customendpoint/LiteLLM/Qwen3.8-27B-NVFP4", timestamp, promptTokens: 600, completionTokens: 30 },
-          { requestId: "json-official", modelId: "copilot/gpt-5.3-codex", timestamp, promptTokens: 700, completionTokens: 70 },
-        ],
-      }),
-      "utf8",
-    );
-    await fs.utimes(sessionPath, fixedMtime, fixedMtime);
-    const secondStat = await fs.stat(sessionPath);
-    assert.equal(secondStat.size, firstStat.size);
-    assert.equal(secondStat.mtimeMs, firstStat.mtimeMs);
+    // Keep one descriptor across the metadata check and rewrite, so the
+    // fixture operates on the same file even if its pathname is replaced.
+    const handle = await fs.open(sessionPath, "r+");
+    try {
+      const firstStat = await handle.stat();
+      await handle.writeFile(
+        JSON.stringify({
+          requests: [
+            { requestId: "json-1", modelId: "customendpoint/LiteLLM/Qwen3.8-27B-NVFP4", timestamp, promptTokens: 600, completionTokens: 30 },
+            { requestId: "json-official", modelId: "copilot/gpt-5.3-codex", timestamp, promptTokens: 700, completionTokens: 70 },
+          ],
+        }),
+        "utf8",
+      );
+      await handle.utimes(fixedMtime, fixedMtime);
+      const secondStat = await handle.stat();
+      assert.equal(secondStat.size, firstStat.size);
+      assert.equal(secondStat.mtimeMs, firstStat.mtimeMs);
+    } finally {
+      await handle.close();
+    }
     const second = await parseVsCodeCopilotChatIncremental({
       sessionPaths: [sessionPath],
       cursors,
@@ -6562,6 +6567,103 @@ test("parseVsCodeCopilotChatIncremental reads legacy JSON snapshots and reconcil
     assert.equal(rows.at(-1).input_tokens, 0);
     assert.equal(rows.at(-1).output_tokens, 30);
     assert.equal(rows.at(-1).total_tokens, 630);
+
+    // A snapshot compactor may temporarily omit an old aggregate. That is not
+    // evidence that the provider refunded the usage; preserve the historical
+    // bucket and remember the aggregate so a later reappearance is reconciled
+    // as a delta instead of being counted from zero again.
+    await fs.writeFile(
+      sessionPath,
+      JSON.stringify({
+        requests: [{
+          requestId: "json-official",
+          modelId: "copilot/gpt-5.3-codex",
+          timestamp,
+          promptTokens: 700,
+          completionTokens: 70,
+        }],
+      }),
+      "utf8",
+    );
+    const disappeared = await parseVsCodeCopilotChatIncremental({
+      sessionPaths: [sessionPath],
+      cursors,
+      queuePath,
+    });
+    assert.equal(disappeared.eventsAggregated, 1);
+    const historicalBucket = Object.values(cursors.hourly.buckets).find(
+      (bucket) => bucket?.totals?.unclassified_input_tokens === 600,
+    );
+    assert.equal(historicalBucket?.totals?.total_tokens, 630);
+
+    await fs.writeFile(
+      sessionPath,
+      JSON.stringify({
+        requests: [
+          { requestId: "json-1", modelId: "customendpoint/LiteLLM/Qwen3.8-27B-NVFP4", timestamp, promptTokens: 700, completionTokens: 35 },
+          { requestId: "json-official", modelId: "copilot/gpt-5.3-codex", timestamp, promptTokens: 700, completionTokens: 70 },
+        ],
+      }),
+      "utf8",
+    );
+    await parseVsCodeCopilotChatIncremental({
+      sessionPaths: [sessionPath],
+      cursors,
+      queuePath,
+    });
+    const reappearedBucket = Object.values(cursors.hourly.buckets).find(
+      (bucket) => bucket?.totals?.unclassified_input_tokens === 700,
+    );
+    assert.equal(reappearedBucket?.totals?.total_tokens, 735);
+  } finally {
+    await fs.rm(tmp, { recursive: true, force: true });
+  }
+});
+
+test("parseVsCodeCopilotChatIncremental detects same-size JSONL rewrites with a content identity", async () => {
+  const tmp = await fs.mkdtemp(path.join(os.tmpdir(), "tt-vscode-copilot-jsonl-hash-"));
+  try {
+    const sessionPath = path.join(tmp, "session.jsonl");
+    const queuePath = path.join(tmp, "queue.jsonl");
+    const timestamp = Date.parse("2026-09-02T08:05:00.000Z");
+    const makeFile = (promptTokens) => JSON.stringify({
+      kind: 0,
+      v: {
+        requests: [{
+          requestId: "same-size",
+          modelId: "customendpoint/LiteLLM/gpt-5.6-luna",
+          timestamp,
+          promptTokens,
+          completionTokens: 5,
+        }],
+      },
+    }) + "\n";
+    const firstRaw = makeFile(10);
+    const secondRaw = makeFile(20);
+    assert.equal(secondRaw.length, firstRaw.length);
+    await fs.writeFile(sessionPath, firstRaw, "utf8");
+    const fixedMtime = new Date(Date.parse("2026-09-02T08:00:00.000Z"));
+    await fs.utimes(sessionPath, fixedMtime, fixedMtime);
+    const cursors = {};
+    await parseVsCodeCopilotChatIncremental({ sessionPaths: [sessionPath], cursors, queuePath });
+    const firstState = cursors.copilotVsCode.files[sessionPath];
+    assert.match(firstState.contentHash, /^[a-f0-9]{64}$/);
+    const firstHash = firstState.contentHash;
+    const firstStat = await fs.stat(sessionPath);
+
+    await fs.writeFile(sessionPath, secondRaw, "utf8");
+    await fs.utimes(sessionPath, fixedMtime, fixedMtime);
+    const secondStat = await fs.stat(sessionPath);
+    assert.equal(secondStat.size, firstStat.size);
+    assert.equal(secondStat.mtimeMs, firstStat.mtimeMs);
+    const second = await parseVsCodeCopilotChatIncremental({ sessionPaths: [sessionPath], cursors, queuePath });
+    assert.equal(second.eventsAggregated, 1);
+    const secondState = cursors.copilotVsCode.files[sessionPath];
+    assert.match(secondState.contentHash, /^[a-f0-9]{64}$/);
+    assert.notEqual(secondState.contentHash, firstHash);
+    const row = JSON.parse((await fs.readFile(queuePath, "utf8")).trim().split("\n").at(-1));
+    assert.equal(row.unclassified_input_tokens, 20);
+    assert.equal(row.total_tokens, 25);
   } finally {
     await fs.rm(tmp, { recursive: true, force: true });
   }
@@ -6629,6 +6731,8 @@ test("parseVsCodeCopilotChatIncremental bounds JSONL cursor overlap and strips r
     }));
     const raw = JSON.stringify({ kind: 0, v: { requests } }) + "\n";
     await fs.writeFile(sessionPath, raw, "utf8");
+    const fixedMtime = new Date(Date.parse("2026-09-02T10:00:00.000Z"));
+    await fs.utimes(sessionPath, fixedMtime, fixedMtime);
     const cursors = {};
 
     const result = await parseVsCodeCopilotChatIncremental({
@@ -6647,7 +6751,128 @@ test("parseVsCodeCopilotChatIncremental bounds JSONL cursor overlap and strips r
       ),
       false,
     );
+    assert.equal(
+      fileState.requestOverlap.every(
+        (entry) => /^[a-f0-9]{64}$/.test(entry.usageFingerprint) && typeof entry.key === "string",
+      ),
+      true,
+    );
     assert.ok(JSON.stringify(fileState).length < raw.length);
+
+    // A same-size rewrite must reconcile the complete document against the
+    // compact file aggregate, rather than replaying all 512 historical
+    // requests on top of the hourly bucket.
+    const rewrittenRequests = requests.map((request) => ({
+      ...request,
+      promptTokens: 51,
+    }));
+    const rewrittenRaw = JSON.stringify({ kind: 0, v: { requests: rewrittenRequests } }) + "\n";
+    assert.equal(rewrittenRaw.length, raw.length);
+    await fs.writeFile(sessionPath, rewrittenRaw, "utf8");
+    await fs.utimes(sessionPath, fixedMtime, fixedMtime);
+    const rewritten = await parseVsCodeCopilotChatIncremental({
+      sessionPaths: [sessionPath],
+      cursors,
+      queuePath,
+    });
+    assert.equal(rewritten.eventsAggregated, requests.length);
+    const rewrittenBucket = Object.values(cursors.hourly.buckets).find(
+      (entry) => entry?.totals?.unclassified_input_tokens === requests.length * 51,
+    );
+    assert.equal(rewrittenBucket?.totals?.total_tokens, requests.length * 56);
+
+    // Once an old request falls out of the overlap, a late field patch must
+    // not recreate its usage and double the historical bucket.
+    await fs.appendFile(
+      sessionPath,
+      JSON.stringify({ kind: 1, k: ["requests", 0, "completionTokens"], v: 6 }) + "\n",
+      "utf8",
+    );
+    const latePatch = await parseVsCodeCopilotChatIncremental({
+      sessionPaths: [sessionPath],
+      cursors,
+      queuePath,
+    });
+    assert.equal(latePatch.eventsAggregated, 0);
+    const bucket = Object.values(cursors.hourly.buckets).find(
+      (entry) => entry?.totals?.unclassified_input_tokens === requests.length * 51,
+    );
+    assert.equal(bucket?.totals?.total_tokens, requests.length * 56);
+  } finally {
+    await fs.rm(tmp, { recursive: true, force: true });
+  }
+});
+
+test("parseVsCodeCopilotChatIncremental upgrades legacy full-request cursors without re-counting", async () => {
+  const tmp = await fs.mkdtemp(path.join(os.tmpdir(), "tt-vscode-copilot-cursor-upgrade-"));
+  try {
+    const sessionPath = path.join(tmp, "session.jsonl");
+    const queuePath = path.join(tmp, "queue.jsonl");
+    const timestamp = Date.parse("2026-09-02T11:05:00.000Z");
+    const requests = Array.from({ length: 300 }, (_, index) => ({
+      requestId: `legacy-${index}`,
+      modelId: "customendpoint/LiteLLM/gpt-5.6-luna",
+      timestamp,
+      promptTokens: 10,
+      completionTokens: 2,
+    }));
+    await fs.writeFile(
+      sessionPath,
+      JSON.stringify({ kind: 0, v: { requests } }) + "\n",
+      "utf8",
+    );
+    const cursors = {};
+    await parseVsCodeCopilotChatIncremental({ sessionPaths: [sessionPath], cursors, queuePath });
+
+    const legacy = JSON.parse(JSON.stringify(cursors));
+    const current = legacy.copilotVsCode.files[sessionPath];
+    legacy.copilotVsCode.version = 2;
+    legacy.copilotVsCode.files[sessionPath] = {
+      format: "jsonl",
+      size: current.size,
+      mtimeMs: current.mtimeMs,
+      ino: current.ino,
+      requests,
+    };
+    const queueBefore = await readJsonLines(queuePath);
+    const result = await parseVsCodeCopilotChatIncremental({
+      sessionPaths: [sessionPath],
+      cursors: legacy,
+      queuePath,
+    });
+    assert.equal(result.bucketsQueued, 0);
+    assert.equal((await readJsonLines(queuePath)).length, queueBefore.length);
+    const upgraded = legacy.copilotVsCode.files[sessionPath];
+    assert.equal(Object.hasOwn(upgraded, "requests"), false);
+    assert.ok(upgraded.requestOverlap.length <= 256);
+    assert.ok(upgraded.usageTotals);
+
+    // A legacy cursor has no durable content identity. If VS Code rewrites a
+    // same-size file without changing mtime, rescan once instead of trusting
+    // the stale byte offset.
+    const legacyRewrite = JSON.parse(JSON.stringify(cursors));
+    const originalFileState = legacyRewrite.copilotVsCode.files[sessionPath];
+    legacyRewrite.copilotVsCode.version = 2;
+    legacyRewrite.copilotVsCode.files[sessionPath] = {
+      format: "jsonl",
+      size: originalFileState.size,
+      mtimeMs: originalFileState.mtimeMs,
+      ino: originalFileState.ino,
+      requests,
+    };
+    const rewrittenRequests = requests.map((request) => ({ ...request, promptTokens: 11 }));
+    const rewrittenRaw = JSON.stringify({ kind: 0, v: { requests: rewrittenRequests } }) + "\n";
+    await fs.writeFile(sessionPath, rewrittenRaw, "utf8");
+    await fs.utimes(sessionPath, new Date(originalFileState.mtimeMs), new Date(originalFileState.mtimeMs));
+    assert.equal((await fs.stat(sessionPath)).size, originalFileState.size);
+    const rewriteResult = await parseVsCodeCopilotChatIncremental({
+      sessionPaths: [sessionPath],
+      cursors: legacyRewrite,
+      queuePath,
+    });
+    assert.equal(rewriteResult.bucketsQueued, 1);
+    const rewriteRows = await readJsonLines(queuePath);
+    assert.equal(rewriteRows.at(-1).unclassified_input_tokens, requests.length * 11);
   } finally {
     await fs.rm(tmp, { recursive: true, force: true });
   }

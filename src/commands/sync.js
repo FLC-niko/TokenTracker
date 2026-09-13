@@ -3837,6 +3837,17 @@ async function drainQueueToCloud({ baseUrl, anonKey, deviceToken, queuePath, que
       Authorization: `Bearer ${deviceToken}`,
     };
     if (anonKey) headers.apikey = anonKey;
+    if (result.buckets.some((row) => Number(row.unclassified_input_tokens) > 0)) {
+      // An older ingest endpoint silently drops unknown columns. Negotiate
+      // support before sending any partial-accounting rows or advancing state.
+      const capability = await fetch(`${root}/functions/${INGEST_SLUG}?capabilities=1`, {
+        method: "GET", headers,
+      });
+      const supported = capability.ok ? await capability.json().catch(() => null) : null;
+      if (!(Number(supported?.accounting_version) >= 3)) {
+        throw new Error("Cloud accounting support is not ready for unclassified input; usage remains queued locally.");
+      }
+    }
     const res = await fetch(`${root}/functions/${INGEST_SLUG}`, {
       method: "POST",
       headers,

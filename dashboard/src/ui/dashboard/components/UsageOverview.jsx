@@ -334,6 +334,7 @@ export function UsageOverview({
   const allModels = useMemo(() => buildAllModels(fleetData), [fleetData]);
   const allUsage = allModels.reduce((sum, model) => sum + (Number(model.usage) || 0), 0);
   const allCost = providers.reduce((sum, provider) => sum + (Number(provider.usd) || 0), 0);
+  const allCostPartial = providers.some((provider) => provider.costPartial);
   const activeProvider =
     expandedProvider == null
       ? null
@@ -547,7 +548,7 @@ export function UsageOverview({
                 aria-controls="provider-details-all"
                 aria-label={copy("usage.overview.all_tools_card_aria", {
                   tokens: formatPositiveTokens(formatTokens, allUsage) || String(0),
-                  cost: formatCost(allCost, currency, rate) || `${getCurrencySymbol(currency)}0`,
+                  cost: allCostPartial ? copy("usage.cost.partial") : formatCost(allCost, currency, rate) || `${getCurrencySymbol(currency)}0`,
                   count: allModels.length,
                 })}
                 onClick={() =>
@@ -589,7 +590,7 @@ export function UsageOverview({
                       provider: displayLabel,
                       percent: percentLabel,
                       tokens: formatPositiveTokens(formatTokens, provider.usage) || String(0),
-                      cost: formatCost(provider.usd, currency, rate) || `${getCurrencySymbol(currency)}0`,
+                      cost: provider.costPartial ? copy("usage.cost.partial") : formatCost(provider.usd, currency, rate) || `${getCurrencySymbol(currency)}0`,
                       action: copy(isExpanded ? "usage.overview.collapse" : "usage.overview.expand"),
                     })}
                     onClick={() => setExpandedProvider(isExpanded ? null : provider.label)}
@@ -682,7 +683,7 @@ function ModelUsageRows({ models, color }) {
     <div className="space-y-3">
       {models.map((model) => {
         const tokensLabel = formatPositiveTokens(formatTokens, model.usage);
-        const costLabel = formatCost(model.cost, currency, rate);
+        const costLabel = model.costPartial ? copy("usage.cost.partial") : formatCost(model.cost, currency, rate);
         const clampedShare = Math.max(0, Math.min(100, Number(model.share) || 0));
         return (
           <div key={model.id || model.name} data-model-rank-row>
