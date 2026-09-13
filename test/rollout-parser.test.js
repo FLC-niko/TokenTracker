@@ -6534,27 +6534,19 @@ test("parseVsCodeCopilotChatIncremental reads legacy JSON snapshots and reconcil
     );
     assert.equal(rows.at(-1).total_tokens, 525);
 
-    // Keep one descriptor across the metadata check and rewrite, so the
-    // fixture operates on the same file even if its pathname is replaced.
-    const handle = await fs.open(sessionPath, "r+");
-    try {
-      const firstStat = await handle.stat();
-      await handle.writeFile(
-        JSON.stringify({
-          requests: [
-            { requestId: "json-1", modelId: "customendpoint/LiteLLM/Qwen3.8-27B-NVFP4", timestamp, promptTokens: 600, completionTokens: 30 },
-            { requestId: "json-official", modelId: "copilot/gpt-5.3-codex", timestamp, promptTokens: 700, completionTokens: 70 },
-          ],
-        }),
-        "utf8",
-      );
-      await handle.utimes(fixedMtime, fixedMtime);
-      const secondStat = await handle.stat();
-      assert.equal(secondStat.size, firstStat.size);
-      assert.equal(secondStat.mtimeMs, firstStat.mtimeMs);
-    } finally {
-      await handle.close();
-    }
+    // Rewrite through the same pathname while retaining the size and mtime
+    // from the parser cursor. The parser must use content identity, not a
+    // path-based check followed by a later file operation.
+    const firstFileState = cursors.copilotVsCode.files[sessionPath];
+    const rewrittenSnapshot = JSON.stringify({
+      requests: [
+        { requestId: "json-1", modelId: "customendpoint/LiteLLM/Qwen3.8-27B-NVFP4", timestamp, promptTokens: 600, completionTokens: 30 },
+        { requestId: "json-official", modelId: "copilot/gpt-5.3-codex", timestamp, promptTokens: 700, completionTokens: 70 },
+      ],
+    });
+    assert.equal(rewrittenSnapshot.length, firstFileState.size);
+    await fs.writeFile(sessionPath, rewrittenSnapshot, "utf8");
+    await fs.utimes(sessionPath, fixedMtime, fixedMtime);
     const second = await parseVsCodeCopilotChatIncremental({
       sessionPaths: [sessionPath],
       cursors,
@@ -6567,6 +6559,8 @@ test("parseVsCodeCopilotChatIncremental reads legacy JSON snapshots and reconcil
     assert.equal(rows.at(-1).input_tokens, 0);
     assert.equal(rows.at(-1).output_tokens, 30);
     assert.equal(rows.at(-1).total_tokens, 630);
+    assert.equal(cursors.copilotVsCode.files[sessionPath].size, firstFileState.size);
+    assert.equal(cursors.copilotVsCode.files[sessionPath].mtimeMs, firstFileState.mtimeMs);
 
     // A snapshot compactor may temporarily omit an old aggregate. That is not
     // evidence that the provider refunded the usage; preserve the historical
