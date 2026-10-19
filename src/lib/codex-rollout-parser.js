@@ -30,8 +30,40 @@ const {
   currentCodexModel,
   snapshotCodexModelAttributionState,
 } = require("./codex-model-attribution");
+const { readCodexServiceTier, isPriorityServiceTier } = require("./codex-service-tier");
+const {
+  createUsageRecordState,
+  extractTokenUsageRecord,
+  noteLineAfterUsageRecord,
+  noteTokenCount,
+  noteUsageRecord,
+  snapshotUsageRecordState,
+  takeCompactionOnTokenCount,
+} = require("./codex-usage-record");
 
 const DISCOVERY_FULL_AUDIT_INTERVAL_MS = 60 * 1000;
+const CODEX_ROLLOUT_TEXT_MAX_BYTES = 256 * 1024 * 1024;
+
+async function readCodexRolloutText(filePath, { maxOutputBytes = CODEX_ROLLOUT_TEXT_MAX_BYTES } = {}) {
+  if (typeof filePath !== "string" || !/\.jsonl\.zstd?$/i.test(filePath)) {
+    return fs.readFile(filePath, "utf8");
+  }
+  // The snapshot decoder lives in rollout.js (reused by the sync parser);
+  // require lazily so this module stays loadable without pulling the whole
+  // rollout graph at import time.
+  const rollout = require("./rollout");
+  const snapshot = await rollout.readCodexRolloutSnapshot(filePath, { maxOutputBytes });
+  if (!snapshot) {
+    // Treat undecodable / vanished archives as recoverable I/O so grouped
+    // session reads (live + archive) can still use a readable sibling copy.
+    const error = new Error(`unreadable Codex archive ${filePath}`);
+    error.code = "EIO";
+    throw error;
+  }
+  // Snapshot lines keep their "\n" terminators; the tail element may be an
+  // unterminated final line — join preserves exactly that.
+  return snapshot.lines.join("\n");
+}
 const MAX_DISCOVERY_INVENTORIES = 32;
 const DISCOVERY_INVENTORIES = new Map();
 const ZONED_DAY_FORMATTERS = new Map();
@@ -133,6 +165,11 @@ function safeJsonParse(str, diagnostics = null) {
   }
 }
 
+function isRolloutCandidateFileName(name) {
+  if (typeof name !== "string") return false;
+  return name.endsWith(".jsonl") || /^rollout-.*\.jsonl\.zstd?$/.test(name);
+}
+
 function listJsonlFiles(rootDir) {
   const out = [];
   const stack = [rootDir];
@@ -150,7 +187,7 @@ function listJsonlFiles(rootDir) {
       const filePath = path.join(dir, entry.name);
       if (entry.isDirectory()) {
         stack.push(filePath);
-      } else if (entry.isFile() && entry.name.endsWith(".jsonl")) {
+      } else if (entry.isFile() && isRolloutCandidateFileName(entry.name)) {
         out.push(filePath);
       }
     }
@@ -321,7 +358,7 @@ function discoverCodexSessionFiles(rootDirs, options = {}) {
         stack.push(filePath);
         continue;
       }
-      if (!child.isFile() || !child.name.endsWith(".jsonl") || visited.has(filePath)) continue;
+      if (!child.isFile() || !isRolloutCandidateFileName(child.name) || visited.has(filePath)) continue;
       visited.add(filePath);
       if (diagnostics) diagnostics.discovered_files += 1;
       const cached = inventory.files.get(filePath) || null;
@@ -560,6 +597,7 @@ async function parseCodexRolloutFile(filePath, {
   collectBreakdowns = true,
   collectModelUsage = false,
   onObject = null,
+  onUsage = null,
 } = {}) {
   const filePaths = (Array.isArray(filePath) ? filePath : [filePath]).filter(Boolean);
   const primaryFilePath = filePaths[0] || String(filePath || "");
@@ -592,6 +630,11 @@ async function parseCodexRolloutFile(filePath, {
   const modelAttributionState = createCodexModelAttributionState(
     isResuming ? resumeState.modelAttributionState || { model } : {},
   );
+  // Codex writes thread_settings_applied immediately before the turn_context of
+  // the turn it applies to, and token_count rows carry no turn id, so each one
+  // belongs to the most recent preceding tier record. Sessions that never emit
+  // the event (most CLI sessions) stay null and are billed at Standard.
+  let serviceTier = isResuming ? resumeState.serviceTier || null : null;
   let provider = isResuming ? resumeState.provider || null : null;
   let cliVersion = isResuming ? resumeState.cliVersion || null : null;
   let forkedFromId = isResuming ? resumeState.forkedFromId || null : null;
@@ -637,9 +680,37 @@ async function parseCodexRolloutFile(filePath, {
 
   let turnCount = 0;
 
-  function recordModelUsage(delta, rawRequestUsage) {
+  // Compaction records (issue #652, rules in codex-usage-record.js). A resume
+  // state from before #652 with prevTotals has seen a token_count.
+  const usageRecordState = createUsageRecordState(
+    isResuming
+      ? resumeState.usageRecordState || (resumeState.prevTotals ? { sawTokenCount: true } : null)
+      : null,
+  );
+  // Compactions counted in this session, by response_id: the files merged for
+  // a session can repeat a record (an archived copy, a split fragment), and a
+  // resumed parse must not count one from an earlier chunk again.
+  const compactionResponseIds = new Set(
+    isResuming && Array.isArray(resumeState.compactionResponseIds)
+      ? resumeState.compactionResponseIds
+      : [],
+  );
+
+  // Attribution as of now. A compaction record is counted later than it is
+  // read, so it carries the attribution captured when it was read.
+  function currentUsageAttribution() {
+    return {
+      model: currentCodexModel(modelAttributionState) || "unknown",
+      selectedModel: modelAttributionState.selectedModel || null,
+      rerouted: Boolean(modelAttributionState.rerouted),
+      rerouteReason: modelAttributionState.rerouteReason || null,
+      serviceTier,
+    };
+  }
+
+  function recordModelUsage(delta, rawRequestUsage, attribution = currentUsageAttribution()) {
     if (!collectModelUsage || !delta || delta.total_tokens <= 0) return;
-    const effectiveModel = currentCodexModel(modelAttributionState) || "unknown";
+    const effectiveModel = attribution.model;
     let row = byModel.get(effectiveModel);
     if (!row) {
       row = {
@@ -650,29 +721,44 @@ async function parseCodexRolloutFile(filePath, {
         long_context_cache_creation_input_tokens: 0,
         long_context_output_tokens: 0,
         long_context_reasoning_output_tokens: 0,
+        priority_input_tokens: 0,
+        priority_cached_input_tokens: 0,
+        priority_cache_creation_input_tokens: 0,
+        priority_output_tokens: 0,
+        priority_reasoning_output_tokens: 0,
+        priority_long_context_input_tokens: 0,
+        priority_long_context_cached_input_tokens: 0,
+        priority_long_context_cache_creation_input_tokens: 0,
+        priority_long_context_output_tokens: 0,
+        priority_long_context_reasoning_output_tokens: 0,
         usage_events: 0,
         rerouted_usage_events: 0,
         long_context_usage_events: 0,
+        priority_usage_events: 0,
         selected_models: new Set(),
         reroute_reasons: new Set(),
       };
       byModel.set(effectiveModel, row);
     }
+    const subsetKeys = Object.keys(row).filter((key) => /^(?:long_context_|priority_)|^(?:usage_events|rerouted_usage_events)$/.test(key));
+    const before = Object.fromEntries(subsetKeys.map((key) => [key, row[key]]));
     addInto(row, delta);
     row.usage_events += 1;
-    if (modelAttributionState.selectedModel) {
-      row.selected_models.add(modelAttributionState.selectedModel);
+    if (attribution.selectedModel) {
+      row.selected_models.add(attribution.selectedModel);
     }
-    if (modelAttributionState.rerouted) {
+    if (attribution.rerouted) {
       row.rerouted_usage_events += 1;
-      if (modelAttributionState.rerouteReason) {
-        row.reroute_reasons.add(modelAttributionState.rerouteReason);
+      if (attribution.rerouteReason) {
+        row.reroute_reasons.add(attribution.rerouteReason);
       }
     }
     // OpenAI applies the long-context tier to the whole request when its raw
     // (cache-inclusive) input exceeds 272K tokens. Preserve the exact subset
     // so pricing can be recomputed later without rescanning private logs.
-    if (Number(rawRequestUsage?.input_tokens || 0) > OPENAI_LONG_CONTEXT_INPUT_THRESHOLD) {
+    const isLongContext =
+      Number(rawRequestUsage?.input_tokens || 0) > OPENAI_LONG_CONTEXT_INPUT_THRESHOLD;
+    if (isLongContext) {
       row.long_context_usage_events += 1;
       row.long_context_input_tokens += delta.input_tokens;
       row.long_context_cached_input_tokens += delta.cached_input_tokens;
@@ -680,6 +766,31 @@ async function parseCodexRolloutFile(filePath, {
       row.long_context_output_tokens += delta.output_tokens;
       row.long_context_reasoning_output_tokens += delta.reasoning_output_tokens;
     }
+    // Astra Fast bills at a flat multiple of whichever context tier the request
+    // was on, so the priority premium multiplies the long-context premium
+    // instead of replacing it. The two subsets alone cannot say how much usage
+    // was on BOTH, so record the intersection explicitly — otherwise a long
+    // Fast request prices at 3x Standard input where it should be 4x.
+    if (isPriorityServiceTier(attribution.serviceTier)) {
+      row.priority_usage_events += 1;
+      row.priority_input_tokens += delta.input_tokens;
+      row.priority_cached_input_tokens += delta.cached_input_tokens;
+      row.priority_cache_creation_input_tokens += delta.cache_creation_input_tokens;
+      row.priority_output_tokens += delta.output_tokens;
+      row.priority_reasoning_output_tokens += delta.reasoning_output_tokens;
+      if (isLongContext) {
+        row.priority_long_context_input_tokens += delta.input_tokens;
+        row.priority_long_context_cached_input_tokens += delta.cached_input_tokens;
+        row.priority_long_context_cache_creation_input_tokens +=
+          delta.cache_creation_input_tokens;
+        row.priority_long_context_output_tokens += delta.output_tokens;
+        row.priority_long_context_reasoning_output_tokens += delta.reasoning_output_tokens;
+      }
+    }
+    return { ...delta, ...Object.fromEntries(subsetKeys.map((key) => [key, row[key] - before[key]])),
+      selected_models: attribution.selectedModel ? [attribution.selectedModel] : [],
+      reroute_reasons: attribution.rerouteReason ? [attribution.rerouteReason] : [],
+      model_attribution: attribution.rerouted ? "effective" : "selected" };
   }
 
   function ensureTool(name) {
@@ -845,6 +956,16 @@ async function parseCodexRolloutFile(filePath, {
     pendingExecDetails = [];
   }
 
+  function countCompactionRecord(record) {
+    if (compactionResponseIds.has(record.responseId)) return;
+    compactionResponseIds.add(record.responseId);
+    if (!record.inRequestedRange) return;
+    const pricedDelta = recordModelUsage(record.delta, record.rawUsage, record.attribution);
+    if (typeof onUsage === "function") onUsage({ timestamp: record.timestamp,
+      delta: pricedDelta || record.delta, rawUsage: record.rawUsage, model: record.attribution.model, origin: "compaction" });
+    attributeTurn(record.delta);
+  }
+
   function usageEventSignature(lastUsage, totalUsage) {
     return JSON.stringify({ lastUsage, totalUsage });
   }
@@ -912,6 +1033,8 @@ async function parseCodexRolloutFile(filePath, {
     // turn_context.payload.model itself would make codex-model-attribution.js
     // one of two authorities on the same question.
     if (typeof onObject === "function") onObject(obj, attributedModel);
+    const usageRecord = extractTokenUsageRecord(obj);
+    if (!usageRecord) noteLineAfterUsageRecord(usageRecordState, obj?.type === "compacted");
     const ts = typeof obj?.timestamp === "string" ? obj.timestamp : null;
     if (!ts) continue;
     const inRequestedRange = isTimestampInRequestedDayRange(ts, { from, to, timeZoneContext });
@@ -936,6 +1059,12 @@ async function parseCodexRolloutFile(filePath, {
       }
     }
 
+    const appliedServiceTier = readCodexServiceTier(obj);
+    if (appliedServiceTier) {
+      serviceTier = appliedServiceTier;
+      continue;
+    }
+
     if (obj.type === "turn_context") {
       const p = obj.payload || {};
       if (typeof p.cwd === "string") cwd = p.cwd;
@@ -957,22 +1086,55 @@ async function parseCodexRolloutFile(filePath, {
       continue;
     }
 
+    if (usageRecord) {
+      const delta = normalizeUsage(usageRecord.usage);
+      noteUsageRecord(
+        usageRecordState,
+        // Without a response_id a compaction cannot be deduplicated.
+        delta.total_tokens > 0 && usageRecord.responseId
+          ? {
+              responseId: usageRecord.responseId,
+              timestamp: usageRecord.timestamp,
+              inRequestedRange,
+              rawUsage: usageRecord.usage,
+              delta,
+              attribution: currentUsageAttribution(),
+            }
+          : null,
+      );
+      continue;
+    }
+
     const tokenCount = extractTokenCount(obj);
     if (tokenCount) {
       const info = tokenCount.info;
       const lastUsage = info?.last_token_usage;
       const totalUsage = info?.total_token_usage;
+      let compaction = null;
+      if (info && typeof info === "object") {
+        noteTokenCount(usageRecordState);
+        compaction = takeCompactionOnTokenCount(
+          usageRecordState,
+          usageDeltaState.lastTotal,
+          totalUsage,
+        );
+      }
       const rawDelta = consumeUsageDelta(usageDeltaState, lastUsage, totalUsage);
       const delta = rawDelta ? normalizeUsage(rawDelta) : null;
+      // Timing consumers receive canonical, deduplicated usage below. A null
+      // delta is a snapshot, not another model response.
+      if (compaction) countCompactionRecord(compaction);
       const isNewResumeEvent = noteTokenEvent(ts, lastUsage, totalUsage);
       if (inRequestedRange) {
         const eventSessionId = sessionId || rolloutSessionIdFromPath(primaryFilePath) || primaryFilePath;
         const eventKey = `${eventSessionId}:${ts}:${usageEventSignature(lastUsage, totalUsage)}`;
         if (!isNewResumeEvent || (seenTokenEvents && seenTokenEvents.has(eventKey))) {
+          if (typeof onUsage === "function") onUsage({ timestamp: ts, delta: null, rawUsage: lastUsage, model: attributedModel });
           attributeTurn(null);
         } else {
           if (seenTokenEvents && delta?.total_tokens > 0) seenTokenEvents.add(eventKey);
-          recordModelUsage(delta, lastUsage || rawDelta);
+          const pricedDelta = recordModelUsage(delta, lastUsage || rawDelta);
+          if (typeof onUsage === "function") onUsage({ timestamp: ts, delta: pricedDelta || delta, rawUsage: lastUsage || rawDelta, model: attributedModel });
           attributeTurn(delta);
         }
       } else {
@@ -1020,6 +1182,7 @@ async function parseCodexRolloutFile(filePath, {
       cwd,
       model,
       modelAttributionState: snapshotCodexModelAttributionState(modelAttributionState),
+      serviceTier,
       provider,
       cliVersion,
       forkedFromId,
@@ -1035,9 +1198,17 @@ async function parseCodexRolloutFile(filePath, {
       pendingExecDetails,
       lastTokenTimestamp,
       lastTimestampEventSignatures: Array.from(materializeLastTimestampSignatures()),
+      usageRecordState: snapshotUsageRecordState(usageRecordState),
+      compactionResponseIds: Array.from(compactionResponseIds),
     };
     result.endOffset = readProgress.endOffset;
-    result.appendable = Boolean(contentHasher) && (
+    // Compressed snapshots are not append-only logs: endOffset stays at the
+    // pre-decode cursor (often 0) and must never be marked appendable, or the
+    // next growth would "resume" by parsing compressed bytes as JSONL.
+    const hasCompressedArchive = filePaths.some(
+      (candidate) => typeof candidate === "string" && /\.jsonl\.zstd?$/i.test(candidate),
+    );
+    result.appendable = Boolean(contentHasher) && !hasCompressedArchive && (
       readProgress.endOffset === 0 || readProgress.lastByte === 0x0a
     );
     result.contentHashState = contentHasher;
@@ -1171,6 +1342,27 @@ async function* readCodexObjectsFull(filePath, diagnostics, fileIndex, {
   readProgress = null,
   contentHasher = null,
 } = {}) {
+  // Compressed archives are immutable snapshots, not append-only logs: byte
+  // offsets are meaningless inside them, so decode the whole text and split
+  // into lines. `readProgress` stays null so callers never persist a fake
+  // byte cursor for them.
+  if (typeof filePath === "string" && /\.jsonl\.zstd?$/i.test(filePath)) {
+    const text = await readCodexRolloutText(filePath);
+    let lineIndex = 0;
+    const lines = text.split("\n");
+    for (let index = 0; index < lines.length; index += 1) {
+      const isLast = index + 1 >= lines.length;
+      if (isLast && lines[index] === "") continue;
+      const lineBuffer = Buffer.from(lines[index], "utf8");
+      const obj = parseCodexLine(lineBuffer, diagnostics);
+      if (obj) {
+        yield { obj, fileIndex, lineIndex };
+        lineIndex += 1;
+      }
+    }
+    if (diagnostics) diagnostics.parsed_files += 1;
+    return;
+  }
   yield* readCodexObjectsIncremental(filePath, diagnostics, fileIndex, {
     startOffset,
     endOffset,
@@ -1193,6 +1385,7 @@ function isRecoverableGroupedReadError(error) {
 
 async function* iterateCodexObjects(filePaths, diagnostics, options = {}) {
   if (filePaths.length <= 1) {
+    if (!filePaths[0]) return;
     for await (const record of readCodexObjects(filePaths[0], diagnostics, 0, options)) {
       yield record.obj;
     }
@@ -1217,7 +1410,11 @@ async function* iterateCodexObjects(filePaths, diagnostics, options = {}) {
       if (!isRecoverableGroupedReadError(error)) throw error;
     }
   }
-  if (!scannedFiles) throw new Error("all grouped Codex rollout files failed during read");
+  if (!scannedFiles) {
+    const error = new Error("all grouped Codex rollout files failed during read");
+    error.code = "EIO";
+    throw error;
+  }
   records.sort((a, b) => {
     const aTimestamp = typeof a.obj?.timestamp === "string" ? a.obj.timestamp : "";
     const bTimestamp = typeof b.obj?.timestamp === "string" ? b.obj.timestamp : "";
@@ -1235,7 +1432,7 @@ async function* iterateCodexObjects(filePaths, diagnostics, options = {}) {
 
 function rolloutSessionIdFromPath(filePath) {
   const match = path.basename(String(filePath || "")).match(
-    /([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\.jsonl$/i,
+    /([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\.jsonl(?:\.zstd?)?$/i,
   );
   return match ? match[1] : null;
 }
@@ -1266,6 +1463,7 @@ module.exports = {
   isTimestampInRequestedDayRange,
   rolloutSessionIdFromPath,
   isCodexResumeInvalidated,
+  isRecoverableGroupedReadError,
   finalizeToolRows,
   finalizeSkillRows,
   finalizeExecRows,

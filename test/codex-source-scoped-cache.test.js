@@ -740,7 +740,7 @@ test("full auto sync persists Codex day inventory cache between runs", async () 
 
     const cursorsPath = path.join(home, ".tokentracker", "tracker", "cursors.json");
     const cursors = JSON.parse(await fs.readFile(cursorsPath, "utf8"));
-    assert.equal(cursors.codexDayInventoryCache?.version, 1);
+    assert.equal(cursors.codexDayInventoryCache?.version, 2);
     assert.ok(cursors.codexDayInventoryCache.days[dayDir], "first sync should cache the Codex day");
 
     const { count } = await countReaddir(
@@ -869,7 +869,7 @@ test("Codex day inventory cache reduces repeated old-day readdir", async () => {
     await writeCodexRollout(tmp, "2026-06-28", "019f16bd-aaaa-7000-8000-aaaaaaaaaaaa", 1);
     await writeCodexRollout(tmp, "2026-06-29", "019f16bd-bbbb-7000-8000-bbbbbbbbbbbb", 2);
 
-    const cache = { version: 1, days: {} };
+    const cache = { version: 2, days: {} };
     const firstStats = {};
     const first = await countReaddir(() =>
       listRolloutFiles(sessionsDir, { dayInventoryCache: cache, stats: firstStats }),
@@ -939,7 +939,7 @@ test("Codex day inventory cache invalidates when a day directory changes", async
     const sessionsDir = path.join(tmp, "sessions");
     await writeCodexRollout(tmp, "2026-06-28", "019f16bd-cccc-7000-8000-cccccccccccc", 1);
 
-    const cache = { version: 1, days: {} };
+    const cache = { version: 2, days: {} };
     await listRolloutFiles(sessionsDir, { dayInventoryCache: cache });
 
     const added = await writeCodexRollout(
@@ -972,7 +972,7 @@ test("Codex day inventory cache falls back safely when cache data is corrupt", a
       1,
     );
     const dayDir = path.dirname(rolloutPath);
-    const cache = { version: 1, days: { [dayDir]: { statKey: "corrupt", files: "not-an-array" } } };
+    const cache = { version: 2, days: { [dayDir]: { statKey: "corrupt", files: "not-an-array" } } };
 
     const stats = {};
     const found = await listRolloutFiles(sessionsDir, { dayInventoryCache: cache, stats });
@@ -995,7 +995,7 @@ test("Codex day inventory cache rejects corrupt cached filenames", async () => {
       1,
     );
     const dayDir = path.dirname(rolloutPath);
-    const cache = { version: 1, days: {} };
+    const cache = { version: 2, days: {} };
     await listRolloutFiles(sessionsDir, { dayInventoryCache: cache });
     for (const badName of ["rollout-x/evil.jsonl", "rollout-x\\evil.jsonl", "../rollout-x.jsonl"]) {
       cache.days[dayDir].files = [badName];
@@ -1022,7 +1022,7 @@ test("Codex day inventory cache discards incompatible cache versions", async () 
       1,
     );
     const dayDir = path.dirname(rolloutPath);
-    const cache = { version: 1, days: {} };
+    const cache = { version: 2, days: {} };
     await listRolloutFiles(sessionsDir, { dayInventoryCache: cache });
 
     cache.version = 0;
@@ -1030,7 +1030,7 @@ test("Codex day inventory cache discards incompatible cache versions", async () 
 
     const found = await listRolloutFiles(sessionsDir, { dayInventoryCache: cache });
     assert.deepEqual(found, [rolloutPath]);
-    assert.equal(cache.version, 1);
+    assert.equal(cache.version, 2);
     assert.ok(cache.days[dayDir].files.includes(path.basename(rolloutPath)));
   } finally {
     await fs.rm(tmp, { recursive: true, force: true });

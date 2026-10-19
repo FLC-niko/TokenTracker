@@ -4,15 +4,22 @@ const os = require("node:os");
 const path = require("node:path");
 const { spawn } = require("node:child_process");
 const crypto = require("node:crypto");
-const { DEFAULT_BASE_URL, resolveRuntimeConfig } = require("./runtime-config");
+const { setImmediate: yieldToRequests } = require("node:timers/promises");
+const { createAsyncQueueReader } = require("./async-queue-reader");
+const { DEFAULT_BASE_URL, resolveRuntimeConfig, assertInsforgeRuntime, normalizeInstanceBaseUrl, clearDeviceIdentity, resetInstanceState } = require("./runtime-config");
 const {
   filterRowsByUsageScope,
   getSourceScope,
   listExcludedSources,
   normalizeUsageScope,
 } = require("./source-metadata");
-const { accountSlugFor, fetchAccountUsage, mintAccessToken } = require("./cloud-account");
+const { accountSlugFor, fetchAccountUsage, mintAccessToken, invalidateCloudAccountPayloadCache, getCloudAccountSessionGeneration } = require("./cloud-account");
+const { resetCloudDeviceUsage, readCloudUsageReset } = require("./cloud-usage-reset");
 const { getOrCreateMachineId, computeStableMachineId } = require("./machine-id");
+const { functionUrlFor, fetchFunctionResponse } = require("./function-url");
+const { createCloudDeviceTokenStore } = require("./cloud-device-token");
+const { parseBearerToken } = require("./bearer-token");
+const { writeJsonAtomicSync } = require("./atomic-json");
 
 const SYNC_TIMEOUT_MS = 120_000;
 // A failed account-view request should not stall every dashboard refresh
@@ -56,6 +63,7 @@ const {
   computeKnownRowCost,
   ensurePricingLoaded,
   getPricingRevision,
+  getModelPricingInfo,
 } = require("./pricing");
 
 const {
@@ -89,13 +97,13 @@ const CLAUDE_MEM_OBSERVER_PROJECT_KEY = deriveProjectKeyFromRef(
 );
 const PROJECT_USAGE_MAX_ENTRIES = 10;
 const MAX_TIME_ZONE_CACHE_ENTRIES = 16;
+const AGGREGATION_BATCH_ROWS = 256;
 
 // The native dashboard fans one refresh out across several local endpoints.
 // Keep one immutable, deduped view of the current queue so those endpoints do
 // not all read and JSON.parse the same append-only file. A file identity +
 // nanosecond timestamp signature invalidates the cache immediately on append,
 // in-place rewrite, or atomic replacement.
-let queueDataCache = null;
 const dailyAggregationCache = new WeakMap();
 const zonedPartsFormatters = new Map();
 
@@ -105,11 +113,6 @@ function boundedCacheSet(cache, key, value, maxEntries) {
   while (cache.size > maxEntries) {
     cache.delete(cache.keys().next().value);
   }
-}
-
-function queueFileSignature(queuePath) {
-  const stat = fs.statSync(queuePath, { bigint: true });
-  return `${stat.dev}:${stat.ino}:${stat.size}:${stat.mtimeNs}:${stat.ctimeNs}`;
 }
 
 function timeZoneContextKey({ timeZone, offsetMinutes } = {}) {
@@ -122,7 +125,7 @@ function timeZoneContextKey({ timeZone, offsetMinutes } = {}) {
 // key ONCE (rowDayKey constructs an Intl.DateTimeFormat per call — the
 // dominant per-row cost) and reuse it for both the range check and any
 // day bucketing.
-function readProjectUsageContext(qp, url) {
+async function readProjectUsageContext(qp, url) {
   const from = url.searchParams.get("from") || "";
   const to = url.searchParams.get("to") || "";
   const timeZoneContext = getTimeZoneContext(url);
@@ -133,7 +136,7 @@ function readProjectUsageContext(qp, url) {
     return (!from || day >= from) && (!to || day <= to);
   };
   const projectQueuePath = path.join(path.dirname(qp), "project.queue.jsonl");
-  const projectRows = readProjectQueueData(projectQueuePath).filter(
+  const projectRows = (await readProjectQueueData(projectQueuePath)).filter(
     (row) => row.project_key !== CLAUDE_MEM_OBSERVER_PROJECT_KEY,
   );
   return { from, to, timeZoneContext, hasRange, dayInRange, projectRows };
@@ -142,57 +145,15 @@ function readProjectUsageContext(qp, url) {
 // Same signature-based caching as readQueueData: the project-usage endpoints
 // all fan out from one dashboard refresh, so without this every request
 // re-read and re-parsed the whole append-only project queue.
-let projectQueueDataCache = null;
-
-function readProjectQueueData(projectQueuePath) {
-  let signature;
-  try {
-    signature = queueFileSignature(projectQueuePath);
-  } catch (e) {
-    if (projectQueueDataCache?.queuePath === projectQueuePath) {
-      projectQueueDataCache = null;
-    }
-    if (e?.code !== "ENOENT") {
-      console.error("[LocalAPI] readProjectQueueData: failed to stat:", e?.message || e);
-    }
-    return [];
-  }
-
-  if (
-    projectQueueDataCache?.queuePath === projectQueuePath &&
-    projectQueueDataCache.signature === signature
-  ) {
-    return projectQueueDataCache.rows;
-  }
-
-  let raw;
-  try {
-    raw = fs.readFileSync(projectQueuePath, "utf8");
-  } catch (e) {
-    if (e?.code !== "ENOENT") {
-      console.error("[LocalAPI] readProjectQueueData: failed to read:", e?.message || e);
-    }
-    return [];
-  }
-  const lines = raw.split("\n").filter((l) => l.trim());
-  const seen = new Map();
-  for (const line of lines) {
-    try {
-      const row = JSON.parse(line);
-      const key = `${row.project_key || ""}|${row.source || ""}|${row.hour_start || ""}`;
-      // Same legacy-row corrections as the main queue (codex inclusive-input,
-      // cursor billable=0) so both read paths report identical numbers.
-      seen.set(key, normalizeQueueRow(row));
-    } catch {
-      // skip malformed
-    }
-  }
-  // Callers treat the result as read-only (sortByHour copies before sorting),
-  // so the cached array can be shared across requests.
-  const rows = Array.from(seen.values());
-  projectQueueDataCache = { queuePath: projectQueuePath, signature, rows };
-  return rows;
-}
+const readProjectQueueData = createAsyncQueueReader({
+  label: "readProjectQueueData",
+  parseRow(row) {
+    return {
+      key: `${row.project_key || ""}|${row.source || ""}|${row.hour_start || ""}`,
+      row: normalizeQueueRow(row),
+    };
+  },
+});
 
 function isLegacyInclusiveCodexRow(row) {
   if (!row || (row.source !== "codex" && row.source !== "every-code")) return false;
@@ -242,136 +203,16 @@ function normalizeQueueRow(row) {
   return normalized;
 }
 
-function readQueueData(queuePath) {
-  let stat;
-  try {
-    stat = fs.statSync(queuePath, { bigint: true });
-  } catch (e) {
-    if (queueDataCache?.queuePath === queuePath) queueDataCache = null;
-    if (e?.code !== "ENOENT") {
-      console.error("[LocalAPI] readQueueData: failed to stat queue:", e?.message || e);
-    }
-    return [];
-  }
-  const signature = `${stat.dev}:${stat.ino}:${stat.size}:${stat.mtimeNs}:${stat.ctimeNs}`;
-
-  const cached = queueDataCache;
-  if (cached?.queuePath === queuePath && cached.signature === signature) {
-    return cached.rows;
-  }
-
-  // The queue is append-only, so on a same-file append only the new tail is
-  // read and parsed; the deduped row set carries over. A replaced, truncated,
-  // or first-seen file falls back to a full read.
-  const devIno = `${stat.dev}:${stat.ino}`;
-  const fileSize = Number(stat.size);
-  const canAppend =
-    cached != null &&
-    cached.queuePath === queuePath &&
-    cached.devIno === devIno &&
-    fileSize >= cached.consumedBytes;
-  let seen = canAppend ? cached.seen : new Map();
-  let offset = canAppend ? cached.consumedBytes : 0;
-
-  // Integrity probe for the append assumption: repo writers only append or
-  // atomically replace (inode change), but an EXTERNAL in-place rewrite
-  // (cp over the file, shell redirect) keeps the inode with a same/larger
-  // size while changing the prefix. The byte before our offset must be the
-  // newline that terminated the last consumed line — anything else means the
-  // prefix is no longer ours, so fall back to a full read.
-  if (offset > 0) {
-    try {
-      const fd = fs.openSync(queuePath, "r");
-      try {
-        const probe = Buffer.allocUnsafe(1);
-        if (fs.readSync(fd, probe, 0, 1, offset - 1) !== 1 || probe[0] !== 0x0a) {
-          seen = new Map();
-          offset = 0;
-        }
-      } finally {
-        fs.closeSync(fd);
-      }
-    } catch {
-      seen = new Map();
-      offset = 0;
-    }
-  }
-
-  let raw = "";
-  if (fileSize > offset) {
-    try {
-      if (offset === 0) {
-        raw = fs.readFileSync(queuePath, "utf8");
-      } else {
-        const fd = fs.openSync(queuePath, "r");
-        try {
-          const length = fileSize - offset;
-          const buffer = Buffer.allocUnsafe(length);
-          let read = 0;
-          while (read < length) {
-            // A concurrent truncation between stat and open makes readSync hit
-            // EOF early — without the 0-byte break this loop never terminates.
-            const n = fs.readSync(fd, buffer, read, length - read, offset + read);
-            if (n === 0) break;
-            read += n;
-          }
-          raw = buffer.toString("utf8", 0, read);
-        } finally {
-          fs.closeSync(fd);
-        }
-      }
-    } catch (e) {
-      // ENOENT is legitimate (queue deleted between stat and read); anything
-      // else is a signal we don't want to hide behind an empty array forever —
-      // the dashboard would otherwise render "0 tokens" with no clue the queue
-      // was unreadable.
-      if (e?.code !== "ENOENT") {
-        console.error("[LocalAPI] readQueueData: failed to read queue:", e?.message || e);
-      }
-      return canAppend ? cached.rows : [];
-    }
-  }
-
-  // Parse row-by-row so a single corrupted line (partial write, disk-full
-  // truncation, …) does not wipe out every other row with it. An unterminated
-  // tail is attempted (legacy writers may omit the final newline) but NOT
-  // marked consumed — a mid-append partial line is re-read once it completes.
-  // "\n" (0x0A) never appears inside a multi-byte UTF-8 sequence, so cutting
-  // on the last newline is byte-safe.
-  let consumedBytes = offset;
-  let malformed = 0;
-  if (raw) {
-    const lastNewline = raw.lastIndexOf("\n");
-    if (lastNewline !== -1) {
-      consumedBytes += Buffer.byteLength(raw.slice(0, lastNewline), "utf8") + 1;
-    }
-    const lines = raw.split("\n");
-    for (const line of lines) {
-      if (!line.trim()) continue;
-      try {
-        const row = JSON.parse(line);
-        // Account session states (and the pre-release watermark records
-        // this branch may still hold in a dev queue) are cloud-side control
-        // records, not usage rows - never surface them locally.
-        if (row?.kind === "account_session_state" || row?.kind === "account_sync_watermark") continue;
-        // Deduplicate: each sync appends cumulative totals per bucket, so for
-        // each (source, model, hour_start) keep only the latest (last) entry.
-        const key = `${row.source || ""}|${row.model || ""}|${row.hour_start || ""}`;
-        seen.set(key, normalizeQueueRow(row));
-      } catch {
-        malformed += 1;
-      }
-    }
-  }
-  if (malformed > 0) {
-    console.error(
-      `[LocalAPI] readQueueData: skipped ${malformed} malformed line(s) in ${queuePath}`,
-    );
-  }
-  const rows = Array.from(seen.values());
-  queueDataCache = { queuePath, signature, devIno, consumedBytes, seen, rows };
-  return rows;
-}
+const readQueueData = createAsyncQueueReader({
+  label: "readQueueData",
+  parseRow(row) {
+    if (row?.kind === "account_session_state" || row?.kind === "account_sync_watermark") return null;
+    return {
+      key: `${row.source || ""}|${row.model || ""}|${row.hour_start || ""}`,
+      row: normalizeQueueRow(row),
+    };
+  },
+});
 
 function rowDayKey(row, timeZoneContext) {
   const hs = row.hour_start;
@@ -399,8 +240,32 @@ function aggregateByDay(rows, timeZoneContext = null) {
     return cached;
   }
 
+  if (!cachedByTimeZone) {
+    cachedByTimeZone = new Map();
+    dailyAggregationCache.set(normalizedRows, cachedByTimeZone);
+  }
+  const pending = buildDailyAggregates(normalizedRows, timeZoneContext).then((daily) => {
+    // Pricing can refresh while a large aggregation yields. Rebuild consistently
+    // with the current catalog instead of publishing a mix of two revisions.
+    if (cacheKey !== timeZoneContextKey(timeZoneContext || {})) {
+      cachedByTimeZone.delete(cacheKey);
+      return aggregateByDay(normalizedRows, timeZoneContext);
+    }
+    return daily;
+  }).catch((error) => {
+    if (cachedByTimeZone.get(cacheKey) === pending) cachedByTimeZone.delete(cacheKey);
+    throw error;
+  });
+  // Share both completed and in-flight aggregates across summary/daily/heatmap.
+  boundedCacheSet(cachedByTimeZone, cacheKey, pending, MAX_TIME_ZONE_CACHE_ENTRIES);
+  return pending;
+}
+
+async function buildDailyAggregates(normalizedRows, timeZoneContext) {
   const byDay = new Map();
+  let processed = 0;
   for (const row of normalizedRows) {
+    if (++processed % AGGREGATION_BATCH_ROWS === 0) await yieldToRequests();
     if (!row.hour_start) continue;
     const day = rowDayKey(row, timeZoneContext);
     if (!day) continue;
@@ -437,11 +302,6 @@ function aggregateByDay(rows, timeZoneContext = null) {
     a.models[model] = (a.models[model] || 0) + (row.total_tokens || 0);
   }
   const daily = Array.from(byDay.values()).sort((a, b) => a.day.localeCompare(b.day));
-  if (!cachedByTimeZone) {
-    cachedByTimeZone = new Map();
-    dailyAggregationCache.set(normalizedRows, cachedByTimeZone);
-  }
-  boundedCacheSet(cachedByTimeZone, cacheKey, daily, MAX_TIME_ZONE_CACHE_ENTRIES);
   return daily;
 }
 
@@ -546,9 +406,9 @@ function getRequestedUsageScope(url) {
   return normalizeUsageScope(url.searchParams.get("scope"));
 }
 
-function scopedQueueRows(queuePath, url) {
+async function scopedQueueRows(queuePath, url) {
   const scope = getRequestedUsageScope(url);
-  const allRows = readQueueData(queuePath);
+  const allRows = await readQueueData(queuePath);
   return {
     scope,
     allRows,
@@ -743,9 +603,11 @@ function formatPartsDayKey(parts) {
   return `${parts.year}-${String(parts.month).padStart(2, "0")}-${String(parts.day).padStart(2, "0")}`;
 }
 
-function aggregateHourlyByDay(rows, dayKey, timeZoneContext) {
+async function aggregateHourlyByDay(rows, dayKey, timeZoneContext) {
   const byHour = new Map();
+  let processed = 0;
   for (const row of rows) {
+    if (++processed % AGGREGATION_BATCH_ROWS === 0) await yieldToRequests();
     if (!row.hour_start) continue;
     const parts = getZonedParts(new Date(row.hour_start), timeZoneContext);
     if (!parts) continue;
@@ -809,18 +671,11 @@ function normalizeRemoteHttpBaseUrl(value) {
   }
 }
 
-function resolveAllowedInsforgeBaseUrl(value) {
+function resolveAllowedInsforgeBaseUrl(value, runtime = resolveRuntimeConfig()) {
   const requested = normalizeRemoteHttpBaseUrl(value);
   if (!requested) return null;
 
-  const runtime = resolveRuntimeConfig();
-  const allowed = new Set(
-    [runtime.baseUrl, DEFAULT_BASE_URL]
-      .map((entry) => normalizeRemoteHttpBaseUrl(entry))
-      .filter(Boolean),
-  );
-
-  return allowed.has(requested) ? requested : null;
+  return requested === normalizeRemoteHttpBaseUrl(runtime.baseUrl) ? requested : null;
 }
 
 function parseCookieHeader(value) {
@@ -893,17 +748,29 @@ function readBodyLimited(req, maxBytes) {
 
 function runSyncCommand(extraEnv = {}, opts = {}) {
   return new Promise((resolve, reject) => {
-    const args = [TRACKER_BIN, "sync"];
+    const args = opts.trackerDataDir
+      ? ["-e", `require(${JSON.stringify(path.resolve(__dirname, "../commands/sync.js"))}).cmdSync(process.argv.slice(1), ${JSON.stringify({ trackerDataDir: opts.trackerDataDir, home: path.dirname(opts.trackerDataDir), ...(opts.syncContext || {}) })}).catch(e => { console.error(e.message); process.exitCode = 1; })`, "--"]
+      : [TRACKER_BIN, "sync"];
     if (opts.auto === true) args.push("--auto");
     if (opts.background === true) args.push("--background");
     if (opts.publishAccount === true) args.push("--publish-account");
     if (opts.allLocalSources === true) args.push("--all-local-sources");
     if (opts.drain === true) args.push("--drain");
     if (opts.waitForLock === true) args.push("--wait-for-lock");
+    if (opts.signal?.aborted) { reject(Object.assign(new Error("Account session changed"), { code: "auth_session_changed", status: 409 })); return; }
     const child = spawn(process.execPath, args, {
-      env: { ...process.env, ...extraEnv },
+      env: {
+        ...process.env, ...extraEnv,
+        ...(extraEnv.TOKENTRACKER_DEVICE_TOKEN ? {
+          TOKENTRACKER_INSFORGE_BASE_URL: extraEnv.TOKENTRACKER_INSFORGE_BASE_URL,
+          TOKENTRACKER_INSFORGE_ANON_KEY: extraEnv.TOKENTRACKER_INSFORGE_ANON_KEY || "",
+        } : {}),
+        TOKENTRACKER_LOCAL_SYNC_DEVICE_TOKEN: extraEnv.TOKENTRACKER_DEVICE_TOKEN || "",
+      },
       stdio: ["ignore", "pipe", "pipe"],
     });
+    const cancel = () => child.kill("SIGTERM");
+    opts.signal?.addEventListener("abort", cancel, { once: true });
     let stdout = "";
     let stderr = "";
     let settled = false;
@@ -911,18 +778,13 @@ function runSyncCommand(extraEnv = {}, opts = {}) {
       if (settled) return;
       settled = true;
       clearTimeout(tid);
+      opts.signal?.removeEventListener("abort", cancel);
       fn(v);
     };
+    let timedOut = false;
     const tid = setTimeout(() => {
+      timedOut = true;
       child.kill("SIGTERM");
-      finish(
-        reject,
-        Object.assign(new Error("Sync timed out"), {
-          code: "SYNC_TIMEOUT",
-          stdout: trimOutput(stdout),
-          stderr: trimOutput(stderr),
-        }),
-      );
     }, SYNC_TIMEOUT_MS);
     child.stdout?.on("data", (c) => {
       stdout += c;
@@ -934,6 +796,8 @@ function runSyncCommand(extraEnv = {}, opts = {}) {
       finish(reject, Object.assign(e, { stdout: trimOutput(stdout), stderr: trimOutput(stderr) }));
     });
     child.on("close", (code) => {
+      if (timedOut) { finish(reject, Object.assign(new Error("Sync timed out"), { code: "SYNC_TIMEOUT", stdout: trimOutput(stdout), stderr: trimOutput(stderr) })); return; }
+      if (opts.signal?.aborted) { finish(reject, Object.assign(new Error("Account session changed"), { code: "auth_session_changed", status: 409 })); return; }
       const r = { code: code ?? 1, stdout: trimOutput(stdout), stderr: trimOutput(stderr) };
       if (code === 0) {
         finish(resolve, r);
@@ -1056,7 +920,17 @@ function scanClaudeProjects(projectMap) {
 
 function json(res, data, status) {
   data = annotateCostPayload(data);
-  res.writeHead(status || 200, { "Content-Type": "application/json" });
+  // Usage and cost payloads change on every sync, and cost is re-priced on
+  // every read (pricing is applied per request, never stored in the queue) —
+  // so a cached response can pin stale costs on screen indefinitely. WebView2
+  // caches responses that carry no freshness directive, and the dashboard's
+  // local fetch path omits `cache: "no-store"` (only the cloud path sets it).
+  // Endpoints that care already set this header by hand; do it once here so
+  // every JSON response is covered.
+  res.writeHead(status || 200, {
+    "Content-Type": "application/json",
+    "Cache-Control": "no-store",
+  });
   res.end(JSON.stringify(data));
 }
 
@@ -1138,8 +1012,9 @@ function buildProxyHeaders(headers) {
 // Main handler factory
 // ---------------------------------------------------------------------------
 
-function createLocalApiHandler({ queuePath }) {
+function createLocalApiHandler({ queuePath, serverVersion = null, trackerDataDir: isolatedTrackerDataDir = null, syncContext = null }) {
   const qp = queuePath || resolveQueuePath();
+  const normalizedServerVersion = typeof serverVersion === "string" ? serverVersion.trim() : "";
 
   // Server-side cookie relay: captures auth cookies from InsForge cloud responses
   // so that both browser and WKWebView share the same login session via the proxy.
@@ -1147,16 +1022,114 @@ function createLocalApiHandler({ queuePath }) {
   const csrfRelayCookieName = "insforge_csrf_token";
   let relayCookies = new Map();
   const localAuthToken = crypto.randomBytes(24).toString("hex");
-  const trackerDataDir = path.join(os.homedir(), ".tokentracker", "tracker");
+  const trackerDataDir = isolatedTrackerDataDir || path.dirname(qp);
   const cookiePath = path.join(trackerDataDir, "relay-cookies.json");
+  const localSyncDeviceTokenStore = createCloudDeviceTokenStore(path.join(trackerDataDir, "cloud-device-token.json"));
   const localSyncDeviceTokenCache = new Map();
   const localSyncDeviceTokenInflight = new Map();
+  let localSyncDeviceTokenUserId = "";
+  let localCloudSession = null;
+  let localCloudGeneration = 0;
+  const activeCloudSyncs = new Set();
+  const localSyncDeviceMetadata = new Map();
+  function invalidateLocalCloudSession() {
+    localCloudGeneration += 1;
+    localCloudSession = null;
+    for (const controller of activeCloudSyncs) controller.abort();
+  }
+  function clearLocalSyncDeviceTokenCache() {
+    invalidateLocalCloudSession();
+    localSyncDeviceMetadata.clear();
+    localSyncDeviceTokenCache.clear();
+    localSyncDeviceTokenInflight.clear();
+    localSyncDeviceTokenStore.clear();
+    localSyncDeviceTokenUserId = "";
+  }
+  function invalidateLocalSyncDeviceToken(token) {
+    if (!token) return;
+    for (const [key, value] of localSyncDeviceTokenCache) {
+      if (value === token) localSyncDeviceTokenCache.delete(key);
+    }
+    localSyncDeviceTokenStore.invalidate(token);
+  }
+  function currentCloudUploadFailure(syncStartedAt, { backoff = false, deviceToken, attemptId } = {}) {
+    try {
+      const state = JSON.parse(fs.readFileSync(path.join(path.dirname(qp), "upload.throttle.json"), "utf8"));
+      if (attemptId && state.lastErrorAttemptId === attemptId &&
+          Date.parse(state.lastErrorAt || "") >= syncStartedAt && Number(state.lastErrorStatus) > 0) {
+        if (state.lastErrorCode === "CLOUD_DEVICE_TOKEN_REJECTED") invalidateLocalSyncDeviceToken(deviceToken);
+        return { code: state.lastErrorCode || "CLOUD_UPLOAD_FAILED", status: Number(state.lastErrorStatus), retryAfterMs: Math.max(0, Math.max(Number(state.backoffUntilMs || 0), Number(state.nextAllowedAtMs || 0)) - Date.now()), nextAllowedAt: state.nextAllowedAtMs ? new Date(state.nextAllowedAtMs).toISOString() : null };
+      }
+      if (backoff && Math.max(Number(state.backoffUntilMs || 0), Number(state.nextAllowedAtMs || 0)) > syncStartedAt) {
+        return { code: "SYNC_UPLOAD_BACKOFF", status: 429, retryAfterMs: Math.max(0, Math.max(Number(state.backoffUntilMs || 0), Number(state.nextAllowedAtMs || 0)) - Date.now()), nextAllowedAt: state.nextAllowedAtMs ? new Date(state.nextAllowedAtMs).toISOString() : null };
+      }
+    } catch { /* no upload failure was recorded */ }
+    return null;
+  }
   // A dashboard refresh fans out to several account-view endpoints. Keep the
   // circuit-breaker state per session instead of one global slot (a successful
   // request for one account must not clear another account's failure), and
   // suppress the duplicate fan-out while the first cloud probe is pending.
   const accountViewFailures = new Map();
-  const accountViewInFlight = new Set();
+  const accountViewInFlight = new Map();
+  let accountUploadState = readAccountUploadState();
+  const runtimeConfigPath = path.join(path.dirname(qp), "config.json");
+  const instancePath = path.join(trackerDataDir, "runtime-instance.json");
+  const issuedAccessTokenInstances = new Map();
+  let instanceFingerprint = "";
+  try { instanceFingerprint = JSON.parse(fs.readFileSync(instancePath, "utf8")).fingerprint || ""; } catch { /* first start */ }
+
+  function fingerprintFor(runtime) {
+    return crypto.createHash("sha256").update(`${runtime.baseUrl}\0${runtime.anonKey || ""}`).digest("hex");
+  }
+
+  function getRuntime() {
+    let config = {};
+    let invalid = false;
+    try { config = JSON.parse(fs.readFileSync(runtimeConfigPath, "utf8")); }
+    catch (error) { invalid = error.code !== "ENOENT"; }
+    if (!config || typeof config !== "object" || Array.isArray(config)) { config = {}; invalid = true; }
+    const runtime = resolveRuntimeConfig({ config: config || {}, env: process.env });
+    if (invalid) runtime.configurationError = "invalid_local_config";
+    if (runtime.configurationError || (!fs.existsSync(runtimeConfigPath) && !fs.existsSync(qp))) return runtime;
+    const fingerprint = fingerprintFor(runtime);
+    if (fingerprint !== instanceFingerprint) {
+      if (instanceFingerprint || runtime.baseUrl !== DEFAULT_BASE_URL) {
+        clearRelayCookies("backend instance changed");
+        _nativeAuthPending = false; _nativeAuthExpiry = 0;
+        resetInstanceState(path.dirname(qp));
+        if (trackerDataDir !== path.dirname(qp)) resetInstanceState(trackerDataDir);
+        accountViewFailures.clear(); accountViewInFlight.clear();
+        if (["deviceToken", "deviceId", "user_id"].some(key => config?.[key]) &&
+            normalizeInstanceBaseUrl(config.deviceTokenBaseUrl) !== runtime.baseUrl) {
+          config = clearDeviceIdentity(config);
+          writeJsonAtomicSync(runtimeConfigPath, config);
+          runtime.deviceToken = null;
+        }
+      }
+      fs.mkdirSync(trackerDataDir, { recursive: true });
+      fs.writeFileSync(instancePath, JSON.stringify({ fingerprint }), { mode: 0o600 });
+      instanceFingerprint = fingerprint;
+    }
+    return runtime;
+  }
+
+  function readAccountUploadState() {
+    try {
+      const state = JSON.parse(fs.readFileSync(path.join(path.dirname(qp), "queue.state.json"), "utf8"));
+      return JSON.stringify([Number(state.offset) || 0, state.updatedAt || ""]);
+    } catch {
+      return "";
+    }
+  }
+
+  function invalidateAfterAccountUpload() {
+    const state = readAccountUploadState();
+    if (state !== accountUploadState) {
+      accountUploadState = state;
+      invalidateCloudAccountPayloadCache();
+    }
+  }
 
   function accountViewFailureUntil(failureKey) {
     const until = accountViewFailures.get(failureKey) || 0;
@@ -1208,6 +1181,8 @@ function createLocalApiHandler({ queuePath }) {
   }
 
   function clearRelayCookies(reason) {
+    clearLocalSyncDeviceTokenCache();
+    invalidateCloudAccountPayloadCache({ sessionChanged: true });
     if (relayCookies.size === 0) return;
     relayCookies.clear();
     try {
@@ -1236,6 +1211,7 @@ function createLocalApiHandler({ queuePath }) {
       
       if (isDeletion) {
         if (relayCookies.has(name)) {
+          if (name === "insforge_refresh_token") invalidateCloudAccountPayloadCache({ sessionChanged: true });
           relayCookies.delete(name);
           changed = true;
           console.log(`[LocalAPI] Cookie deleted: ${name}`);
@@ -1243,6 +1219,7 @@ function createLocalApiHandler({ queuePath }) {
       } else {
         const oldVal = relayCookies.get(name);
         if (oldVal !== raw.trim()) {
+          if (name === "insforge_refresh_token") invalidateCloudAccountPayloadCache({ sessionChanged: true });
           relayCookies.set(name, raw.trim());
           changed = true;
           console.log(`[LocalAPI] Cookie captured: ${name}`);
@@ -1267,13 +1244,18 @@ function createLocalApiHandler({ queuePath }) {
     }
   }
 
-  function captureAuthTokensFromBody(bodyBuffer, contentType) {
+  function captureAuthTokensFromBody(bodyBuffer, contentType, { newLogin = false, sourceFingerprint } = {}) {
     if (!bodyBuffer || !String(contentType || "").toLowerCase().includes("application/json")) return;
     let parsed = null;
     try {
       parsed = JSON.parse(bodyBuffer.toString("utf8"));
     } catch {
       return;
+    }
+    if (sourceFingerprint && typeof parsed?.accessToken === "string" && parsed.accessToken.length <= 8192) {
+      const hash = crypto.createHash("sha256").update(parsed.accessToken).digest("hex");
+      if (!issuedAccessTokenInstances.has(hash)) issuedAccessTokenInstances.set(hash, sourceFingerprint);
+      while (issuedAccessTokenInstances.size > 64) issuedAccessTokenInstances.delete(issuedAccessTokenInstances.keys().next().value);
     }
     let changed = false;
     const token = typeof parsed?.csrfToken === "string" ? parsed.csrfToken.trim() : "";
@@ -1286,8 +1268,10 @@ function createLocalApiHandler({ queuePath }) {
     }
     const refreshToken = typeof parsed?.refreshToken === "string" ? parsed.refreshToken.trim() : "";
     if (refreshToken) {
+      if (newLogin) clearLocalSyncDeviceTokenCache();
       const cookie = `insforge_refresh_token=${encodeURIComponent(refreshToken)}; Path=/; HttpOnly; SameSite=Lax`;
       if (relayCookies.get("insforge_refresh_token") !== cookie) {
+        invalidateCloudAccountPayloadCache({ sessionChanged: true });
         relayCookies.set("insforge_refresh_token", cookie);
         changed = true;
       }
@@ -1301,28 +1285,36 @@ function createLocalApiHandler({ queuePath }) {
   // sync is on. Cloud sync is a dashboard (WebView) preference persisted in
   // localStorage; the dashboard mirrors it here via POST
   // /functions/tokentracker-cloud-sync-pref so the auth-unaware popover can key
-  // off the same flag. Defaults ON, exactly like the dashboard toggle — every
-  // consumer additionally requires a relayed refresh token, so the default only
-  // takes effect for signed-in users; an explicit {enabled:false} still wins.
+  // off the same flag. Defaults OFF, exactly like the dashboard toggle;
+  // existing saved choices are preserved.
   const cloudSyncPrefPath = path.join(trackerDataDir, "cloud-sync-pref.json");
   let cloudSyncPrefCache;
+  let cloudSyncPrefGeneration = 0;
   function getCloudSyncPref() {
     if (cloudSyncPrefCache === undefined) {
-      try {
-        cloudSyncPrefCache = JSON.parse(fs.readFileSync(cloudSyncPrefPath, "utf8"))?.enabled !== false;
-      } catch {
-        cloudSyncPrefCache = true;
-      }
+      cloudSyncPrefCache = require("./cloud-sync-prefs").readCloudSyncEnabled(trackerDataDir);
     }
     return cloudSyncPrefCache;
   }
-  function setCloudSyncPref(enabled) {
+  function setCloudSyncPref(enabled, changedAtMs = Date.now()) {
+    // Multiple dashboard windows can deliver mirrors out of order. Keep the
+    // newest saved choice; old files without an ordering marker remain valid.
+    try {
+      const saved = JSON.parse(fs.readFileSync(cloudSyncPrefPath, "utf8"));
+      if (Number(saved?.changedAtMs || 0) > changedAtMs ||
+          (changedAtMs > 0 && saved?.changedAtMs === changedAtMs && saved?.enabled === false && enabled)) return;
+    } catch { /* first choice or an unreadable preference */ }
+    if (getCloudSyncPref() !== Boolean(enabled)) {
+      cloudSyncPrefGeneration += 1;
+      clearLocalSyncDeviceTokenCache();
+      invalidateCloudAccountPayloadCache();
+    }
     cloudSyncPrefCache = Boolean(enabled);
     try {
       if (!fs.existsSync(trackerDataDir)) fs.mkdirSync(trackerDataDir, { recursive: true });
       fs.writeFileSync(
         cloudSyncPrefPath,
-        JSON.stringify({ enabled: cloudSyncPrefCache, updatedAt: new Date().toISOString() }),
+        JSON.stringify({ enabled: cloudSyncPrefCache, changedAtMs, updatedAt: new Date().toISOString() }),
         { encoding: "utf8", mode: 0o600 },
       );
     } catch (e) {
@@ -1350,43 +1342,67 @@ function createLocalApiHandler({ queuePath }) {
     }
   }
 
-  function localSyncDeviceTokenCacheKey(refreshToken, machineId, baseUrl) {
-    return `${baseUrl}\0${refreshToken}\0${machineId}`;
+  function localSyncDeviceTokenCacheKey(userId, machineId, baseUrl) {
+    return `${baseUrl}\0${userId}\0${machineId}`;
   }
 
   async function issueDeviceTokenForLocalSync(queuePathForMachineId, options = {}) {
     if (!getCloudSyncPref()) return null;
     const refreshToken = getRefreshTokenForCloud();
-    if (!refreshToken) return null;
+    if (!options.accessToken && !refreshToken) return null;
     const machineId = getOrCreateMachineId(queuePathForMachineId);
     if (!machineId) return null;
-
-    const runtime = resolveRuntimeConfig();
-    const baseUrl =
-      normalizeRemoteHttpBaseUrl(options.baseUrl) ||
-      normalizeRemoteHttpBaseUrl(runtime.baseUrl) ||
-      normalizeRemoteHttpBaseUrl(DEFAULT_BASE_URL);
-    const cacheKey = localSyncDeviceTokenCacheKey(refreshToken, machineId, baseUrl);
-    const cachedToken = localSyncDeviceTokenCache.get(cacheKey);
-    if (cachedToken) return cachedToken;
+    const runtime = assertInsforgeRuntime(getRuntime());
+    const baseUrl = normalizeRemoteHttpBaseUrl(options.baseUrl) ||
+      normalizeRemoteHttpBaseUrl(runtime.baseUrl);
+    const sessionAtStart = getCloudAccountSessionGeneration();
+    const cloudPrefAtStart = cloudSyncPrefGeneration;
+    const generationAtStart = localCloudGeneration;
+    const minted = options.accessToken ? { accessToken: options.accessToken } : await mintAccessToken({
+      baseUrl, anonKey: runtime.anonKey, refreshToken, timeoutMs: runtime.httpTimeoutMs, throwOnFailure: true,
+    }).catch((error) => {
+      if (error.status === 401 && sessionAtStart === getCloudAccountSessionGeneration()) clearLocalSyncDeviceTokenCache();
+      throw error;
+    });
+    if (!minted?.accessToken || sessionAtStart !== getCloudAccountSessionGeneration()) return null;
+    const rotatedRefreshToken =
+      typeof minted.refreshToken === "string" && minted.refreshToken.trim()
+        ? minted.refreshToken.trim()
+        : "";
+    if (rotatedRefreshToken) setRelayRefreshToken(rotatedRefreshToken);
+    if (minted.csrfToken) setRelayCsrfToken(minted.csrfToken);
+    if (!getCloudSyncPref() || cloudPrefAtStart !== cloudSyncPrefGeneration) return null;
+    // Refresh validates native ownership. A browser JWT must additionally pass
+    // token issuance upstream before the mirror receives an upload binding.
+    let userId = "";
+    try {
+      const payload = JSON.parse(Buffer.from(minted.accessToken.split(".")[1], "base64url").toString("utf8"));
+      userId = typeof payload.sub === "string" ? payload.sub : "";
+    } catch { /* legacy opaque access tokens retain their isolated refresh key */ }
+    if (options.expectedOwnerId && userId !== options.expectedOwnerId) {
+      throw Object.assign(new Error("Account owner mismatch"), { status: 409, code: "auth_owner_mismatch" });
+    }
+    if (userId && localSyncDeviceTokenUserId && userId !== localSyncDeviceTokenUserId) {
+      clearLocalSyncDeviceTokenCache();
+    }
+    if (userId) localSyncDeviceTokenUserId = userId;
+    const identity = userId || `refresh:${rotatedRefreshToken || refreshToken}`;
+    const cacheKey = localSyncDeviceTokenCacheKey(identity, machineId, baseUrl);
+    const binding = { userId, baseUrl, machineId };
+    const cachedToken = !options.accessToken && (localSyncDeviceTokenCache.get(cacheKey) ||
+      (userId ? localSyncDeviceTokenStore.get(binding) : null));
+    if (cachedToken) {
+      localSyncDeviceTokenCache.set(cacheKey, cachedToken);
+      if (userId) localSyncDeviceTokenStore.set(binding, cachedToken);
+      return options.returnSession ? localSyncDeviceMetadata.get(cachedToken) || null : cachedToken;
+    }
     const inflightToken = localSyncDeviceTokenInflight.get(cacheKey);
-    if (inflightToken) return inflightToken;
+    if (inflightToken?.sessionGeneration === sessionAtStart && inflightToken.generation === generationAtStart) {
+      const token = await inflightToken.promise;
+      return options.returnSession ? localSyncDeviceMetadata.get(token) || null : token;
+    }
 
     const issuePromise = (async () => {
-      const minted = await mintAccessToken({
-        baseUrl,
-        anonKey: runtime.anonKey,
-        refreshToken,
-        timeoutMs: runtime.httpTimeoutMs,
-      });
-      if (!minted?.accessToken) return null;
-      const rotatedRefreshToken =
-        typeof minted.refreshToken === "string" && minted.refreshToken.trim()
-          ? minted.refreshToken.trim()
-          : "";
-      if (rotatedRefreshToken) setRelayRefreshToken(rotatedRefreshToken);
-      if (minted.csrfToken) setRelayCsrfToken(minted.csrfToken);
-
       const root = String(baseUrl || DEFAULT_BASE_URL).replace(/\/$/, "");
       const headers = {
         "Content-Type": "application/json",
@@ -1407,7 +1423,7 @@ function createLocalApiHandler({ queuePath }) {
             process.platform === "linux" ? "Linux x86_64" :
               "web";
 
-      const res = await fetch(`${root}/functions/tokentracker-device-token-issue`, {
+      const res = await fetchFunctionResponse(functionUrlFor(root, "tokentracker-device-token-issue"), {
         method: "POST",
         headers,
         signal: controller ? controller.signal : undefined,
@@ -1422,20 +1438,36 @@ function createLocalApiHandler({ queuePath }) {
       }).finally(() => {
         if (timeoutId) clearTimeout(timeoutId);
       });
-      if (!res.ok) return null;
+      getRuntime();
+      if (sessionAtStart !== getCloudAccountSessionGeneration() || !getCloudSyncPref() || cloudPrefAtStart !== cloudSyncPrefGeneration || generationAtStart !== localCloudGeneration) return null;
+      if (!res.ok) {
+        if (res.status === 401 && sessionAtStart === getCloudAccountSessionGeneration()) {
+          localSyncDeviceTokenCache.delete(cacheKey);
+          localSyncDeviceTokenStore.clear(binding);
+        }
+        const denied = await res.json().catch(() => ({}));
+        if (typeof denied?.code === "string" && denied.code.startsWith("cloud_")) {
+          throw Object.assign(new Error(denied.code), { code: denied.code, status: res.status,
+            recoveryUrl: denied.recovery_url });
+        }
+        return null;
+      }
       const data = await res.json().catch(() => null);
       const token = typeof data?.token === "string" ? data.token.trim() : "";
+      if (sessionAtStart !== getCloudAccountSessionGeneration() || !getCloudSyncPref() || cloudPrefAtStart !== cloudSyncPrefGeneration || generationAtStart !== localCloudGeneration) return null;
       if (token) {
-        const activeRefreshToken = rotatedRefreshToken || refreshToken;
-        localSyncDeviceTokenCache.set(localSyncDeviceTokenCacheKey(activeRefreshToken, machineId, baseUrl), token);
+        localSyncDeviceMetadata.set(token, { token, deviceId: data.device_id, issuedAt: data.created_at || new Date().toISOString() });
+        localSyncDeviceTokenCache.set(cacheKey, token);
+        if (userId) localSyncDeviceTokenStore.set(binding, token);
       }
       return token || null;
     })();
-    localSyncDeviceTokenInflight.set(cacheKey, issuePromise);
+    localSyncDeviceTokenInflight.set(cacheKey, { promise: issuePromise, sessionGeneration: sessionAtStart, generation: generationAtStart });
     try {
-      return await issuePromise;
+      const token = await issuePromise;
+      return options.returnSession ? localSyncDeviceMetadata.get(token) || null : token;
     } finally {
-      localSyncDeviceTokenInflight.delete(cacheKey);
+      if (localSyncDeviceTokenInflight.get(cacheKey)?.promise === issuePromise) localSyncDeviceTokenInflight.delete(cacheKey);
     }
   }
 
@@ -1456,6 +1488,7 @@ function createLocalApiHandler({ queuePath }) {
     if (err.name === "AbortError" || err.name === "TimeoutError" || err.code === "auth_timeout") {
       return "transient-timeout";
     }
+    if (typeof err.code === "string" && err.code.startsWith("cloud_")) return err.code.replaceAll("_", "-");
     if (err.code === "auth_rejected" || err.code === "auth_invalid" || err.status === 401 || err.status === 403) {
       return "transient-auth";
     }
@@ -1472,41 +1505,67 @@ function createLocalApiHandler({ queuePath }) {
     if (!getCloudSyncPref()) return ACCOUNT_FALLBACK_CLOUD_SYNC_OFF;
     const refreshToken = getRefreshTokenForCloud();
     if (!refreshToken) return ACCOUNT_FALLBACK_SIGNED_OUT;
-    const runtime = resolveRuntimeConfig();
+    invalidateAfterAccountUpload();
+    const runtime = getRuntime();
+    if (runtime.configurationError) return ACCOUNT_FALLBACK_SIGNED_OUT;
     const failureKey = `${runtime.baseUrl}\0${refreshToken}`;
-    const requestKey = `${failureKey}\0${usageSlug}\0${url.searchParams.toString()}`;
-    if (accountViewFailureUntil(failureKey) > Date.now()) {
+    const sessionAtStart = getCloudAccountSessionGeneration();
+    const cloudPrefAtStart = cloudSyncPrefGeneration;
+    const params = new URLSearchParams(url.searchParams);
+    params.sort();
+    const requestKey = `${failureKey}\0${sessionAtStart}\0${cloudPrefAtStart}\0${accountUploadState}\0${usageSlug}\0${params}`;
+    if (url.searchParams.get("refresh") !== "1" && accountViewFailureUntil(failureKey) > Date.now()) {
       return "transient-backoff";
     }
-    // Six native dashboard requests normally arrive together. If the cloud is
-    // already being probed for this session, let the remaining requests use
-    // their local fallback instead of opening more timeout-bound sockets.
-    if (accountViewInFlight.has(requestKey)) {
-      return "transient-inflight";
-    }
-    accountViewInFlight.add(requestKey);
     const envTimeout = process.env.TOKENTRACKER_HTTP_TIMEOUT_MS
       ? parseInt(process.env.TOKENTRACKER_HTTP_TIMEOUT_MS, 10)
       : 0;
     const timeoutMs = envTimeout > 0 ? envTimeout : 4000;
     try {
-      const out = await fetchAccountUsage({
-        usageSlug,
-        searchParams: url.searchParams,
-        baseUrl: runtime.baseUrl || DEFAULT_BASE_URL,
-        anonKey: runtime.anonKey,
-        refreshToken,
-        timeoutMs,
-      });
+      // An identical overlapping read shares the entire probe, including its
+      // token mint. A healthy pending read must not look like a cloud outage
+      // and trigger the native client's account recovery loop.
+      let pending = accountViewInFlight.get(requestKey);
+      if (!pending) {
+        pending = fetchAccountUsage({
+          usageSlug,
+          searchParams: url.searchParams,
+          baseUrl: runtime.baseUrl || DEFAULT_BASE_URL,
+          anonKey: runtime.anonKey,
+          refreshToken,
+          timeoutMs,
+          onSessionRefreshed: (session) => {
+            getRuntime();
+            if (sessionAtStart !== getCloudAccountSessionGeneration()) {
+              throw Object.assign(new Error("Account session changed"), { code: "auth_session_changed" });
+            }
+            if (session.refreshToken) setRelayRefreshToken(session.refreshToken);
+            if (session.csrfToken) setRelayCsrfToken(session.csrfToken);
+          },
+        });
+        accountViewInFlight.set(requestKey, pending);
+        const cleanup = () => {
+          if (accountViewInFlight.get(requestKey) === pending) accountViewInFlight.delete(requestKey);
+        };
+        pending.then(cleanup, cleanup);
+      }
+      const out = await pending;
+      getRuntime();
       // `null` here means the slug has no cloud equivalent, or the session
       // vanished mid-request — a routing/session fact, not an outage.
       if (!out) return ACCOUNT_FALLBACK_SIGNED_OUT;
+      if (sessionAtStart !== getCloudAccountSessionGeneration()) {
+        throw Object.assign(new Error("Account session changed"), { code: "auth_session_changed" });
+      }
       if (out.data == null) {
         rememberAccountViewFailure(failureKey);
         return "transient-upstream";
       }
-      if (out.rotatedRefreshToken) setRelayRefreshToken(out.rotatedRefreshToken);
-      if (out.rotatedCsrfToken) setRelayCsrfToken(out.rotatedCsrfToken);
+      if (!getCloudSyncPref()) return ACCOUNT_FALLBACK_CLOUD_SYNC_OFF;
+      if (cloudPrefAtStart !== cloudSyncPrefGeneration) {
+        json(res, { error: "Cloud sync preference changed", code: "CLOUD_SYNC_CHANGED" }, 409);
+        return "served";
+      }
       accountViewFailures.delete(failureKey);
       res.writeHead(200, {
         "Content-Type": "application/json",
@@ -1516,18 +1575,27 @@ function createLocalApiHandler({ queuePath }) {
       res.end(JSON.stringify(out.data));
       return "served";
     } catch (e) {
+      const currentSession = getCloudAccountSessionGeneration();
+      if (e.code === "auth_session_changed" ||
+          (sessionAtStart !== currentSession && e.invalidatedSessionGeneration !== currentSession)) {
+        json(res, { error: "Account session changed", code: "auth_session_changed" }, 409);
+        return "served";
+      }
+      if (!getCloudSyncPref()) return ACCOUNT_FALLBACK_CLOUD_SYNC_OFF;
+      if (cloudPrefAtStart !== cloudSyncPrefGeneration) {
+        json(res, { error: "Cloud sync preference changed", code: "CLOUD_SYNC_CHANGED" }, 409);
+        return "served";
+      }
       // Signed in + cloud sync on, but the cloud read failed (offline, token
       // rejected, edge error, or timeout). Serve local data rather than
       // erroring, but say so: this is a *temporary* downgrade and the client
       // must not treat it as the user's real data scope.
       const reason = classifyAccountFallback(e);
-      if (resolveRuntimeConfig().debug) {
+      if (getRuntime().debug) {
         console.warn(`[LocalAPI] account view fallback (${reason}) for ${usageSlug}:`, e?.message || e);
       }
       rememberAccountViewFailure(failureKey);
       return reason;
-    } finally {
-      accountViewInFlight.delete(requestKey);
     }
   }
 
@@ -1578,6 +1646,45 @@ function createLocalApiHandler({ queuePath }) {
 
   return async function handleLocalApi(req, res, url) {
     const p = url.pathname;
+    // Session recovery and the one-time native callback marker belong to local
+    // clients. Reject foreign requests before consuming either, including preflights.
+    const nativeMarkerRead = p === "/api/auth-bridge/verifier" && String(req.method).toUpperCase() === "GET";
+    if (p.startsWith("/api/auth/") || nativeMarkerRead) {
+      if (!hasAllowedLoopbackOrigin(req.headers || {}) || req.headers?.["sec-fetch-site"] === "cross-site") {
+        json(res, { code: "untrusted_auth_origin", error: "Authentication requests must come from the local dashboard." }, 403);
+        return true;
+      }
+      if (String(req.method).toUpperCase() === "OPTIONS") {
+        res.writeHead(204, {
+          "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+          "Access-Control-Allow-Headers": "Content-Type, Authorization",
+        });
+        res.end();
+        return true;
+      }
+    }
+    const selectedRuntime = getRuntime();
+    const callerInstance = req.headers?.["x-tokentracker-instance"];
+    if (callerInstance && normalizeInstanceBaseUrl(callerInstance) !== selectedRuntime.baseUrl) {
+      json(res, { code: "instance_changed", error: "The configured backend instance changed. Reload and sign in again." }, 409);
+      return true;
+    }
+    const bearer = parseBearerToken(req.headers?.authorization);
+    const issuedFor = bearer && issuedAccessTokenInstances.get(crypto.createHash("sha256").update(bearer).digest("hex"));
+    if (issuedFor && issuedFor !== fingerprintFor(selectedRuntime)) {
+      json(res, { code: "instance_changed", error: "This session belongs to another backend instance. Sign in again." }, 409);
+      return true;
+    }
+    if (p === "/api/runtime-config.js") {
+      if (String(req.method).toUpperCase() !== "GET") { json(res, { error: "Method Not Allowed" }, 405); return true; }
+      const descriptor = { baseUrl: normalizeInstanceBaseUrl(selectedRuntime.baseUrl) || "",
+        anonKey: selectedRuntime.configurationError ? null : selectedRuntime.anonKey,
+        dashboardUrl: normalizeInstanceBaseUrl(selectedRuntime.dashboardUrl) || "", configurationError: selectedRuntime.configurationError };
+      const value = JSON.stringify(descriptor).replace(/</g, "\\u003c").replace(/\u2028/g, "\\u2028").replace(/\u2029/g, "\\u2029");
+      res.writeHead(200, { "Content-Type": "application/javascript; charset=utf-8", "Cache-Control": "no-store", "X-Content-Type-Options": "nosniff" });
+      res.end(`window.__TOKENTRACKER_RUNTIME_CONFIG__=${value};`);
+      return true;
+    }
 
     if (p === "/api/local-auth") {
       if (String(req.method || "GET").toUpperCase() !== "GET") {
@@ -1588,7 +1695,10 @@ function createLocalApiHandler({ queuePath }) {
         "Content-Type": "application/json",
         "Cache-Control": "no-store",
       });
-      res.end(JSON.stringify({ token: localAuthToken }));
+      res.end(JSON.stringify({
+        token: localAuthToken,
+        ...(normalizedServerVersion ? { serverVersion: normalizedServerVersion } : {}),
+      }));
       return true;
     }
 
@@ -1688,11 +1798,32 @@ function createLocalApiHandler({ queuePath }) {
 
     // --- auth proxy: forward /api/auth/* to InsForge cloud ---
     if (p.startsWith("/api/auth/")) {
-      const runtime = resolveRuntimeConfig();
+      if (String(req.method).toUpperCase() === "POST" && /^\/api\/auth\/(?:logout|sessions|sign-in|oauth\/exchange)$/.test(p)) {
+        clearLocalSyncDeviceTokenCache();
+        invalidateCloudAccountPayloadCache({ sessionChanged: true });
+      }
+      const authSessionAtStart = getCloudAccountSessionGeneration();
+      const runtime = getRuntime();
+      try { assertInsforgeRuntime(runtime); } catch (error) { json(res, { code: error.code, error: error.message }, 503); return true; }
       const insforgeBase = runtime.baseUrl || DEFAULT_BASE_URL;
+      if (req.headers.apikey && req.headers.apikey !== runtime.anonKey) {
+        json(res, { code: "instance_changed", error: "The public client key belongs to another backend instance." }, 409);
+        return true;
+      }
       try {
         const targetUrl = `${insforgeBase.replace(/\/$/, "")}${p}${url.search || ""}`;
         const proxyHeaders = buildProxyHeaders(req.headers);
+        // Browser cookies survive changes to the loopback server's backend.
+        // Only this instance's captured cookies can be relayed, including when
+        // switching from a custom instance back to the official service.
+        const hadBrowserCookies = Boolean(normalizeCookieHeader(proxyHeaders.cookie).trim());
+        proxyHeaders.cookie = hadBrowserCookies ? buildRelayCookieHeader("") : "";
+        if (proxyHeaders["x-csrf-token"] !== getRelayCookieValue(csrfRelayCookieName)) delete proxyHeaders["x-csrf-token"];
+        if (insforgeBase !== DEFAULT_BASE_URL && proxyHeaders.authorization && !callerInstance) {
+          json(res, { code: "instance_changed", error: "Reload the local dashboard before using a custom backend session." }, 409);
+          return true;
+        }
+        proxyHeaders.apikey = runtime.anonKey;
         const hasClientCookie = normalizeCookieHeader(proxyHeaders["cookie"]).trim().length > 0;
         const hasCsrfHeader = typeof proxyHeaders["x-csrf-token"] === "string" && proxyHeaders["x-csrf-token"].trim().length > 0;
         const relayCsrfToken = getRelayCookieValue(csrfRelayCookieName);
@@ -1732,6 +1863,7 @@ function createLocalApiHandler({ queuePath }) {
         const injectedRelayCookies =
           shouldInjectRelayCookies && relayCookies.size > 0 && mergedCookie !== originalCookieHeader;
         if (mergedCookie) proxyHeaders["cookie"] = mergedCookie;
+        else delete proxyHeaders["cookie"];
 
         const bodyChunks = [];
         for await (const chunk of req) bodyChunks.push(chunk);
@@ -1782,9 +1914,19 @@ function createLocalApiHandler({ queuePath }) {
           }
         }
 
+        const latestRuntime = getRuntime();
+        if (latestRuntime.configurationError || latestRuntime.baseUrl !== runtime.baseUrl || latestRuntime.anonKey !== runtime.anonKey) {
+          json(res, { code: "instance_changed", error: "The configured backend changed during authentication. Reload and sign in again." }, 409);
+          return true;
+        }
         // Error responses must not mutate relay state: a 403's deletion
         // set-cookie (insforge_refresh_token=; Expires=1970) would otherwise
         // destroy a still-valid persisted session.
+        if ((p === "/api/auth/refresh" || p === "/api/auth/logout") &&
+            authSessionAtStart !== getCloudAccountSessionGeneration()) {
+          json(res, { error: "Account session changed", code: "auth_session_changed" }, 409);
+          return true;
+        }
         const allowRelayCapture = proxyRes.status < 400;
         const responseHeaders = [...proxyRes.headers.entries()]
           .filter(([k]) => !["transfer-encoding", "connection"].includes(k.toLowerCase()))
@@ -1801,7 +1943,9 @@ function createLocalApiHandler({ queuePath }) {
           if (p === "/api/auth/logout") {
             clearRelayCookies("sign out");
           } else {
-            captureAuthTokensFromBody(resBody, proxyRes.headers.get("content-type"));
+            captureAuthTokensFromBody(resBody, proxyRes.headers.get("content-type"), {
+              newLogin: p !== "/api/auth/refresh", sourceFingerprint: fingerprintFor(runtime),
+            });
           }
         }
         if (
@@ -1996,6 +2140,69 @@ function createLocalApiHandler({ queuePath }) {
       return true;
     }
 
+    // The browser supplies its current JWT only to prove ownership upstream.
+    // Uploads use this server-held binding, never a caller's opaque device token.
+    if (p === "/functions/tokentracker-cloud-session") {
+      if (String(req.method).toUpperCase() !== "POST") { json(res, { error: "Method Not Allowed" }, 405); return true; }
+      if (!isAuthorizedLocalMutation(req)) { json(res, { error: "Unauthorized" }, 401); return true; }
+      try {
+        const body = await readJsonBody(req);
+        assertInsforgeRuntime(getRuntime());
+        if (body.clear === true) {
+          if (body.session_id && body.session_id === localCloudSession?.id) clearLocalSyncDeviceTokenCache();
+          json(res, { ok: true }); return true;
+        }
+        if (!getCloudSyncPref()) { json(res, { code: "CLOUD_SYNC_DISABLED" }, 409); return true; }
+        const accessToken = String(req.headers.authorization || "").replace(/^Bearer /i, "").trim();
+        const ownerId = typeof body.expectedOwnerId === "string" ? body.expectedOwnerId.trim() : "";
+        if (!accessToken || !ownerId) { json(res, { code: "auth_required" }, 401); return true; }
+        const baseUrl = resolveAllowedInsforgeBaseUrl(body.insforgeBaseUrl || getRuntime().baseUrl, getRuntime());
+        if (!baseUrl) { json(res, { error: "Unsupported insforgeBaseUrl override" }, 400); return true; }
+        clearLocalSyncDeviceTokenCache();
+        const generation = localCloudGeneration;
+        await Promise.all([...activeCloudSyncs].map(controller => controller.done).filter(Boolean));
+        const issued = await issueDeviceTokenForLocalSync(qp, { baseUrl, accessToken, expectedOwnerId: ownerId, returnSession: true });
+        if (generation !== localCloudGeneration) { json(res, { code: "auth_session_changed" }, 409); return true; }
+        if (!issued?.token || !issued.deviceId) { json(res, { code: "auth_rejected" }, 401); return true; }
+        localCloudSession = { id: crypto.randomUUID(), ownerId, baseUrl, generation, token: issued.token };
+        json(res, { session_id: localCloudSession.id, device_id: issued.deviceId, created_at: issued.issuedAt });
+      } catch (error) { json(res, { error: error.message, code: error.code || null, recovery_url: error.recoveryUrl || null }, error.status || 502); }
+      return true;
+    }
+
+    if (p === "/functions/tokentracker-cloud-usage-reset") {
+      if (!isAuthorizedLocalMutation(req) || req.headers["sec-fetch-site"] === "cross-site") { json(res, { error: "Unauthorized" }, 401); return true; }
+      try {
+        if (String(req.method).toUpperCase() === "GET") {
+          json(res, { pending: Boolean(readCloudUsageReset(trackerDataDir)) }); return true;
+        }
+        if (String(req.method).toUpperCase() !== "POST") { json(res, { error: "Method Not Allowed" }, 405); return true; }
+        const body = await readJsonBody(req);
+        const session = localCloudSession;
+        if (!getCloudSyncPref() || !session || body.cloudSessionId !== session.id || body.expectedOwnerId !== session.ownerId) {
+          json(res, { code: "auth_session_changed" }, 409); return true;
+        }
+        const metadata = localSyncDeviceMetadata.get(session.token);
+        const accessToken = String(req.headers.authorization || "").replace(/^Bearer /i, "").trim();
+        const runtime = assertInsforgeRuntime(getRuntime());
+        let claims;
+        try { claims = JSON.parse(Buffer.from(accessToken.split(".")[1], "base64url").toString("utf8")); } catch { /* rejected below */ }
+        if (claims?.sub !== session.ownerId || !Number.isFinite(claims?.exp) || claims.exp * 1000 <= Date.now()) {
+          json(res, { code: "auth_required" }, 401); return true;
+        }
+        const isCurrent = () => getCloudSyncPref() && localCloudSession === session && session.generation === localCloudGeneration &&
+          claims.exp * 1000 > Date.now() && getRuntime().baseUrl === session.baseUrl;
+        const result = await resetCloudDeviceUsage({ trackerDir: trackerDataDir, ownerId: session.ownerId,
+          deviceId: metadata?.deviceId, baseUrl: session.baseUrl, anonKey: runtime.anonKey, accessToken, isCurrent });
+        if (!isCurrent()) { json(res, { code: "auth_session_changed" }, 409); return true; }
+        clearLocalSyncDeviceTokenCache();
+        invalidateAfterAccountUpload();
+        invalidateCloudAccountPayloadCache();
+        json(res, { ...result, pending: true });
+      } catch (error) { json(res, { error: error.code || "cloud_usage_reset_failed", code: error.code || null }, error.status || 502); }
+      return true;
+    }
+
     // --- local-sync (POST) ---
     if (p === "/functions/tokentracker-local-sync") {
       if (String(req.method || "GET").toUpperCase() !== "POST") {
@@ -2013,8 +2220,15 @@ function createLocalApiHandler({ queuePath }) {
         } catch {
           body = {};
         }
-        const extraEnv = {};
+        const currentRuntime = getRuntime();
+        if (body.drain === true || body.cloudSessionId || body.insforgeBaseUrl || body.expectedOwnerId) assertInsforgeRuntime(currentRuntime);
+        const extraEnv = { TOKENTRACKER_CLOUD_RECHECK: "0", TOKENTRACKER_INSFORGE_BASE_URL: currentRuntime.baseUrl, TOKENTRACKER_INSFORGE_ANON_KEY: currentRuntime.anonKey || "" };
         const drain = body.drain === true;
+        // A user action after membership/resume may probe the server again.
+        // The server still enforces membership, paused slots and its deadline.
+        if (drain && body.recheckCloudAccess === true && body.auto !== true) {
+          extraEnv.TOKENTRACKER_CLOUD_RECHECK = "1";
+        }
         // Native Sync Now combines an incremental background scan with a full
         // cloud drain. A plain {drain:true} request remains an exhaustive sync.
         const auto = body.auto === true;
@@ -2029,12 +2243,20 @@ function createLocalApiHandler({ queuePath }) {
         if (background && body.nativeOnlyWsl === true) {
           extraEnv.TOKENTRACKER_WSL_MODE = "native-only";
         }
-        if (typeof body.deviceToken === "string" && body.deviceToken.trim()) {
-          extraEnv.TOKENTRACKER_DEVICE_TOKEN = body.deviceToken.trim();
+        if (body.deviceToken != null && !background) {
+          json(res, { ok: false, error: "Use the current cloud session", code: getCloudSyncPref() ? "auth_session_required" : "CLOUD_SYNC_DISABLED" }, 409);
+          return true;
         }
+        const browserSession = body.cloudSessionId ? localCloudSession : null;
+        if (body.cloudSessionId === "" || (body.expectedOwnerId && !body.cloudSessionId)) { json(res, { ok: false, code: "auth_session_required" }, 409); return true; }
+        if (body.cloudSessionId && (!browserSession || body.cloudSessionId !== browserSession.id ||
+            body.expectedOwnerId !== browserSession.ownerId || browserSession.generation !== localCloudGeneration || !getCloudSyncPref())) {
+          json(res, { ok: false, code: "auth_session_changed" }, 409); return true;
+        }
+        if (browserSession) extraEnv.TOKENTRACKER_DEVICE_TOKEN = browserSession.token;
         let localSyncBaseUrl = null;
         if (body.insforgeBaseUrl != null) {
-          const allowedBaseUrl = resolveAllowedInsforgeBaseUrl(body.insforgeBaseUrl);
+          const allowedBaseUrl = resolveAllowedInsforgeBaseUrl(body.insforgeBaseUrl, getRuntime());
           if (!allowedBaseUrl) {
             json(res, { ok: false, error: "Unsupported insforgeBaseUrl override" }, 400);
             return true;
@@ -2042,17 +2264,33 @@ function createLocalApiHandler({ queuePath }) {
           extraEnv.TOKENTRACKER_INSFORGE_BASE_URL = allowedBaseUrl;
           localSyncBaseUrl = allowedBaseUrl;
         }
+        if (browserSession) {
+          extraEnv.TOKENTRACKER_INSFORGE_BASE_URL = browserSession.baseUrl;
+          localSyncBaseUrl = browserSession.baseUrl;
+        }
+        const uploadGeneration = localCloudGeneration;
         if ((!background || publishAccount) &&
             !extraEnv.TOKENTRACKER_DEVICE_TOKEN &&
             getCloudSyncPref() &&
             getRefreshTokenForCloud()) {
           let issuedToken = null;
+          const issuerSessionAtStart = getCloudAccountSessionGeneration();
+          const issuerCloudPrefAtStart = cloudSyncPrefGeneration;
           try {
-            issuedToken = await issueDeviceTokenForLocalSync(qp, { baseUrl: localSyncBaseUrl });
+            issuedToken = await issueDeviceTokenForLocalSync(qp, { baseUrl: localSyncBaseUrl, expectedOwnerId: localCloudSession?.ownerId });
           } catch (e) {
-            if (resolveRuntimeConfig().debug) {
+            if (e?.code?.startsWith("cloud_") || e?.code === "auth_owner_mismatch") throw e;
+            if (getRuntime().debug) {
               console.warn("[LocalAPI] local sync device token issue failed:", e?.message || e);
             }
+          }
+          if (issuerSessionAtStart !== getCloudAccountSessionGeneration()) {
+            json(res, { ok: false, error: "Account session changed", code: "auth_session_changed" }, 409);
+            return true;
+          }
+          if (!getCloudSyncPref() || issuerCloudPrefAtStart !== cloudSyncPrefGeneration) {
+            json(res, { ok: false, error: "Cloud sync preference changed", code: "CLOUD_SYNC_CHANGED" }, 409);
+            return true;
           }
           if (!issuedToken) {
             if (drain) {
@@ -2063,7 +2301,41 @@ function createLocalApiHandler({ queuePath }) {
             extraEnv.TOKENTRACKER_DEVICE_TOKEN = issuedToken;
           }
         }
-        const result = await runSyncCommand(extraEnv, {
+        if (extraEnv.TOKENTRACKER_DEVICE_TOKEN && uploadGeneration !== localCloudGeneration) {
+          json(res, { ok: false, code: "auth_session_changed" }, 409); return true;
+        }
+        if (extraEnv.TOKENTRACKER_DEVICE_TOKEN) {
+          const metadata = localSyncDeviceMetadata.get(extraEnv.TOKENTRACKER_DEVICE_TOKEN);
+          if (metadata?.deviceId) extraEnv.TOKENTRACKER_CLOUD_DEVICE_ID = metadata.deviceId;
+        }
+        await Promise.all([...activeCloudSyncs].filter(controller => controller.signal.aborted).map(controller => controller.done).filter(Boolean));
+        if (extraEnv.TOKENTRACKER_DEVICE_TOKEN && uploadGeneration !== localCloudGeneration) throw Object.assign(new Error("Account session changed"), { code: "auth_session_changed", status: 409 });
+        if (extraEnv.TOKENTRACKER_DEVICE_TOKEN && localSyncDeviceTokenUserId) {
+          const uploadBaseUrl = localSyncBaseUrl || getRuntime().baseUrl;
+          const reset = readCloudUsageReset(trackerDataDir);
+          if (reset && (reset.ownerId !== localSyncDeviceTokenUserId || reset.baseUrl.replace(/\/$/, "") !== uploadBaseUrl.replace(/\/$/, "") ||
+              (extraEnv.TOKENTRACKER_CLOUD_DEVICE_ID && reset.deviceId !== extraEnv.TOKENTRACKER_CLOUD_DEVICE_ID))) {
+            json(res, { ok: false, code: "cloud_usage_reset_owner_changed" }, 409); return true;
+          }
+          const binding = JSON.stringify({ ownerId: localSyncDeviceTokenUserId, baseUrl: uploadBaseUrl });
+          const ownerPath = path.join(path.dirname(qp), "cloud-upload-owner.json");
+          let previous = "";
+          try { previous = fs.readFileSync(ownerPath, "utf8"); } catch { /* an unbound legacy cursor cannot prove its previous owner */ }
+          if (previous !== binding) {
+            fs.writeFileSync(path.join(path.dirname(qp), "queue.state.json"), JSON.stringify({ offset: 0, updatedAt: new Date().toISOString() }), { mode: 0o600 });
+            try { fs.unlinkSync(path.join(path.dirname(qp), "upload.throttle.json")); } catch { /* no cooldown yet */ }
+          }
+          fs.writeFileSync(ownerPath, binding, { mode: 0o600 });
+        }
+        const controller = new AbortController();
+        if (extraEnv.TOKENTRACKER_DEVICE_TOKEN) activeCloudSyncs.add(controller);
+        const syncStartedAt = Date.now();
+        if (localSyncDeviceTokenUserId) extraEnv.TOKENTRACKER_CLOUD_OWNER_ID = localSyncDeviceTokenUserId;
+        extraEnv.TOKENTRACKER_LOCAL_SYNC_ATTEMPT_ID = crypto.randomUUID();
+        const syncPromise = runSyncCommand(extraEnv, {
+          signal: controller.signal,
+          trackerDataDir: isolatedTrackerDataDir,
+          syncContext,
           drain,
           auto,
           background,
@@ -2072,15 +2344,36 @@ function createLocalApiHandler({ queuePath }) {
           waitForLock:
             !drain && !background && Boolean(extraEnv.TOKENTRACKER_DEVICE_TOKEN),
         });
+        controller.done = syncPromise.catch(() => {});
+        const result = await syncPromise.catch((error) => {
+          if (uploadGeneration !== localCloudGeneration) throw Object.assign(new Error("Account session changed"), { code: "auth_session_changed", status: 409 });
+          const failure = currentCloudUploadFailure(syncStartedAt, { backoff: auto && drain, deviceToken: extraEnv.TOKENTRACKER_DEVICE_TOKEN, attemptId: extraEnv.TOKENTRACKER_LOCAL_SYNC_ATTEMPT_ID });
+          if (failure) Object.assign(error, failure);
+          throw error;
+        }).finally(() => activeCloudSyncs.delete(controller));
+        if (extraEnv.TOKENTRACKER_DEVICE_TOKEN && uploadGeneration !== localCloudGeneration) throw Object.assign(new Error("Account session changed"), { code: "auth_session_changed", status: 409 });
+        const failure = currentCloudUploadFailure(syncStartedAt, { deviceToken: extraEnv.TOKENTRACKER_DEVICE_TOKEN, attemptId: extraEnv.TOKENTRACKER_LOCAL_SYNC_ATTEMPT_ID });
+        if (failure) throw Object.assign(new Error("Cloud upload failed"), failure);
+        invalidateAfterAccountUpload();
+        if (drain) invalidateCloudAccountPayloadCache();
         try {
           const { resetUsageLimitsCache } = require("./usage-limits");
           resetUsageLimitsCache();
         } catch (_e) {
           // ignore if module load fails
         }
-        json(res, { ok: true, ...result });
+        let cloudAccess = { uploaded: false, pending: true };
+        try {
+          const state = JSON.parse(fs.readFileSync(path.join(path.dirname(qp), "upload.throttle.json"), "utf8"));
+          if (state.nextAllowedAtMs) cloudAccess.next_allowed_at = new Date(state.nextAllowedAtMs).toISOString();
+          cloudAccess.uploaded = state.lastSuccessAttemptId === extraEnv.TOKENTRACKER_LOCAL_SYNC_ATTEMPT_ID &&
+            Number(state.lastSuccessMs || 0) >= syncStartedAt;
+          const queueState = JSON.parse(fs.readFileSync(path.join(path.dirname(qp), "queue.state.json"), "utf8"));
+          cloudAccess.pending = fs.statSync(qp).size > Number(queueState.offset || 0);
+        } catch { /* no upload has been attempted yet */ }
+        json(res, { ok: true, ...result, ...cloudAccess });
       } catch (e) {
-        json(res, { ok: false, error: e?.message, code: e?.code ?? null, stdout: e?.stdout || "", stderr: e?.stderr || "" }, 500);
+        json(res, { ok: false, error: e?.message, code: e?.code ?? null, recovery_url: e?.recoveryUrl ?? null, next_allowed_at: e?.nextAllowedAt ?? null, retry_after_seconds: e?.retryAfterMs ? Math.ceil(e.retryAfterMs / 1000) : null, stdout: e?.stdout || "", stderr: e?.stderr || "" }, e?.status || 500);
       }
       return true;
     }
@@ -2089,7 +2382,7 @@ function createLocalApiHandler({ queuePath }) {
     if (p === "/functions/tokentracker-wrapped") {
       const yearParam = url.searchParams.get("year");
       const year = yearParam ? Number(yearParam) : null;
-      const { rows, scope, excludedSources } = scopedQueueRows(qp, url);
+      const { rows, scope, excludedSources } = await scopedQueueRows(qp, url);
       const { aggregateWrapped } = require("./wrapped-aggregator");
       const summary = aggregateWrapped(rows, year ? { year } : {});
       json(res, { scope, excluded_sources: excludedSources, ...summary });
@@ -2118,8 +2411,8 @@ function createLocalApiHandler({ queuePath }) {
       const from = url.searchParams.get("from") || "";
       const to = url.searchParams.get("to") || "";
       const timeZoneContext = getTimeZoneContext(url);
-      const { rows, scope, excludedSources } = scopedQueueRows(qp, url);
-      const allDaily = aggregateByDay(rows, timeZoneContext);
+      const { rows, scope, excludedSources } = await scopedQueueRows(qp, url);
+      const allDaily = await aggregateByDay(rows, timeZoneContext);
       const daily = allDaily.filter((d) => d.day >= from && d.day <= to);
       const totals = daily.reduce(
         (acc, r) => {
@@ -2186,8 +2479,8 @@ function createLocalApiHandler({ queuePath }) {
       const from = url.searchParams.get("from") || "";
       const to = url.searchParams.get("to") || "";
       const timeZoneContext = getTimeZoneContext(url);
-      const { rows, scope, excludedSources } = scopedQueueRows(qp, url);
-      const daily = aggregateByDay(rows, timeZoneContext).filter((d) => d.day >= from && d.day <= to);
+      const { rows, scope, excludedSources } = await scopedQueueRows(qp, url);
+      const daily = (await aggregateByDay(rows, timeZoneContext)).filter((d) => d.day >= from && d.day <= to);
       json(res, { from, to, scope, excluded_sources: excludedSources, data: daily });
       return true;
     }
@@ -2220,7 +2513,7 @@ function createLocalApiHandler({ queuePath }) {
         json(res, { available: false, from, to, by_model: [], by_tool: [], totals: null });
         return true;
       }
-      const { rows, scope, excludedSources } = scopedQueueRows(qp, url);
+      const { rows, scope, excludedSources } = await scopedQueueRows(qp, url);
       const result = computeQualityPerDollar(rows, outcomes, { from, to });
       json(res, { from, to, scope, excluded_sources: excludedSources, ...result });
       return true;
@@ -2236,7 +2529,7 @@ function createLocalApiHandler({ queuePath }) {
         const sessions = await buildSessionAnalytics({ force: refresh });
         const wantsCsv = url.searchParams.get("format") === "csv";
         const includeSessions = wantsCsv || ["1", "true"].includes(url.searchParams.get("include_sessions"));
-        const result = summarizeSessions(sessions, { from, to, includeSessions });
+        const result = summarizeSessions(sessions, { from, to, includeSessions, ...getTimeZoneContext(url) });
         if (wantsCsv) {
           const content = sessionsToCsv(result.sessions);
           res.statusCode = 200;
@@ -2271,7 +2564,7 @@ function createLocalApiHandler({ queuePath }) {
       try {
         const { buildSessionAnalytics, listSessionsForBrowser } = require("./session-analytics");
         const sessions = await buildSessionAnalytics({ force: refresh });
-        const result = listSessionsForBrowser(sessions, { from, to, limit });
+        const result = listSessionsForBrowser(sessions, { from, to, limit, ...getTimeZoneContext(url) });
         json(res, { from, to, ...result });
       } catch (error) {
         // Node fs errors embed the absolute path ("EACCES ... open '/Users/…'").
@@ -2293,8 +2586,8 @@ function createLocalApiHandler({ queuePath }) {
     if (p === "/functions/tokentracker-usage-heatmap") {
       const weeks = parseInt(url.searchParams.get("weeks") || "52", 10);
       const timeZoneContext = getTimeZoneContext(url);
-      const { rows, scope, excludedSources } = scopedQueueRows(qp, url);
-      const daily = aggregateByDay(rows, timeZoneContext);
+      const { rows, scope, excludedSources } = await scopedQueueRows(qp, url);
+      const daily = await aggregateByDay(rows, timeZoneContext);
       const todayParts = getZonedParts(new Date(), timeZoneContext);
       const todayStr = formatPartsDayKey(todayParts) || new Date().toISOString().slice(0, 10);
       const end = new Date(`${todayStr}T00:00:00Z`);
@@ -2360,15 +2653,15 @@ function createLocalApiHandler({ queuePath }) {
       const from = url.searchParams.get("from") || "";
       const to = url.searchParams.get("to") || "";
       const timeZoneContext = getTimeZoneContext(url);
-      const { rows: scopedRows, scope, excludedSources } = scopedQueueRows(qp, url);
-      const rows = scopedRows.filter((r) => {
-        if (!r.hour_start) return false;
-        const d = rowDayKey(r, timeZoneContext);
-        return d >= from && d <= to;
-      });
-
+      const { rows: scopedRows, scope, excludedSources } = await scopedQueueRows(qp, url);
+      const pricingRevision = getPricingRevision();
       const bySource = new Map();
-      for (const row of rows) {
+      let processed = 0;
+      for (const row of scopedRows) {
+        if (++processed % AGGREGATION_BATCH_ROWS === 0) await yieldToRequests();
+        if (!row.hour_start) continue;
+        const day = rowDayKey(row, timeZoneContext);
+        if (day < from || day > to) continue;
         const src = row.source || "unknown";
         const mdl = row.model || "unknown";
         if (!bySource.has(src))
@@ -2383,8 +2676,11 @@ function createLocalApiHandler({ queuePath }) {
         sa.totals.cache_creation_input_tokens += row.cache_creation_input_tokens || 0;
         sa.totals.reasoning_output_tokens += row.reasoning_output_tokens || 0;
         if (!sa.models.has(mdl))
-          sa.models.set(mdl, { model: mdl, model_id: mdl, totals: { total_tokens: 0, billable_total_tokens: 0, input_tokens: 0, output_tokens: 0, unclassified_input_tokens: 0, cached_input_tokens: 0, cache_creation_input_tokens: 0, reasoning_output_tokens: 0, total_cost_usd: "0" } });
+          sa.models.set(mdl, { model: mdl, model_id: mdl, pricing: getModelPricingInfo(mdl, { source: src }), totals: { total_tokens: 0, billable_total_tokens: 0, input_tokens: 0, output_tokens: 0, unclassified_input_tokens: 0, cached_input_tokens: 0, cache_creation_input_tokens: 0, reasoning_output_tokens: 0, total_cost_usd: "0" } });
         const ma = sa.models.get(mdl);
+        const reportedCost = ["grok", "cline"].includes(src) && Number(row.total_cost_usd) > 0;
+        const costSource = reportedCost ? "provider_reported" : "model_pricing";
+        ma.cost_source = ma.cost_source && ma.cost_source !== costSource ? "mixed" : costSource;
         ma.totals.total_tokens += row.total_tokens || 0;
         ma.totals.billable_total_tokens += row.billable_total_tokens ?? row.total_tokens ?? 0;
         ma.totals.input_tokens += row.input_tokens || 0;
@@ -2393,20 +2689,22 @@ function createLocalApiHandler({ queuePath }) {
         ma.totals.unclassified_input_tokens = (ma.totals.unclassified_input_tokens || 0) + (row.unclassified_input_tokens || 0 || 0);
         ma.totals.cache_creation_input_tokens += row.cache_creation_input_tokens || 0;
         ma.totals.reasoning_output_tokens += row.reasoning_output_tokens || 0;
-        ma.totals.total_cost_usd = Number(ma.totals.total_cost_usd || 0)
-          + (Number(row.total_cost_usd) || 0);
+        // Price each row, exactly as aggregateByDay does for the hero (#653).
+        // computeRowCost is not linear for models with a Fast tier or
+        // long-context rates: priority_* / long_context_* mark a subset of the
+        // base columns rather than adding volume, so they survive only while the
+        // row is intact. Summing the base columns first and pricing once silently
+        // dropped every premium — same tokens, fewer dollars than the hero.
+        ma.totals.total_cost_usd = Number(ma.totals.total_cost_usd || 0) + computeKnownRowCost(row);
       }
+      if (pricingRevision !== getPricingRevision()) return handleLocalApi(req, res, url);
 
       const sources = Array.from(bySource.values()).map((s) => {
         s.models = Array.from(s.models.values())
-          .map((m) => {
-            const cost = computeKnownRowCost({
-              ...m.totals,
-              model: m.model,
-              source: s.source,
-            });
-            return { ...m, totals: { ...m.totals, total_cost_usd: cost.toFixed(6) } };
-          })
+          .map((m) => ({
+            ...m,
+            totals: { ...m.totals, total_cost_usd: Number(m.totals.total_cost_usd || 0).toFixed(6) },
+          }))
           .sort((a, b) => b.totals.total_tokens - a.totals.total_tokens);
         const sourceCost = s.models.reduce((sum, m) => sum + Number(m.totals.total_cost_usd), 0);
         s.totals.total_cost_usd = sourceCost.toFixed(6);
@@ -2450,7 +2748,7 @@ function createLocalApiHandler({ queuePath }) {
             timeZoneContext,
           });
           if (!Number(result?.totals?.total_tokens || 0)) {
-            const fallback = buildCodexCategoryFallbackFromQueue(readQueueData(qp), {
+            const fallback = buildCodexCategoryFallbackFromQueue(await readQueueData(qp), {
               from,
               to,
               timeZoneContext,
@@ -2499,11 +2797,13 @@ function createLocalApiHandler({ queuePath }) {
         ? Math.min(Math.floor(limitParam), PROJECT_USAGE_MAX_ENTRIES)
         : PROJECT_USAGE_MAX_ENTRIES;
       const { timeZoneContext, hasRange, dayInRange, projectRows } =
-        readProjectUsageContext(qp, url);
+        await readProjectUsageContext(qp, url);
 
-      const aggregateEntries = (rows, keyOf, refOf) => {
+      const aggregateEntries = async (rows, keyOf, refOf) => {
         const byKey = new Map();
+        let processed = 0;
         for (const row of rows) {
+          if (++processed % AGGREGATION_BATCH_ROWS === 0) await yieldToRequests();
           if (hasRange && !dayInRange(rowDayKey(row, timeZoneContext))) continue;
           const key = keyOf(row);
           if (!byKey.has(key)) {
@@ -2553,7 +2853,7 @@ function createLocalApiHandler({ queuePath }) {
           }));
       };
 
-      let entries = aggregateEntries(
+      let entries = await aggregateEntries(
         projectRows,
         (row) => row.project_key || "unknown",
         (row) => row.project_ref || "",
@@ -2565,8 +2865,8 @@ function createLocalApiHandler({ queuePath }) {
       // totally empty. This path used to also exist for the non-empty case
       // and produce wrong numbers; keep it only as the empty fallback.
       if (entries.length === 0 && projectRows.length === 0) {
-        entries = aggregateEntries(
-          readQueueData(qp),
+        entries = await aggregateEntries(
+          await readQueueData(qp),
           (row) => row.source || "unknown",
           // Synthetic source-only row: leave project_ref empty rather than
           // fabricating `https://${src}.ai`, which resolves to unrelated
@@ -2591,7 +2891,7 @@ function createLocalApiHandler({ queuePath }) {
         return true;
       }
       const { from, to, timeZoneContext, dayInRange, projectRows } =
-        readProjectUsageContext(qp, url);
+        await readProjectUsageContext(qp, url);
 
       const emptyMeasures = () => ({
         total_tokens: 0,
@@ -2622,8 +2922,9 @@ function createLocalApiHandler({ queuePath }) {
       const byDay = new Map();
       const bySource = new Map();
       let rangeTotalTokens = 0;
-
+      let processed = 0;
       for (const row of projectRows) {
+        if (++processed % AGGREGATION_BATCH_ROWS === 0) await yieldToRequests();
         const day = rowDayKey(row, timeZoneContext);
         if (!dayInRange(day)) continue;
         rangeTotalTokens += Number(row.total_tokens || 0);
@@ -2723,7 +3024,11 @@ function createLocalApiHandler({ queuePath }) {
           json(res, { ok: false, error: "enabled must be a boolean" }, 400);
           return true;
         }
-        setCloudSyncPref(body.enabled);
+        if (body.changedAtMs != null && (!Number.isSafeInteger(body.changedAtMs) || body.changedAtMs < 0)) {
+          json(res, { ok: false, error: "changedAtMs must be a nonnegative safe integer" }, 400);
+          return true;
+        }
+        setCloudSyncPref(body.enabled, body.changedAtMs ?? Date.now());
         json(res, { ok: true, enabled: getCloudSyncPref() });
         return true;
       }
@@ -2901,8 +3206,8 @@ function createLocalApiHandler({ queuePath }) {
     if (p === "/functions/tokentracker-usage-hourly") {
       const day = url.searchParams.get("day") || new Date().toISOString().slice(0, 10);
       const timeZoneContext = getTimeZoneContext(url);
-      const { rows, scope, excludedSources } = scopedQueueRows(qp, url);
-      const data = aggregateHourlyByDay(rows, day, timeZoneContext);
+      const { rows, scope, excludedSources } = await scopedQueueRows(qp, url);
+      const data = await aggregateHourlyByDay(rows, day, timeZoneContext);
       json(res, { day, scope, excluded_sources: excludedSources, data });
       return true;
     }
@@ -2912,9 +3217,11 @@ function createLocalApiHandler({ queuePath }) {
       const from = url.searchParams.get("from") || "";
       const to = url.searchParams.get("to") || "";
       const timeZoneContext = getTimeZoneContext(url);
-      const { rows, scope, excludedSources } = scopedQueueRows(qp, url);
+      const { rows, scope, excludedSources } = await scopedQueueRows(qp, url);
       const byMonth = new Map();
+      let processed = 0;
       for (const row of rows) {
+        if (++processed % AGGREGATION_BATCH_ROWS === 0) await yieldToRequests();
         if (!row.hour_start) continue;
         const day = rowDayKey(row, timeZoneContext);
         if (!day || day < from || day > to) continue;
@@ -3176,6 +3483,11 @@ function createLocalApiHandler({ queuePath }) {
             json(res, { ok: true, skill: await skills.installSkill(body.skill, body.targets || ["claude", "codex"]) });
             return true;
           }
+          if (action === "update_all") {
+            // Partial success is normal, so this reports per-skill rather than failing.
+            json(res, { ok: true, ...(await skills.updateSkills(Array.isArray(body.ids) ? body.ids : [])) });
+            return true;
+          }
           if (action === "uninstall") {
             json(res, { ok: true, ...(skills.uninstallSkill(body.id) || {}) });
             return true;
@@ -3218,8 +3530,8 @@ function createLocalApiHandler({ queuePath }) {
     // --- achievements (local badges) ---
     if (p === "/functions/tokentracker-achievements") {
       const timeZoneContext = getTimeZoneContext(url);
-      const queueRows = readQueueData(qp);
-      const { projectRows } = readProjectUsageContext(qp, url);
+      const queueRows = await readQueueData(qp);
+      const { projectRows } = await readProjectUsageContext(qp, url);
       json(res, {
         generated_at: new Date().toISOString(),
         achievements: computeLocalAchievements(queueRows, projectRows, { timeZoneContext }),
@@ -3231,6 +3543,19 @@ function createLocalApiHandler({ queuePath }) {
     if (p === "/functions/tokentracker-usage-limits") {
       const { getUsageLimits, resetUsageLimitsCache } = require("./usage-limits");
       try {
+        // Devin quota is opt-in (Settings > Usage & Limits > Providers). An
+        // explicit devin=1 without local authentication is rejected before any
+        // cache reset or provider work — silently downgrading it to a disabled
+        // response would misreport an enabled client as a disabled provider.
+        // Authorization is evaluated unconditionally so the check never depends
+        // on the user-controlled opt-in flag itself.
+        const localAuthorized = isAuthorizedLocalMutation(req);
+        const devinParam = url.searchParams.get("devin");
+        const devinEnabled = devinParam === "1" || devinParam === "true";
+        if (devinEnabled && !localAuthorized) {
+          json(res, { error: "Unauthorized" }, 401);
+          return true;
+        }
         const refreshParam = url.searchParams.get("refresh");
         const forceRefresh = refreshParam === "1" || refreshParam === "true";
         if (forceRefresh) {
@@ -3243,6 +3568,7 @@ function createLocalApiHandler({ queuePath }) {
           // Punches through the Claude disk fresh-cache (but not the 429
           // cooldown) — an explicit user refresh should hit upstream.
           forceRefresh,
+          devinEnabled,
         });
         json(res, data);
       } catch (e) {

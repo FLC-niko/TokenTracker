@@ -14,11 +14,16 @@ function normalizeState(raw) {
   return {
     version: 1,
     lastSuccessMs: toSafeInt(s.lastSuccessMs),
+    lastSuccessAttemptId: typeof s.lastSuccessAttemptId === "string" ? s.lastSuccessAttemptId : null,
     nextAllowedAtMs: toSafeInt(s.nextAllowedAtMs),
+    serverNextAllowedAtMs: toSafeInt(s.serverNextAllowedAtMs),
     backoffUntilMs: toSafeInt(s.backoffUntilMs),
     backoffStep: toSafeInt(s.backoffStep),
     lastErrorAt: typeof s.lastErrorAt === "string" ? s.lastErrorAt : null,
     lastError: typeof s.lastError === "string" ? s.lastError : null,
+    lastErrorStatus: toSafeInt(s.lastErrorStatus),
+    lastErrorCode: typeof s.lastErrorCode === "string" ? s.lastErrorCode : null,
+    lastErrorAttemptId: typeof s.lastErrorAttemptId === "string" ? s.lastErrorAttemptId : null,
     updatedAt: typeof s.updatedAt === "string" ? s.updatedAt : null,
   };
 }
@@ -59,26 +64,36 @@ function decideAutoUpload({ nowMs, pendingBytes, state, config }) {
   };
 }
 
-function recordUploadSuccess({ nowMs, state, config, randInt }) {
+function recordUploadSuccess({ nowMs, state, config, randInt, cloudAccess, attemptId }) {
   const cfg = { ...DEFAULTS, ...(config || {}) };
   const s = normalizeState(state);
   const jitter =
     typeof randInt === "function" ? randInt(0, cfg.jitterMsMax) : randomInt(0, cfg.jitterMsMax);
-  const nextAllowedAtMs = nowMs + cfg.intervalMs + jitter;
+  const serverNextAllowedAtMs = toSafeInt(Date.parse(cloudAccess?.next_allowed_at));
+  const rawInterval = cloudAccess?.sync_interval_seconds;
+  const seconds = typeof rawInterval === "number" ? rawInterval
+    : typeof rawInterval === "string" && /^\d+$/.test(rawInterval.trim()) ? Number(rawInterval) : NaN;
+  const intervalMs = Number.isFinite(seconds) && seconds >= 0 ? Math.floor(seconds) * 1000 : cfg.intervalMs;
+  const nextAllowedAtMs = Math.max(serverNextAllowedAtMs, nowMs + intervalMs + jitter);
 
   return {
     ...s,
     lastSuccessMs: nowMs,
+    lastSuccessAttemptId: typeof attemptId === "string" && attemptId ? attemptId : null,
     nextAllowedAtMs,
+    serverNextAllowedAtMs,
     backoffUntilMs: 0,
     backoffStep: 0,
     lastErrorAt: null,
     lastError: null,
+    lastErrorStatus: 0,
+    lastErrorCode: null,
+    lastErrorAttemptId: null,
     updatedAt: new Date(nowMs).toISOString(),
   };
 }
 
-function recordUploadFailure({ nowMs, state, error, config }) {
+function recordUploadFailure({ nowMs, state, error, config, attemptId }) {
   const cfg = { ...DEFAULTS, ...(config || {}) };
   const s = normalizeState(state);
 
@@ -87,22 +102,30 @@ function recordUploadFailure({ nowMs, state, error, config }) {
 
   let backoffMs = 0;
   if (retryAfterMs > 0) {
-    backoffMs = Math.min(cfg.backoffMaxMs, Math.max(cfg.backoffInitialMs, retryAfterMs));
+    // Retry-After is the server's deadline. The configured cap applies only
+    // to exponential retries without an explicit server deadline.
+    backoffMs = Math.max(cfg.backoffInitialMs, retryAfterMs);
   } else {
     const step = Math.min(10, Math.max(0, s.backoffStep || 0));
     backoffMs = Math.min(cfg.backoffMaxMs, cfg.backoffInitialMs * Math.pow(2, step));
   }
 
   const backoffUntilMs = nowMs + backoffMs;
-  const nextAllowedAtMs = Math.max(s.nextAllowedAtMs || 0, backoffUntilMs);
+  const hasServerDeadline = status === 429 && error?.code === "cloud_sync_throttled" && retryAfterMs > 0;
+  const nextAllowedAtMs = hasServerDeadline
+    ? backoffUntilMs : Math.max(s.nextAllowedAtMs || 0, backoffUntilMs);
 
   return {
     ...s,
     nextAllowedAtMs,
+    serverNextAllowedAtMs: hasServerDeadline ? backoffUntilMs : s.serverNextAllowedAtMs,
     backoffUntilMs,
     backoffStep: Math.min(20, (s.backoffStep || 0) + 1),
     lastErrorAt: new Date(nowMs).toISOString(),
     lastError: truncate(String(error?.message || "upload failed"), 200),
+    lastErrorStatus: status,
+    lastErrorCode: typeof error?.code === "string" ? error.code : null,
+    lastErrorAttemptId: typeof attemptId === "string" && attemptId ? attemptId : null,
     updatedAt: new Date(nowMs).toISOString(),
   };
 }

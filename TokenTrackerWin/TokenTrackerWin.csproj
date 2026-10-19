@@ -7,6 +7,7 @@
          which are only brought in when the TFM carries an explicit SDK version. -->
     <TargetFramework>net8.0-windows10.0.19041.0</TargetFramework>
     <UseWindowsForms>true</UseWindowsForms>
+    <ApplicationHighDpiMode>PerMonitorV2</ApplicationHighDpiMode>
     <!-- WPF is enabled so the dashboard window can host the WPF WebView2 control,
          which renders via DirectComposition (CoreWebView2CompositionController) and
          therefore supports a genuinely transparent surface that composites with the
@@ -22,7 +23,7 @@
     <ApplicationManifest>app.manifest</ApplicationManifest>
     <ApplicationIcon>assets\trayicon.ico</ApplicationIcon>
     <!-- Keep in sync with package.json / project.yml on release. -->
-    <Version>0.96.2</Version>
+    <Version>1.4.6</Version>
     <Product>TokenTracker</Product>
     <Company>TokenTracker</Company>
     <!-- App UI strings live in TrayStrings/NativeLocalization (no .resx), so the

@@ -22,6 +22,32 @@ function CodexIcon({ size = 16, className = "" }) {
   );
 }
 
+function AcodeIcon({ size = 16, className = "" }) {
+  return (
+    <span
+      className={`relative inline-block shrink-0 ${className}`.trim()}
+      style={{ width: size, height: size }}
+      data-brand="acode"
+      aria-hidden="true"
+    >
+      <img
+        src="/brand-logos/acode.png"
+        alt=""
+        width={size}
+        height={size}
+        className="block h-full w-full object-contain dark:hidden"
+      />
+      <img
+        src="/brand-logos/acode-dark.png"
+        alt=""
+        width={size}
+        height={size}
+        className="hidden h-full w-full object-contain dark:block"
+      />
+    </span>
+  );
+}
+
 function CursorIcon({ size = 16, className = "" }) {
   return (
     <svg width={size} height={size} viewBox="0 0 24 24" fill="currentColor" fillRule="evenodd" className={className}>
@@ -339,7 +365,16 @@ function DeepSeekHarnessIcon({ size = 16, className = "" }) {
   );
 }
 
+function DumateIcon({ size = 16, className = "" }) {
+  return (
+    <svg width={size} height={size} viewBox="0 0 24 24" fill="none" className={className}>
+      <path d="M7 5h4a7 7 0 0 1 0 14H7V5Z" stroke="currentColor" strokeWidth="2" />
+    </svg>
+  );
+}
+
 const PROVIDER_ICON_MAP = {
+  ACODE: AcodeIcon,
   CLAUDE: ClaudeIcon,
   ZCODE: ZcodeIcon,
   CODEBUDDY: CodeBuddyIcon,
@@ -352,6 +387,7 @@ const PROVIDER_ICON_MAP = {
   DEEPSEEK: DeepSeekHarnessIcon,
   DSH: DeepSeekHarnessIcon,
   DROID: DroidIcon,
+  DUMATE: DumateIcon,
   "EVERY-CODE": CodexIcon,
   GEMINI: GeminiIcon,
   GITHUB: GithubIcon,
@@ -363,6 +399,8 @@ const PROVIDER_ICON_MAP = {
   KIRO: KiroIcon,
   KILOCODE: KilocodeIcon,
   MINIMAX: MinimaxIcon,
+  // MiniMax Code (desktop agent) ships under the MiniMax brand mark.
+  "MINIMAX-CODE": MinimaxIcon,
   OPENCODE: OpenCodeIcon,
   OMP: OmpIcon,
   PI: PiIcon,
@@ -406,6 +444,8 @@ const PROVIDER_LOGO_MAP = {
   DOTS: "/brand-logos/dots.png",
   "PI-DOTS": "/brand-logos/dots.png",
   QODER: "/brand-logos/qoder.svg",
+  // Devin (devin.ai) — the three-hexagon "nodes" mark, mono like Qoder.
+  DEVIN: "/brand-logos/devin.svg",
   REASONIX: "/brand-logos/reasonix.png",
   UNSLOTH: "/brand-logos/unsloth.svg",
   // Qoder CN ships its own brand mark — the domestic edition's icon (a green
@@ -414,6 +454,10 @@ const PROVIDER_LOGO_MAP = {
   "QODER-CN": "/brand-logos/qoder-cn.svg",
   // Volcano Ark (火山方舟) Coding Plan — the Volcengine 3-mountain mark.
   "VOLCANO-ARK": "/brand-logos/volcano-ark.svg",
+  // Cline (CLI v3 / desktop app) — the official robot mark.
+  CLINE: "/brand-logos/cline.png",
+  // International TRAE mark from the installed app's resources/app/out/media/trae-logo.svg.
+  TRAE: "/brand-logos/trae.svg",
 };
 
 // AnythingLLM publishes this compact mark in white. Keep the official asset
@@ -425,6 +469,9 @@ const PROVIDER_LOGO_CLASS_MAP = {
   // as AnythingLLM: black on light backgrounds, native white on dark.
   PI: "brightness-0 dark:brightness-100",
   QODER: "dark:invert",
+  // The Devin nodes mark ships as a black currentColor trace — same
+  // dark-mode inversion treatment as the Qoder mark.
+  DEVIN: "dark:invert",
   // The sail PNG is solid black on transparent — invert to white in dark
   // mode so it doesn't disappear against the dark dashboard background.
   DOTS: "dark:invert",

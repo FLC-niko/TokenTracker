@@ -98,7 +98,7 @@ function printHelp() {
       "  - --from-openclaw marks sync runs triggered by the OpenClaw session plugin.",
       "  - --debug shows original backend errors.",
       "  - device-login pairs a headless CLI / SSH session with a browser sign-in (15-min code).",
-      "  - sessions exports metadata-only Claude/Codex efficiency analytics; no prompt or response text is retained.",
+      "  - sessions exports metadata-only Claude/Codex/Grok/ZCode efficiency analytics; no prompt or response text is retained.",
       "",
     ].join("\n"),
   );

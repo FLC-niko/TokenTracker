@@ -2,7 +2,7 @@ const os = require("node:os");
 const path = require("node:path");
 const fs = require("node:fs/promises");
 const fssync = require("node:fs");
-const cp = require("node:child_process");
+const { runOpenclawCli } = require("./openclaw-cli");
 
 const OPENCLAW_SESSION_PLUGIN_ID = "openclaw-session-sync";
 const OPENCLAW_SESSION_PLUGIN_DIRNAME = "openclaw-plugin";
@@ -311,64 +311,6 @@ async function removeOpenclawSessionPluginConfig({
   return { removed: changed || hadFiles, ...paths };
 }
 
-function runOpenclawCli(args, env = process.env) {
-  // Test-only escape hatch: skip spawning the real `openclaw` CLI. Behaves like
-  // the CLI being absent (which is the CI environment anyway), so callers take
-  // their graceful skip path. Avoids a ~2s `plugins install --link` per cmdInit
-  // on dev machines that happen to have openclaw installed.
-  if ((env && env.TOKENTRACKER_SKIP_OPENCLAW_CLI) === "1") {
-    return {
-      code: 1,
-      skippedReason: "openclaw-cli-missing",
-      error: "skipped via TOKENTRACKER_SKIP_OPENCLAW_CLI",
-      stdout: "",
-      stderr: "",
-    };
-  }
-  let res;
-  try {
-    res = cp.spawnSync("openclaw", args, {
-      env,
-      encoding: "utf8",
-      timeout: 30_000,
-    });
-  } catch (err) {
-    return {
-      code: 1,
-      skippedReason: err?.code === "ENOENT" ? "openclaw-cli-missing" : "openclaw-cli-error",
-      error: err?.message || String(err),
-      stdout: "",
-      stderr: "",
-    };
-  }
-
-  if (res.error?.code === "ENOENT") {
-    return {
-      code: 1,
-      skippedReason: "openclaw-cli-missing",
-      error: res.error.message,
-      stdout: res.stdout || "",
-      stderr: res.stderr || "",
-    };
-  }
-
-  if ((res.status || 0) !== 0) {
-    return {
-      code: Number(res.status || 1),
-      skippedReason: "openclaw-plugins-install-failed",
-      error: (res.stderr || res.stdout || "").trim() || "openclaw plugins install failed",
-      stdout: res.stdout || "",
-      stderr: res.stderr || "",
-    };
-  }
-
-  return {
-    code: 0,
-    stdout: res.stdout || "",
-    stderr: res.stderr || "",
-  };
-}
-
 function buildSessionPluginPackageJson() {
   return `${JSON.stringify(
     {
@@ -429,7 +371,7 @@ function buildSessionPluginIndex({ trackerDir, packageName = "tokentracker-cli",
     `      const agentId = normalize(ctx && ctx.agentId) || parseAgentId(sessionKey);\n` +
     `      if (!agentId) return;\n` +
     `\n` +
-    `      const sessionInfo = resolveSessionInfo(agentId, sessionKey);\n` +
+    `      const sessionInfo = await resolveSessionInfo(agentId, sessionKey);\n` +
     `      const sessionId = normalize(sessionInfo && sessionInfo.sessionId);\n` +
     `      if (!sessionId) return;\n` +
     `\n` +
@@ -498,23 +440,56 @@ function buildSessionPluginIndex({ trackerDir, packageName = "tokentracker-cli",
     `  return out;\n` +
     `}\n` +
     `\n` +
-    `function resolveSessionInfo(agentId, sessionKey) {\n` +
+    `async function resolveSessionInfo(agentId, sessionKey) {\n` +
     `  const key = normalize(sessionKey);\n` +
     `  if (!key) return null;\n` +
     `  const sessionsPath = path.join(openclawHome, 'agents', agentId, 'sessions', 'sessions.json');\n` +
-    `  try {\n` +
-    `    const raw = fs.readFileSync(sessionsPath, 'utf8');\n` +
-    `    const parsed = JSON.parse(raw);\n` +
-    `    if (!parsed || typeof parsed !== 'object') return null;\n` +
-    `    const entry = parsed[key];\n` +
-    `    if (!entry || typeof entry !== 'object') return null;\n` +
-    `    return {\n` +
-    `      sessionKey: key,\n` +
-    `      sessionId: normalize(entry.sessionId),\n` +
-    `      entry\n` +
-    `    };\n` +
-    `  } catch (_) {}\n` +
+    `  if (fs.existsSync(sessionsPath)) {\n` +
+    `    try {\n` +
+    `      const raw = fs.readFileSync(sessionsPath, 'utf8');\n` +
+    `      const parsed = JSON.parse(raw);\n` +
+    `      if (parsed && typeof parsed === 'object') {\n` +
+    `        const entry = parsed[key];\n` +
+    `        if (entry && typeof entry === 'object' && normalize(entry.sessionId)) {\n` +
+    `          return { sessionKey: key, sessionId: normalize(entry.sessionId), entry };\n` +
+    `        }\n` +
+    `      }\n` +
+    `    } catch (_) {}\n` +
+    `  }\n` +
+    `  // OpenClaw >= 2026.9.9 keeps session state in a per-agent SQLite\n` +
+    `  // database (~/.openclaw/agents/<id>/agent/openclaw-agent.sqlite);\n` +
+    `  // sessions.json is no longer written. Without this fallback the\n` +
+    `  // plugin would silently no-op on every agent_end for anyone on a\n` +
+    `  // current OpenClaw install (issue: openclaw migration to sqlite).\n` +
+    `  return resolveSessionInfoFromSqlite(agentId, key);\n` +
+    `}\n` +
+    `\n` +
+    `async function resolveSessionInfoFromSqlite(agentId, sessionKey) {\n` +
+    `  const sqliteModule = await importSqliteSync();\n` +
+    `  if (!sqliteModule) return null;\n` +
+    `  const { DatabaseSync } = sqliteModule;\n` +
+    `  const currentSessionQuery = "SELECT w.session_id FROM session_nodes n JOIN session_windows w ON w.session_id = n.current_session_id WHERE n.session_key = ? AND COALESCE(w.reason, '') != 'compaction'";\n` +
+    `  const sessionQuery = "SELECT session_id FROM session_windows WHERE session_key = ? AND COALESCE(reason, '') != 'compaction' ORDER BY updated_at DESC LIMIT 1";\n` +
+    `  const dbCandidates = [path.join(openclawHome, 'agents', agentId, 'agent', 'openclaw-agent.sqlite'), path.join(openclawHome, 'agents', agentId, 'openclaw-agent.sqlite')];\n` +
+    `  for (const dbPath of dbCandidates) {\n` +
+    `    if (!fs.existsSync(dbPath)) continue;\n` +
+    `    let db;\n` +
+    `    try { db = new DatabaseSync(dbPath, { readOnly: true }); } catch (_) { continue; }\n` +
+    `    try {\n` +
+    `      let row;\n` +
+    `      try { row = db.prepare(currentSessionQuery).get(sessionKey); } catch (_) {}\n` +
+    `      if (!row || !row.session_id) row = db.prepare(sessionQuery).get(sessionKey);\n` +
+    `      if (!row || !row.session_id) continue;\n` +
+    `      // The passive SQLite reader owns per-event accounting; never synthesize lifetime sums.\n` +
+    `      return { sessionKey, sessionId: row.session_id, entry: {} };\n` +
+    `    } catch (_) {}\n` +
+    `    finally { try { db.close(); } catch (_) {} }\n` +
+    `  }\n` +
     `  return null;\n` +
+    `}\n` +
+    `\n` +
+    `async function importSqliteSync() {\n` +
+    `  try { return await import('node:sqlite'); } catch (_) { return null; }\n` +
     `}\n` +
     `\n` +
     `function parseAgentId(sessionKey) {\n` +

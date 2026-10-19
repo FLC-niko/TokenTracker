@@ -12,13 +12,19 @@ const {
   writeJson,
   chmod600IfPossible,
 } = require("../lib/fs");
+const { resolveMimoNativeDbPath } = require("../lib/install-resolver");
+const { resolveDumateDbPaths } = require("../lib/dumate");
+const { expandHome } = require("../lib/scan-roots");
 const { prompt, promptHidden } = require("../lib/prompt");
 const {
   upsertCodexNotify,
+  upsertAcodeNotify,
   upsertEveryCodeNotify,
   readCodexNotify,
+  readAcodeNotify,
   readEveryCodeNotify,
   buildCodexNotifyCmd,
+  buildAcodeNotifyCmd,
   buildEveryCodeNotifyCmd,
   isManagedNotifyCmd,
 } = require("../lib/codex-config");
@@ -66,13 +72,18 @@ const {
   resolvePiAgentDir,
   piAgentDirCollidesWithOmp,
   resolvePrimeAgentDir,
+  resolveMinimaxCodeSessionsDir,
+  resolveCommandCodeHome,
   resolveLmstudioLogFiles,
   resolveUnslothDbPath,
   resolveAnythingllmDbPath,
+  resolveDevinDbPath,
   resolveReasonixHome,
+  resolveMuseHome,
   resolveTraeStoragePath,
 } = require("../lib/rollout");
-const { resolveRuntimeConfig, DEFAULT_BASE_URL } = require("../lib/runtime-config");
+const { resolveRuntimeConfig, DEFAULT_BASE_URL, normalizeInstanceBaseUrl, assertInsforgeRuntime,
+  clearDeviceIdentity, resetInstanceState } = require("../lib/runtime-config");
 const {
   BOLD,
   DIM,
@@ -109,6 +120,7 @@ const DEFAULT_DASHBOARD_URL = "https://www.tokentracker.cc";
 const SUPPORTED_PROVIDERS = [
   "Claude Code",
   "Codex CLI",
+  "AStudio",
   "Cursor",
   "Gemini CLI",
   "Antigravity",
@@ -121,13 +133,16 @@ const SUPPORTED_PROVIDERS = [
   "Kimi Code",
   "CodeBuddy",
   "WorkBuddy",
+  "WorkBuddy AI",
   "Grok Build",
   "oh-my-pi",
+  "OmO",
   "pi",
   "Dots",
   "Prime Agent",
   "Craft Agents",
   "Reasonix",
+  "Muse Code",
   "Kilo CLI",
   "Kilo Code",
   "Roo Code",
@@ -135,19 +150,26 @@ const SUPPORTED_PROVIDERS = [
   "Goose",
   "Droid",
   "Mimo",
+  "DuMate",
   "ZCode",
   "Qoder",
   "AnythingLLM Desktop",
   "Claude Science",
   "DeepSeek Harness",
   "TRAE Work CN",
+  "TRAE",
   "LM Studio",
   "Unsloth Studio",
+  "Devin CLI",
+  "Cline",
+  "MiniMax Code",
+  "Command Code",
 ];
 
-async function cmdInit(argv) {
+async function cmdInit(argv, options = {}) {
   const opts = parseArgs(argv);
-  const home = os.homedir();
+  const home = options.home || os.homedir();
+  if (opts.anonKeyFile) opts.anonKey = (await fs.readFile(opts.anonKeyFile, "utf8")).trim();
 
   const { rootDir, trackerDir, binDir } = await resolveTrackerPaths({ home });
 
@@ -157,10 +179,11 @@ async function cmdInit(argv) {
 
   const existingConfig = await readJson(configPath);
   const runtime = resolveRuntimeConfig({
-    cli: { baseUrl: opts.baseUrl, dashboardUrl: opts.dashboardUrl },
+    cli: { baseUrl: opts.baseUrl, dashboardUrl: opts.dashboardUrl, anonKey: opts.anonKey },
     config: existingConfig || {},
     env: process.env,
   });
+  assertInsforgeRuntime(runtime);
   const notifyPath = path.join(binDir, "notify.cjs");
   const appDir = path.join(trackerDir, "app");
   const trackerBinPath = path.join(appDir, "bin", "tracker.js");
@@ -355,16 +378,28 @@ async function runSetup({
     existingConfig && typeof existingConfig === "object" && !Array.isArray(existingConfig)
       ? existingConfig
       : {};
+  const previousRuntime = resolveRuntimeConfig({ config: existingPlainConfig, env: {} });
+  const changedInstance = normalizeInstanceBaseUrl(previousRuntime.baseUrl) !== runtime.baseUrl ||
+    previousRuntime.anonKey !== runtime.anonKey;
+  if (changedInstance) {
+    resetInstanceState(trackerDir);
+    deviceToken = null; deviceId = null;
+  }
   const config = {
-    ...existingPlainConfig,
+    ...(changedInstance ? clearDeviceIdentity(existingPlainConfig) : existingPlainConfig),
     installedAt,
     // Keep a persisted legacy URL until the first sync. sync owns the migration
     // lock and must reset the upload offset/backoff before removing this marker;
     // rewriting it here would skip the historical replay permanently.
     baseUrl: opts.baseUrl || existingPlainConfig.baseUrl || DEFAULT_BASE_URL,
   };
-  if (opts.dashboardUrl) {
-    config.dashboardUrl = opts.dashboardUrl;
+  if (changedInstance || opts.dashboardUrl) {
+    config.dashboardUrl = runtime.dashboardUrl;
+  }
+  if (changedInstance || opts.anonKey || runtime.sources.anonKey === "env") config.anonKey = runtime.anonKey;
+  if (runtime.baseUrl !== DEFAULT_BASE_URL) {
+    config.baseUrl = runtime.baseUrl;
+    config.dashboardUrl = runtime.dashboardUrl;
   }
 
   await writeJson(configPath, config);
@@ -445,6 +480,50 @@ async function repairCodexNotifyIntegration({ home = os.homedir(), trackerDir, b
   return { ...result, skippedReason: null, notifyPath };
 }
 
+async function repairAcodeNotifyIntegration({ home = os.homedir(), trackerDir, binDir, safeMode = true } = {}) {
+  const paths = trackerDir && binDir ? { trackerDir, binDir } : await resolveTrackerPaths({ home });
+  const resolvedTrackerDir = trackerDir || paths.trackerDir;
+  const resolvedBinDir = binDir || paths.binDir;
+  const notifyPath = await writeNotifyHandler({
+    trackerDir: resolvedTrackerDir,
+    binDir: resolvedBinDir,
+  });
+  const context = buildIntegrationTargets({
+    home,
+    trackerDir: resolvedTrackerDir,
+    notifyPath,
+  });
+  const acodeProbe = await probeFile(context.acodeConfigPath);
+  if (!acodeProbe.exists) {
+    return { changed: false, skippedReason: "config-missing", notifyPath };
+  }
+
+  const currentNotify = await readAcodeNotify(context.acodeConfigPath);
+  if (arraysEqual(currentNotify, context.acodeNotifyCmd)) {
+    return { changed: false, skippedReason: null, notifyPath };
+  }
+
+  const repairDecision = safeMode
+    ? await shouldRepairCodexNotify({
+        currentNotify,
+        expectedNotify: context.acodeNotifyCmd,
+        notifyOriginalPath: context.acodeNotifyOriginalPath,
+      })
+    : { repair: true, captureOriginal: true, replaceOriginal: false };
+  if (!repairDecision.repair) {
+    return { changed: false, skippedReason: repairDecision.reason || "external-notify", notifyPath };
+  }
+
+  const result = await upsertAcodeNotify({
+    acodeConfigPath: context.acodeConfigPath,
+    notifyCmd: context.acodeNotifyCmd,
+    notifyOriginalPath: context.acodeNotifyOriginalPath,
+    captureOriginal: repairDecision.captureOriginal,
+    replaceOriginal: repairDecision.replaceOriginal,
+  });
+  return { ...result, skippedReason: null, notifyPath };
+}
+
 async function repairRuntimeIntegrations({
   home = os.homedir(),
   trackerDir,
@@ -481,6 +560,12 @@ async function repairRuntimeIntegrations({
     binDir: resolvedBinDir,
     safeMode,
   }));
+  await attempt("acode", () => repairAcodeNotifyIntegration({
+    home,
+    trackerDir: resolvedTrackerDir,
+    binDir: resolvedBinDir,
+    safeMode,
+  }));
 
   const hookRepairs = [
     ["claude", context.claudeDir, () => upsertClaudeUsageHooks({
@@ -498,6 +583,10 @@ async function repairRuntimeIntegrations({
     ["workbuddy", context.workbuddyDir, () => upsertClaudeHook({
       settingsPath: context.workbuddySettingsPath,
       hookCommand: context.workbuddyHookCommand,
+    })],
+    ["workbuddy-ai", context.workbuddyAiDir, () => upsertClaudeHook({
+      settingsPath: context.workbuddyAiSettingsPath,
+      hookCommand: context.workbuddyAiHookCommand,
     })],
   ];
   for (const [key, configDir, repair] of hookRepairs) {
@@ -520,11 +609,15 @@ async function repairRuntimeIntegrations({
 function buildIntegrationTargets({ home, trackerDir, notifyPath }) {
   const codexHome = process.env.CODEX_HOME || path.join(home, ".codex");
   const codexConfigPath = path.join(codexHome, "config.toml");
+  const acodeHome = process.env.TOKENTRACKER_ACODE_HOME || path.join(home, ".acode");
+  const acodeConfigPath = path.join(acodeHome, "config.toml");
   const codeHome = process.env.CODE_HOME || path.join(home, ".code");
   const codeConfigPath = path.join(codeHome, "config.toml");
   const notifyOriginalPath = path.join(trackerDir, "codex_notify_original.json");
+  const acodeNotifyOriginalPath = path.join(trackerDir, "acode_notify_original.json");
   const codeNotifyOriginalPath = path.join(trackerDir, "code_notify_original.json");
   const notifyCmd = buildCodexNotifyCmd(notifyPath);
+  const acodeNotifyCmd = buildAcodeNotifyCmd(notifyPath);
   const codeNotifyCmd = buildEveryCodeNotifyCmd(notifyPath);
   const claudeDir = path.join(home, ".claude");
   const claudeSettingsPath = path.join(claudeDir, "settings.json");
@@ -539,6 +632,12 @@ function buildIntegrationTargets({ home, trackerDir, notifyPath }) {
   const workbuddyDir = process.env.WORKBUDDY_HOME || path.join(home, ".workbuddy");
   const workbuddySettingsPath = path.join(workbuddyDir, "settings.json");
   const workbuddyHookCommand = buildHookCommand(notifyPath, "workbuddy");
+  // WorkBuddy AI is the international build of the very same CLI. It keeps its
+  // data in a sibling home (~/.workbuddy-ai), so it needs its own hook install
+  // and its own --source token to be attributed separately from the CN build.
+  const workbuddyAiDir = expandHome(process.env.WORKBUDDY_AI_HOME, home) || path.join(home, ".workbuddy-ai");
+  const workbuddyAiSettingsPath = path.join(workbuddyAiDir, "settings.json");
+  const workbuddyAiHookCommand = buildHookCommand(notifyPath, "workbuddy-ai");
   const geminiConfigDir = resolveGeminiConfigDir({ home, env: process.env });
   const geminiSettingsPath = resolveGeminiSettingsPath({ configDir: geminiConfigDir });
   const geminiHookCommand = buildGeminiHookCommand(notifyPath);
@@ -547,10 +646,13 @@ function buildIntegrationTargets({ home, trackerDir, notifyPath }) {
   return {
     trackerDir,
     codexConfigPath,
+    acodeConfigPath,
     codeConfigPath,
     notifyOriginalPath,
+    acodeNotifyOriginalPath,
     codeNotifyOriginalPath,
     notifyCmd,
+    acodeNotifyCmd,
     codeNotifyCmd,
     claudeDir,
     claudeSettingsPath,
@@ -561,6 +663,9 @@ function buildIntegrationTargets({ home, trackerDir, notifyPath }) {
     workbuddyDir,
     workbuddySettingsPath,
     workbuddyHookCommand,
+    workbuddyAiDir,
+    workbuddyAiSettingsPath,
+    workbuddyAiHookCommand,
     geminiConfigDir,
     geminiSettingsPath,
     geminiHookCommand,
@@ -596,6 +701,24 @@ async function applyIntegrationSetup({
     });
   } else {
     summary.push({ label: "Codex CLI", status: "skipped", detail: renderSkipDetail(codexProbe) });
+  }
+
+  const acodeProbe = await probeFile(context.acodeConfigPath);
+  if (acodeProbe.exists) {
+    const currentNotify = await readAcodeNotify(context.acodeConfigPath);
+    const result = await upsertAcodeNotify({
+      acodeConfigPath: context.acodeConfigPath,
+      notifyCmd: context.acodeNotifyCmd,
+      notifyOriginalPath: context.acodeNotifyOriginalPath,
+      replaceOriginal: shouldReplaceStoredOriginalNotify(currentNotify, context.acodeNotifyCmd),
+    });
+    summary.push({
+      label: "AStudio",
+      status: result.changed ? "updated" : "set",
+      detail: result.changed ? "Updated config" : "Config already set",
+    });
+  } else {
+    summary.push({ label: "AStudio", status: "skipped", detail: renderSkipDetail(acodeProbe) });
   }
 
   const claudeDirExists = await isDir(context.claudeDir);
@@ -726,6 +849,23 @@ async function applyIntegrationSetup({
     }
   }
 
+  // MiniMax Code: passive reader of ~/.minimax/v2/sessions — no hook installation needed.
+  {
+    const minimaxCodeSessionsDir = resolveMinimaxCodeSessionsDir(process.env);
+    if (minimaxCodeSessionsDir && fssync.existsSync(minimaxCodeSessionsDir)) {
+      summary.push({ label: "MiniMax Code", status: "detected", detail: "Passive usage reader (no hook needed)" });
+    }
+  }
+
+  // Command Code (`cmd`): passive reader of ~/.commandcode/projects — no hook
+  // installation needed, and none exists to install.
+  {
+    const commandCodeProjectsDir = path.join(resolveCommandCodeHome(process.env), "projects");
+    if (fssync.existsSync(commandCodeProjectsDir)) {
+      summary.push({ label: "Command Code", status: "detected", detail: "Passive session reader (no hook needed)" });
+    }
+  }
+
   // Craft Agents: passive reader — no hook installation needed.
   // TokenTracker reads ~/.craft-agent/workspaces/<id>/sessions/**/session.jsonl
   // (and any user-relocated workspace listed in ~/.craft-agent/config.json).
@@ -744,17 +884,25 @@ async function applyIntegrationSetup({
     }
   }
 
-  // Trae SOLO (ByteDance AI IDE): plan snapshot only. Trae keeps its session
-  // transcripts SQLCipher-encrypted and its plaintext summaries hold no token
-  // counts, so there is no usage to read — the detail line must not promise
-  // otherwise ("Passive reader" reads, everywhere else, as "tokens counted").
+  // Muse Code: passive reader of ~/.local/share/muse/sessions/**/session.jsonl.
   {
+    if (fssync.existsSync(path.join(resolveMuseHome(process.env), "sessions"))) {
+      summary.push({ label: "Muse Code", status: "detected", detail: "Passive session reader (no hook needed)" });
+    }
+  }
+
+  // International TRAE usage is read locally; no hook or vendor login is needed.
+  {
+    const { resolveTraeDbPaths } = require("../lib/trae-db");
+    const traeDbPaths = resolveTraeDbPaths(process.env);
     const traeStoragePath = resolveTraeStoragePath(process.env);
-    if (traeStoragePath) {
+    if (traeDbPaths.length || traeStoragePath) {
       summary.push({
-        label: "Trae SOLO",
+        label: "TRAE",
         status: "detected",
-        detail: "Plan info only — Trae exposes no readable token usage",
+        detail: traeDbPaths.length
+          ? "Local usage reader (shared application key; optional TOKENTRACKER_TRAE_SQLCIPHER_KEY override)"
+          : "Plan info only — no local usage database found",
       });
     }
   }
@@ -788,13 +936,18 @@ async function applyIntegrationSetup({
     }
   }
 
+  {
+    const dumateDbPaths = resolveDumateDbPaths({ home });
+    if (dumateDbPaths.length > 0) {
+      summary.push({ label: "DuMate", status: "detected", detail: "Passive reader (no hook needed)" });
+    }
+  }
+
   // Mimo (mimocode): passive reader — no hook installation needed. Reuses the
   // OpenCode-fork SQLite schema at ~/.local/share/mimocode/mimocode.db
   // (override via MIMO_HOME).
   {
-    const xdgDataHome = process.env.XDG_DATA_HOME || path.join(home, ".local", "share");
-    const mimoHome = process.env.MIMO_HOME || path.join(xdgDataHome, "mimocode");
-    const mimoDbPath = path.join(mimoHome, "mimocode.db");
+    const mimoDbPath = resolveMimoNativeDbPath({ home });
     if (fssync.existsSync(mimoDbPath)) {
       summary.push({ label: "Mimo", status: "detected", detail: "Passive reader (no hook needed)" });
     }
@@ -835,6 +988,18 @@ async function applyIntegrationSetup({
     }
   }
 
+  // Devin CLI (Cognition): passive SQLite reader — no hook installation needed.
+  {
+    const devinDbPath = resolveDevinDbPath(process.env);
+    if (devinDbPath && fssync.existsSync(devinDbPath)) {
+      summary.push({
+        label: "Devin CLI",
+        status: "detected",
+        detail: "Passive reader (no hook needed)",
+      });
+    }
+  }
+
   // Kilo Code VS Code extension (kilocode.kilo-code): passive reader — no hook
   // installation needed. Scans ui_messages.json under every detected VS Code-
   // family install (Code, Cursor, CodeBuddy, Windsurf, …).
@@ -847,6 +1012,30 @@ async function applyIntegrationSetup({
         label: "Kilo Code (VS Code extension)",
         status: "detected",
         detail: `Passive reader · ${taskFiles.length} task${taskFiles.length !== 1 ? "s" : ""} in ${ides}`,
+      });
+    }
+  }
+
+  // Cline CLI v3 / desktop app: passive reader — no hook installation needed.
+  // Cline keeps its own data dir (~/.cline/data/sessions, overridable through
+  // CLINE_DIR/CLINE_DATA_DIR/CLINE_SESSION_DATA_DIR); the VS Code extension's
+  // globalStorage layout is a separate, older install we do not read.
+  {
+    const { resolveClineSessionFilesWithStatus } = require("../lib/rollout");
+    const clineScan = resolveClineSessionFilesWithStatus(process.env);
+    const sessionFiles = clineScan.files;
+    if (sessionFiles.length > 0) {
+      summary.push({
+        label: "Cline",
+        status: "detected",
+        detail: `Passive reader · ${sessionFiles.length} transcript${sessionFiles.length !== 1 ? "s" : ""}`,
+      });
+    }
+    for (const failure of clineScan.errors) {
+      summary.push({
+        label: "Cline",
+        status: "error",
+        detail: `Passive reader discovery failed · ${failure.root}: ${failure.error.code ? `${failure.error.code}: ` : ""}${failure.error.message}`,
       });
     }
   }
@@ -876,6 +1065,18 @@ async function applyIntegrationSetup({
     summary.push({ label: "WorkBuddy", status: "installed", detail: "Hooks installed" });
   } else {
     summary.push({ label: "WorkBuddy", status: "skipped", detail: "Config not found" });
+  }
+
+  // WorkBuddy AI: international build, same hook schema, sibling home.
+  const workbuddyAiDirExists = await isDir(context.workbuddyAiDir);
+  if (workbuddyAiDirExists) {
+    await upsertClaudeHook({
+      settingsPath: context.workbuddyAiSettingsPath,
+      hookCommand: context.workbuddyAiHookCommand,
+    });
+    summary.push({ label: "WorkBuddy AI", status: "installed", detail: "Hooks installed" });
+  } else {
+    summary.push({ label: "WorkBuddy AI", status: "skipped", detail: "Config not found" });
   }
 
   const openclawBefore = await probeOpenclawSessionPluginState({
@@ -973,6 +1174,19 @@ async function previewIntegrations({ context }) {
     summary.push({ label: "Codex CLI", status: "skipped", detail: renderSkipDetail(codexProbe) });
   }
 
+  const acodeProbe = await probeFile(context.acodeConfigPath);
+  if (acodeProbe.exists) {
+    const existing = await readAcodeNotify(context.acodeConfigPath);
+    const matches = arraysEqual(existing, context.acodeNotifyCmd);
+    summary.push({
+      label: "AStudio",
+      status: matches ? "set" : "updated",
+      detail: matches ? "Already configured" : "Will update config",
+    });
+  } else {
+    summary.push({ label: "AStudio", status: "skipped", detail: renderSkipDetail(acodeProbe) });
+  }
+
   const claudeDirExists = await isDir(context.claudeDir);
   if (claudeDirExists) {
     const configured = await areClaudeUsageHooksConfigured({
@@ -1016,6 +1230,21 @@ async function previewIntegrations({ context }) {
     });
   } else {
     summary.push({ label: "WorkBuddy", status: "skipped", detail: "Config not found" });
+  }
+
+  const workbuddyAiDirExists = await isDir(context.workbuddyAiDir);
+  if (workbuddyAiDirExists) {
+    const configured = await isClaudeHookConfigured({
+      settingsPath: context.workbuddyAiSettingsPath,
+      hookCommand: context.workbuddyAiHookCommand,
+    });
+    summary.push({
+      label: "WorkBuddy AI",
+      status: "installed",
+      detail: configured ? "Hooks already installed" : "Will install hooks",
+    });
+  } else {
+    summary.push({ label: "WorkBuddy AI", status: "skipped", detail: "Config not found" });
   }
 
   const geminiConfigExists = await isDir(context.geminiConfigDir);
@@ -1179,6 +1408,8 @@ function parseArgs(argv) {
   const out = {
     baseUrl: null,
     dashboardUrl: null,
+    anonKey: null,
+    anonKeyFile: null,
     email: null,
     password: null,
     deviceName: null,
@@ -1193,6 +1424,8 @@ function parseArgs(argv) {
     const a = argv[i];
     if (a === "--base-url") out.baseUrl = argv[++i] || null;
     else if (a === "--dashboard-url") out.dashboardUrl = argv[++i] || null;
+    else if (a === "--anon-key") out.anonKey = argv[++i] || null;
+    else if (a === "--anon-key-file") out.anonKeyFile = argv[++i] || null;
     else if (a === "--email") out.email = argv[++i] || null;
     else if (a === "--password") out.password = argv[++i] || null;
     else if (a === "--device-name") out.deviceName = argv[++i] || null;
@@ -1254,6 +1487,7 @@ for (let i = 0; i < rawArgs.length; i++) {
 const trackerDir = ${JSON.stringify(trackerDir)};
 const signalPath = ${JSON.stringify(queueSignalPath)};
 const codexOriginalPath = ${JSON.stringify(originalPath)};
+const acodeOriginalPath = ${JSON.stringify(path.join(trackerDir, "acode_notify_original.json"))};
 const codeOriginalPath = ${JSON.stringify(path.join(trackerDir, "code_notify_original.json"))};
 const trackerBinPath = ${JSON.stringify(trackerBinPath)};
   const depsMarkerPath = path.join(trackerDir, 'app', 'bin', 'tracker.js');
@@ -1310,14 +1544,16 @@ try {
   }
 } catch (_) {}
 
-// Chain the original notify if present (Codex/Every Code only).
+// Chain the existing Codex, AStudio, or Every Code notify hook.
 try {
   const originalPath =
     source === 'every-code'
       ? codeOriginalPath
-      : source === 'claude' || source === 'opencode' || source === 'gemini' || source === 'codebuddy' || source === 'workbuddy'
-        ? null
-        : codexOriginalPath;
+      : source === 'acode'
+        ? acodeOriginalPath
+        : source === 'claude' || source === 'opencode' || source === 'gemini' || source === 'codebuddy' || source === 'workbuddy' || source === 'workbuddy-ai'
+          ? null
+          : codexOriginalPath;
   if (originalPath) {
     const original = JSON.parse(fs.readFileSync(originalPath, 'utf8'));
     const cmd = Array.isArray(original?.notify) ? original.notify : null;
@@ -2009,6 +2245,7 @@ module.exports = {
   buildNotifyHandler,
   installLocalTrackerApp,
   repairCodexNotifyIntegration,
+  repairAcodeNotifyIntegration,
   repairRuntimeIntegrations,
   applyIntegrationSetup,
 };
@@ -2103,7 +2340,7 @@ async function runFirstSyncAndRead({ trackerBinPath, trackerDir, packageName }) 
     return readFirstSyncTotals(trackerDir);
   }
   const fallbackPkg = packageName || "tokentracker-cli";
-  const argv = ["sync", "--drain"];
+  const argv = ["sync", "--auto", "--drain"];
   const hasLocalRuntime = typeof trackerBinPath === "string" && fssync.existsSync(trackerBinPath);
   const cmd = hasLocalRuntime
     ? [process.execPath, trackerBinPath, ...argv]

@@ -15,6 +15,8 @@ const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
 
+const { resolveEnvRoot } = require("./scan-roots");
+
 const {
   emptyTotals,
   addInto,
@@ -33,6 +35,7 @@ const {
   finalizeExecRows,
   buildSkillStatsEntry,
   isCodexResumeInvalidated,
+  isRecoverableGroupedReadError,
 } = require("./codex-rollout-parser");
 
 // ---------------------------------------------------------------------------
@@ -396,7 +399,7 @@ async function computeCodexContextBreakdown({
     toKey = range?.to || null;
   }
 
-  const codexHome = process.env.CODEX_HOME || path.join(os.homedir(), ".codex");
+  const codexHome = resolveEnvRoot("codex", { env: process.env, home: os.homedir() }) || path.join(os.homedir(), ".codex");
   const roots = codexDir
     ? [codexDir]
     : [path.join(codexHome, "sessions"), path.join(codexHome, "archived_sessions")];
@@ -471,6 +474,7 @@ async function computeCodexContextBreakdown({
       PARSED_GROUP_CACHE.delete(parsedCacheKey);
       PARSED_GROUP_CACHE.set(parsedCacheKey, cachedGroup);
     } else {
+      try {
       let captured = null;
       const singleEntry = entries.length === 1 ? entries[0] : null;
       const appendHashEligible = Boolean(
@@ -536,7 +540,7 @@ async function computeCodexContextBreakdown({
             diagnostics.incremental_parse_fallbacks += 1;
           }
         } catch (error) {
-          if (!isCodexResumeInvalidated(error)) throw error;
+          if (!isCodexResumeInvalidated(error) && !isRecoverableGroupedReadError(error)) throw error;
           diagnostics.incremental_parse_fallbacks += 1;
         } finally {
           await resumeHandle.close();
@@ -584,6 +588,11 @@ async function computeCodexContextBreakdown({
           filePath: singleEntry?.filePath || null,
           stat: singleEntry?.stat || null,
         });
+      }
+      } catch (error) {
+        // One unreadable archive/session must not fail the whole breakdown.
+        if (!isRecoverableGroupedReadError(error)) throw error;
+        continue;
       }
     }
     if (!parsed || !parsed.totals || !parsed.totals.total_tokens) continue;

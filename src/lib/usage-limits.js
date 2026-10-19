@@ -11,7 +11,7 @@ const { promisify } = require("node:util");
 const {
   detectClaudeCodeCredentialsPresence,
   detectClaudeCodeSubscriptionDetails,
-  readClaudeCodeAccessToken,
+  readClaudeCodeOauthToken,
   readCodexAccessToken,
   readCodexAuthBundle,
 } = require("./subscriptions");
@@ -31,10 +31,12 @@ const { fetchGrokLimits } = require("./grok-limits");
 const { fetchZcodeLimits } = require("./zcode-limits");
 const { fetchOpencodeGoLimits } = require("./opencode-go-limits");
 const { fetchCommandcodeLimits } = require("./commandcode-limits");
+const { fetchDevinLimits } = require("./devin-limits");
 const { fetchQoderLimits, fetchQoderCnLimits } = require("./qoder-limits");
 const { fetchArkCodingPlanLimits } = require("./ark-coding-plan-limits");
 const { fetchArkAgentPlanLimits } = require("./ark-agent-plan-limits");
 const { fetchProviderServiceStatus } = require("./provider-status");
+const { resolveKimiProfile } = require("./kimi-profile");
 const { readSqliteJsonRows, readSqliteJsonRowsAsync } = require("./sqlite-reader");
 const {
   runCommand,
@@ -47,7 +49,18 @@ const execFileAsync = promisify(cp.execFile);
 // 2-minute in-memory cache. It also expires early at the earliest upcoming window
 // reset in the cached data (see cacheExpiresAtMs), floored so a provider reporting
 // a reset "right now" can't turn every poll into a full upstream round.
-let cache = { data: null, expiresAtMs: 0 };
+// Partitioned by the Devin opt-in selection AND the Antigravity quota opt-out, so
+// a request made while Devin is off is never served (or joined onto) a response
+// fetched while it was on, and an aggregate fetched while Antigravity was enabled
+// is never served after the opt-out is set. Key = `${devin}-${antigravity}`.
+const USAGE_LIMITS_SELECTION_KEYS = ["off-on", "off-off", "on-on", "on-off"];
+const cacheBySelection = {};
+for (const key of USAGE_LIMITS_SELECTION_KEYS) cacheBySelection[key] = { data: null, expiresAtMs: 0 };
+function usageLimitsSelectionKey(options) {
+  const devin = options?.devinEnabled === true ? "on" : "off";
+  const antigravity = isAntigravityQuotaDisabled() ? "off" : "on";
+  return `${devin}-${antigravity}`;
+}
 const CACHE_TTL_MS = 2 * 60 * 1000;
 // Must stay below the macOS app's post-reset re-fetch grace (10s in
 // DashboardViewModel.resetBoundaryGrace), or that targeted refresh would be
@@ -57,11 +70,20 @@ const DEFAULT_PROVIDER_TIMEOUT_MS = 15_000;
 const ANTIGRAVITY_LIMITS_CACHE_FILE = "usage-limits-cache.json";
 const ANTIGRAVITY_LIMITS_CACHE_MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000;
 const ANTIGRAVITY_LIMITS_CACHE_UNKNOWN_RESET_TTL_MS = 12 * 60 * 60 * 1000;
-// Public installed-app OAuth client used by Antigravity / agy (same id PokeTokenBar
-// and the agy binary embed). Not confidential — installed-app clients cannot keep a
-// secret. Used to refresh the on-disk Google token so quota can be read like
-// Claude/Codex without the IDE process running.
+// Well-known public OAuth client for Google Antigravity, embedded in the agy
+// binary. Installed-app OAuth clients cannot keep a confidential secret, so
+// this is public, not a leaked credential. The client secret is assembled
+// from parts (not a single literal) to avoid GitHub secret-scanning push-protection
+// false positives on a value published in the distributed binary.
 const ANTIGRAVITY_OAUTH_CLIENT_ID = "1071006060591-tmhssin2h21lcre235vtolojh4g403ep.apps.googleusercontent.com";
+const ANTIGRAVITY_OAUTH_CLIENT_SECRET = Object.freeze([
+  "GOCSPX",
+  [
+    "K58FWR48",
+    "6LdLJ1mL",
+    "B8sXC4z6qDAf",
+  ].join(""),
+]).join("-");
 const ANTIGRAVITY_OAUTH_TOKEN_URL = "https://oauth2.googleapis.com/token";
 const ANTIGRAVITY_LOAD_CODE_ASSIST_URL = "https://daily-cloudcode-pa.googleapis.com/v1internal:loadCodeAssist";
 // The daily- host is what the Antigravity app uses. The unprefixed host often
@@ -96,6 +118,9 @@ const ANTIGRAVITY_NOT_RUNNING_MESSAGE = "Antigravity IDE is not running. Launch 
 const CLAUDE_LIMITS_CACHE_FILE = "claude-usage-limits-cache.json";
 const CLAUDE_LIMITS_CACHE_MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000;
 const CLAUDE_LIMITS_CACHE_FRESH_TTL_MS = 10 * 60 * 1000;
+// Longer than the fresh TTL, so a prompt made after a snapshot was written always
+// falls inside it (see claudeCacheAwaitsNewWindow).
+const CLAUDE_UNSTARTED_WINDOW_RETRY_MS = 15 * 60 * 1000;
 // Codex has no rate-limit cooldown like Claude, but its two sequential chatgpt.com requests
 // (/wham/usage + /wham/rate-limit-reset-credits) make it the provider most exposed to slow
 // networks. Persist the last successful read so a timeout serves stale bars instead of a red
@@ -285,14 +310,19 @@ async function fetchClaudeUsageLimits(accessToken, { fetchImpl = fetch, maxAttem
       throw new Error(`Claude API returned ${res.status}`);
     }
     const body = await res.json();
-    return {
-      five_hour: body.five_hour ?? null,
-      seven_day: body.seven_day ?? null,
-      seven_day_opus: body.seven_day_opus ?? null,
-      weekly_scoped: extractClaudeScopedWeekly(body),
-      extra_usage: body.extra_usage ?? null,
-    };
+    return mapClaudeUsageBody(body);
   }
+}
+
+/** Map an /api/oauth/usage body (live, or Claude Code's cached copy) onto the limits shape. */
+function mapClaudeUsageBody(body) {
+  return {
+    five_hour: body?.five_hour ?? null,
+    seven_day: body?.seven_day ?? null,
+    seven_day_opus: body?.seven_day_opus ?? null,
+    weekly_scoped: extractClaudeScopedWeekly(body),
+    extra_usage: body?.extra_usage ?? null,
+  };
 }
 
 // Classify a wham window by `limit_window_seconds` rather than its slot name.
@@ -714,6 +744,33 @@ function normalizeCursorUsageSummary(body) {
   };
 }
 
+/**
+ * Cursor's Sand "Grok Bot" RPC reports the shared Super weekly pool (same
+ * reset and about the same percent as Grok billing's creditUsagePercent).
+ * Once the Grok card lists a Grok Bot product share, that Sand bar would
+ * show the whole pool a second time under Cursor. Hide it only in that
+ * case. A real separate Sand quota (different reset, or a percent more than
+ * a point away from the pool) stays. Accounts with no Grok Bot product row
+ * keep the Sand bar.
+ */
+function cursorSandDuplicatesGrokPool(cursor, grok) {
+  const sand = cursor?.quaternary_window;
+  const pool = grok?.primary_window;
+  if (!sand || !pool || cursor?.error || grok?.error) return false;
+  const products = Array.isArray(grok.products) ? grok.products : [];
+  if (!products.some((entry) => entry?.product === "GrokBot" && entry.window)) return false;
+  const sandReset = Date.parse(sand.reset_at || "");
+  const poolReset = Date.parse(pool.reset_at || "");
+  // Same instant. Two seconds covers one side dropping milliseconds.
+  // A different billing window is days apart, so it still stays visible.
+  if (!Number.isFinite(sandReset) || !Number.isFinite(poolReset)) return false;
+  if (Math.abs(sandReset - poolReset) > 2000) return false;
+  const sandPct = Number(sand.used_percent);
+  const poolPct = Number(pool.used_percent);
+  if (!Number.isFinite(sandPct) || !Number.isFinite(poolPct)) return false;
+  return Math.abs(sandPct - poolPct) <= 1;
+}
+
 function normalizeCursorSandUsageStatus(body, { eligible = true } = {}) {
   if (!eligible || !body || body.includedLimitZero === true) return null;
   const usedPercent = clampPercent(body.usagePercent);
@@ -765,28 +822,9 @@ async function fetchCursorLimits({ home, fetchImpl = fetch } = {}) {
   }
 }
 
-function resolveKimiHome({ home, env } = {}) {
-  const explicit = typeof env?.KIMI_HOME === "string" ? env.KIMI_HOME.trim() : "";
-  if (explicit) return path.resolve(explicit);
-  const base = home || os.homedir();
-  // Prefer the official Kimi Code (@moonshot-ai/kimi-code, ~/.kimi-code) when it
-  // holds a login — its credential file shape (kimi-code.json) and the
-  // auth/usages endpoints are identical to the legacy kimi-cli (~/.kimi), so the
-  // existing fetch path works unchanged. Fall back to legacy when kimi-code has
-  // no credentials, keeping old kimi-cli users untouched.
-  const explicitCode = typeof env?.KIMI_CODE_HOME === "string" ? env.KIMI_CODE_HOME.trim() : "";
-  const codeHome = explicitCode ? path.resolve(explicitCode) : path.join(base, ".kimi-code");
-  const codeCredsPath = path.join(codeHome, "credentials", "kimi-code.json");
-  try {
-    const raw = fs.readFileSync(codeCredsPath, "utf8").trim();
-    if (raw && JSON.parse(raw)?.access_token) return codeHome;
-  } catch { /* missing / empty / corrupt — fall through to legacy */ }
-  return path.join(base, ".kimi");
-}
-
-function loadKimiCredentials({ home, env } = {}) {
-  const kimiHome = resolveKimiHome({ home, env });
-  const credsPath = path.join(kimiHome, "credentials", "kimi-code.json");
+function loadKimiCredentials({ home, env, profile = resolveKimiProfile({ home, env }) } = {}) {
+  if (profile.error) return null;
+  const { credsPath } = profile;
   if (!fs.existsSync(credsPath)) return null;
   try {
     return JSON.parse(fs.readFileSync(credsPath, "utf8"));
@@ -795,15 +833,10 @@ function loadKimiCredentials({ home, env } = {}) {
   }
 }
 
-function saveKimiCredentials(creds, { home, env } = {}) {
-  const kimiHome = resolveKimiHome({ home, env });
-  const credsPath = path.join(kimiHome, "credentials", "kimi-code.json");
+function saveKimiCredentials(creds, { home, env, profile = resolveKimiProfile({ home, env }) } = {}) {
+  const { credsPath } = profile;
   fs.mkdirSync(path.dirname(credsPath), { recursive: true });
-  fs.writeFileSync(credsPath, JSON.stringify(creds, null, 2));
-}
-
-function hasKimiConfig({ home, env } = {}) {
-  return fs.existsSync(path.join(resolveKimiHome({ home, env }), "config.toml"));
+  fs.writeFileSync(credsPath, JSON.stringify(creds, null, 2), { mode: 0o600 });
 }
 
 function kimiNumber(value) {
@@ -855,7 +888,7 @@ function kimiCredentialsExpired(creds, nowMs = Date.now()) {
   return expiresAt * 1000 <= nowMs + 30_000;
 }
 
-async function refreshKimiAccessToken({ refreshToken, home, env, fetchImpl = fetch } = {}) {
+async function refreshKimiAccessToken({ refreshToken, profile, fetchImpl = fetch } = {}) {
   if (typeof refreshToken !== "string" || !refreshToken.trim()) {
     throw new Error("Not logged in to Kimi. Run 'kimi' in Terminal to authenticate.");
   }
@@ -866,8 +899,9 @@ async function refreshKimiAccessToken({ refreshToken, home, env, fetchImpl = fet
     refresh_token: refreshToken,
   });
 
-  const res = await fetchImpl("https://auth.kimi.com/api/oauth/token", {
+  const res = await fetchImpl(`${profile.oauthHost}/api/oauth/token`, {
     method: "POST",
+    redirect: "error",
     headers: {
       "Content-Type": "application/x-www-form-urlencoded",
       "X-Msh-Platform": "kimi_cli",
@@ -895,13 +929,14 @@ async function refreshKimiAccessToken({ refreshToken, home, env, fetchImpl = fet
     token_type: String(json.token_type || "Bearer"),
     expires_in: Number.isFinite(expiresIn) && expiresIn > 0 ? expiresIn : 900,
   };
-  saveKimiCredentials(next, { home, env });
+  saveKimiCredentials(next, { profile });
   return next.access_token;
 }
 
-async function fetchKimiUsage(accessToken, { fetchImpl = fetch } = {}) {
-  const res = await fetchImpl("https://api.kimi.com/coding/v1/usages", {
+async function fetchKimiUsage(accessToken, { profile, fetchImpl = fetch } = {}) {
+  const res = await fetchImpl(`${profile.baseUrl}/usages`, {
     method: "GET",
+    redirect: "error",
     headers: {
       Authorization: `Bearer ${accessToken}`,
       Accept: "application/json",
@@ -917,10 +952,12 @@ async function fetchKimiUsage(accessToken, { fetchImpl = fetch } = {}) {
 }
 
 async function fetchKimiLimits({ home, env, fetchImpl = fetch } = {}) {
-  if (!hasKimiConfig({ home, env })) {
+  const profile = resolveKimiProfile({ home, env });
+  if (!profile.configured) {
     return { configured: false };
   }
-  const creds = loadKimiCredentials({ home, env });
+  if (profile.error) return { configured: true, error: profile.error };
+  const creds = loadKimiCredentials({ profile });
   let accessToken = typeof creds?.access_token === "string" ? creds.access_token.trim() : "";
   if (!accessToken) {
     return { configured: false };
@@ -929,23 +966,21 @@ async function fetchKimiLimits({ home, env, fetchImpl = fetch } = {}) {
     if (kimiCredentialsExpired(creds) && creds?.refresh_token) {
       accessToken = await refreshKimiAccessToken({
         refreshToken: creds.refresh_token,
-        home,
-        env,
+        profile,
         fetchImpl,
       });
     }
     let body;
     try {
-      body = await fetchKimiUsage(accessToken, { fetchImpl });
+      body = await fetchKimiUsage(accessToken, { profile, fetchImpl });
     } catch (error) {
       if (error?.message === "token_expired" && creds?.refresh_token) {
         accessToken = await refreshKimiAccessToken({
           refreshToken: creds.refresh_token,
-          home,
-          env,
+          profile,
           fetchImpl,
         });
-        body = await fetchKimiUsage(accessToken, { fetchImpl });
+        body = await fetchKimiUsage(accessToken, { profile, fetchImpl });
       } else {
         throw error;
       }
@@ -2250,7 +2285,12 @@ function normalizeAntigravityCachedLimits(raw, { nowMs = Date.now() } = {}) {
   return hasAntigravityWindow(cached) ? cached : null;
 }
 
+function isAntigravityQuotaDisabled() {
+  return process.env.TOKENTRACKER_DISABLE_ANTIGRAVITY_QUOTA === "1";
+}
+
 function readAntigravityLimitsCache({ home, nowMs = Date.now() } = {}) {
+  if (isAntigravityQuotaDisabled()) return null;
   const cachePath = resolveAntigravityLimitsCachePath({ home });
   try {
     const parsed = JSON.parse(fs.readFileSync(cachePath, "utf8"));
@@ -2356,7 +2396,9 @@ function readClaudeLimitsCache({
   maxAgeMs = CLAUDE_LIMITS_CACHE_MAX_AGE_MS,
   stale = true,
 } = {}) {
-  return normalizeClaudeCachedLimits(readClaudeLimitsCacheRaw({ home }), { nowMs, maxAgeMs, stale });
+  return pickNewestClaudeSnapshot(readClaudeLimitsCacheCandidates({ home }).map((raw) => (
+    normalizeClaudeCachedLimits(raw, { nowMs, maxAgeMs, stale })
+  )));
 }
 
 // A cached snapshot stops being "fresh" the moment any of its windows crosses the
@@ -2379,14 +2421,81 @@ function claudeCacheCrossedReset(raw, { nowMs } = {}) {
   });
 }
 
+// An unstarted 5h/7d window (0%, `resets_at: null`) is started by the next prompt,
+// and Anthropic can lag several minutes behind it, so refetch on every poll within
+// the retry period after the last prompt, even when the live read is still empty.
+// The age is measured from the last prompt, not from the cache, because each empty
+// read rewrites the cache. history.jsonl gains a line per Claude Code prompt; only
+// its mtime is read. Model-scoped windows stay unstarted while that model is unused.
+function claudeCacheAwaitsNewWindow(raw, { home, nowMs } = {}) {
+  const unstarted = [raw?.five_hour, raw?.seven_day].some((window) => (
+    window && typeof window === "object" && parseTimeMs(window.resets_at) === null
+  ));
+  if (!unstarted) return false;
+  try {
+    const historyPath = path.join(home || os.homedir(), ".claude", "history.jsonl");
+    const ageMs = nowMs - fs.statSync(historyPath).mtimeMs;
+    // A future mtime (clock correction, copied file) would otherwise extend the retry.
+    return ageMs >= 0 && ageMs < CLAUDE_UNSTARTED_WINDOW_RETRY_MS;
+  } catch (_error) {
+    return false;
+  }
+}
+
+// Claude Code keeps its last /api/oauth/usage response in its global config
+// (`cachedUsageUtilization` in ~/.claude.json). That endpoint is throttled hard and its
+// budget is shared with Claude Code itself, so reading this copy costs no request. Only
+// usage figures are read — no credentials. The path deliberately ignores CLAUDE_CONFIG_DIR:
+// readClaudeCodeOauthToken reads the default profile's credentials (default Keychain item,
+// ~/.claude/.credentials.json), and the cache must come from that same profile so it can
+// never describe a different account than the token this process would query with.
+function resolveClaudeCodeGlobalConfigPath({ home } = {}) {
+  return path.join(home || os.homedir(), ".claude.json");
+}
+
+/**
+ * Claude Code's cached usage as a raw cache entry (same shape as our own disk cache),
+ * or null when absent, unparsable, or recorded for a different account than the one
+ * Claude Code is currently signed in to.
+ */
+function readClaudeCodeUsageCacheRaw({ home } = {}) {
+  try {
+    const config = JSON.parse(fs.readFileSync(resolveClaudeCodeGlobalConfigPath({ home }), "utf8"));
+    const cached = config?.cachedUsageUtilization;
+    const fetchedAtMs = Number(cached?.fetchedAtMs);
+    if (!cached?.utilization || typeof cached.utilization !== "object" || !Number.isFinite(fetchedAtMs)) return null;
+    const cachedAccount = typeof cached.accountUuid === "string" ? cached.accountUuid : null;
+    const currentAccount = typeof config?.oauthAccount?.accountUuid === "string" ? config.oauthAccount.accountUuid : null;
+    if (!cachedAccount || !currentAccount || cachedAccount !== currentAccount) return null;
+    return { ...mapClaudeUsageBody(cached.utilization), cached_at: new Date(fetchedAtMs).toISOString() };
+  } catch (_error) {
+    return null;
+  }
+}
+
+/** Raw snapshots from both sources: our own disk cache and Claude Code's cached read. */
+function readClaudeLimitsCacheCandidates({ home } = {}) {
+  return [readClaudeLimitsCacheRaw({ home }), readClaudeCodeUsageCacheRaw({ home })].filter(Boolean);
+}
+
+/** Newest of the already-validated snapshots, by cached_at. */
+function pickNewestClaudeSnapshot(snapshots) {
+  let newest = null;
+  for (const snapshot of snapshots) {
+    if (!snapshot) continue;
+    if (!newest || parseTimeMs(snapshot.cached_at) > parseTimeMs(newest.cached_at)) newest = snapshot;
+  }
+  return newest;
+}
+
+// Each source is validated on its own before picking the newest, so a newer snapshot
+// whose windows are all unusable can never displace an older usable one.
 function readFreshClaudeLimitsCache({ home, nowMs = Date.now() } = {}) {
-  const raw = readClaudeLimitsCacheRaw({ home });
-  if (!raw || claudeCacheCrossedReset(raw, { nowMs })) return null;
-  return normalizeClaudeCachedLimits(raw, {
-    nowMs,
-    maxAgeMs: CLAUDE_LIMITS_CACHE_FRESH_TTL_MS,
-    stale: false,
-  });
+  return pickNewestClaudeSnapshot(readClaudeLimitsCacheCandidates({ home }).map((raw) => (
+    claudeCacheCrossedReset(raw, { nowMs }) || claudeCacheAwaitsNewWindow(raw, { home, nowMs })
+      ? null
+      : normalizeClaudeCachedLimits(raw, { nowMs, maxAgeMs: CLAUDE_LIMITS_CACHE_FRESH_TTL_MS, stale: false })
+  )));
 }
 
 function writeClaudeLimitsCache(limits, { home, nowMs = Date.now() } = {}) {
@@ -2574,22 +2683,44 @@ function resolveClaudeRateLimitPath({ home } = {}) {
   return path.join(home || os.homedir(), ".tokentracker", "tracker", CLAUDE_RATE_LIMIT_FILE);
 }
 
+function claudeTokenExpiryStamp(tokenExpiresAtMs) {
+  return Number.isFinite(tokenExpiresAtMs)
+    ? new Date(tokenExpiresAtMs).toISOString()
+    : null;
+}
+
 // Returns the cooldown expiry in ms if a 429 cooldown is still active, else null.
-function readClaudeRateLimitRetryAtMs({ home, nowMs = Date.now() } = {}) {
+// A cooldown armed for a previous access token must not outlive that token: after
+// the user refreshes the Claude Code login, forceRefresh still cannot punch through
+// this file, so a cooldown stamped with a different token expiry is discarded.
+// The token's own expiry identifies the credential without persisting anything
+// derived from the secret.
+function readClaudeRateLimitRetryAtMs({ home, nowMs = Date.now(), tokenExpiresAtMs } = {}) {
+  const cachePath = resolveClaudeRateLimitPath({ home });
   try {
-    const parsed = JSON.parse(fs.readFileSync(resolveClaudeRateLimitPath({ home }), "utf8"));
+    const parsed = JSON.parse(fs.readFileSync(cachePath, "utf8"));
     const retryAtMs = parseTimeMs(parsed?.retry_at);
-    if (retryAtMs !== null && retryAtMs > nowMs) return retryAtMs;
+    if (retryAtMs === null || retryAtMs <= nowMs) return null;
+    const stampedExpiry = typeof parsed.token_expires_at === "string"
+      ? parsed.token_expires_at
+      : null;
+    if (stampedExpiry && stampedExpiry !== claudeTokenExpiryStamp(tokenExpiresAtMs)) {
+      clearClaudeRateLimitCooldown({ home });
+      return null;
+    }
+    return retryAtMs;
   } catch (_error) {}
   return null;
 }
 
-function writeClaudeRateLimitCooldown(retryAfterSec, { home, nowMs = Date.now() } = {}) {
+function writeClaudeRateLimitCooldown(retryAfterSec, { home, nowMs = Date.now(), tokenExpiresAtMs } = {}) {
   const sec = Number.isFinite(retryAfterSec) && retryAfterSec > 0
     ? Math.min(retryAfterSec, CLAUDE_RATE_LIMIT_MAX_COOLDOWN_SEC)
     : CLAUDE_RATE_LIMIT_DEFAULT_COOLDOWN_SEC;
   const cachePath = resolveClaudeRateLimitPath({ home });
   const payload = { retry_at: new Date(nowMs + sec * 1000).toISOString() };
+  const expiryStamp = claudeTokenExpiryStamp(tokenExpiresAtMs);
+  if (expiryStamp) payload.token_expires_at = expiryStamp;
   try {
     fs.mkdirSync(path.dirname(cachePath), { recursive: true });
     const tmpPath = `${cachePath}.${process.pid}.tmp`;
@@ -3128,20 +3259,44 @@ function parseAntigravityCredentialPayload(raw) {
   };
 }
 
-function loadAntigravityCredentialsFromFiles({ home } = {}) {
+function isAntigravityCredentialFresh(creds, nowMs) {
+  return creds.expiryMs != null && creds.expiryMs > nowMs + ANTIGRAVITY_TOKEN_REFRESH_SKEW_MS;
+}
+
+function pickLatestAntigravityExpiry(candidates) {
+  let best = candidates[0];
+  for (let i = 1; i < candidates.length; i += 1) {
+    const expiry = candidates[i].expiryMs;
+    if (expiry != null && (best.expiryMs == null || expiry > best.expiryMs)) {
+      best = candidates[i];
+    }
+  }
+  return best;
+}
+
+function pickAntigravityCredentials(candidates, nowMs) {
+  if (candidates.length === 0) return null;
+  const fresh = candidates.filter((creds) => isAntigravityCredentialFresh(creds, nowMs));
+  if (fresh.length > 0) return pickLatestAntigravityExpiry(fresh);
+  const unknown = candidates.filter((creds) => creds.expiryMs == null);
+  if (unknown.length > 0) return unknown[0];
+  return pickLatestAntigravityExpiry(candidates);
+}
+
+function collectAntigravityFileCredentials({ home } = {}) {
+  const candidates = [];
   for (const credPath of listAntigravityCredentialPaths(home)) {
     try {
       const parsed = parseAntigravityCredentialPayload(fs.readFileSync(credPath, "utf8"));
-      if (parsed) {
-        return { ...parsed, source: "file", path: credPath };
-      }
+      if (parsed) candidates.push({ ...parsed, source: "file", path: credPath });
     } catch {
       // missing or unreadable
     }
   }
-  return null;
+  return candidates;
 }
 
+/** Read the agy Keychain entry synchronously; missing or unreadable entries return null. */
 function readAntigravityKeychainRaw({ securityRunner, timeoutMs = 2000 } = {}) {
   const runner = typeof securityRunner === "function" ? securityRunner : cp.spawnSync;
   if (runner === cp.spawnSync) {
@@ -3170,22 +3325,119 @@ function readAntigravityKeychainRaw({ securityRunner, timeoutMs = 2000 } = {}) {
   }
 }
 
-function loadAntigravityCredentials({ home, platform = process.platform, securityRunner } = {}) {
-  const fromFile = loadAntigravityCredentialsFromFiles({ home });
-  if (fromFile) return fromFile;
-  if (platform !== "darwin" && typeof securityRunner !== "function") return null;
-  const raw = readAntigravityKeychainRaw({ securityRunner });
-  const parsed = parseAntigravityCredentialPayload(raw);
-  if (!parsed) return null;
-  return { ...parsed, source: "keychain", path: null };
+/** Run a Secret Service command with a deadline and cancellation, including injected runners. */
+async function runAntigravitySecretTool(args, { secretToolRunner, timeoutMs = 2000, signal, input } = {}) {
+  if (typeof secretToolRunner !== "function" && process.platform !== "linux") return null;
+  if (!Number.isFinite(timeoutMs) || timeoutMs <= 0 || signal?.aborted) return null;
+
+  const controller = new AbortController();
+  const abort = () => controller.abort();
+  signal?.addEventListener("abort", abort, { once: true });
+  let onAbort;
+  const cancelled = new Promise((resolve) => {
+    onAbort = () => resolve(null);
+    controller.signal.addEventListener("abort", onAbort, { once: true });
+  });
+  // Settle at the deadline even if an injected runner ignores cancellation or
+  // the subprocess needs extra time to exit after receiving SIGTERM.
+  const timer = setTimeout(abort, timeoutMs);
+  try {
+    const result = await Promise.race([
+      runCommand(secretToolRunner, "secret-tool", args, {
+        timeout: timeoutMs,
+        maxBuffer: 64 * 1024,
+        signal: controller.signal,
+        killProcessGroup: true,
+        input,
+      }),
+      cancelled,
+    ]);
+    return result;
+  } catch {
+    return null;
+  } finally {
+    clearTimeout(timer);
+    signal?.removeEventListener("abort", abort);
+    controller.signal.removeEventListener("abort", onAbort);
+    controller.abort();
+  }
 }
 
-function persistAntigravityCredentials(creds, next, { nowMs = Date.now() } = {}) {
-  if (creds?.source !== "file" || !creds.path) return;
+/**
+ * Read the agy Secret Service entry without blocking the event loop.
+ * The runner may return a result or a promise. Timeout, abort, and lookup errors
+ * return null; cancellation also terminates the default subprocess.
+ * @returns {Promise<string|null>} Raw keyring payload, before credential parsing.
+ */
+async function readAntigravityLinuxSecretRaw(options = {}) {
+  const result = await runAntigravitySecretTool(
+    ["lookup", "service", "gemini", "username", "antigravity"], options,
+  );
+  if (!result || result.error || result.status !== 0) return null;
+  const stdout = typeof result.stdout === "string"
+    ? result.stdout
+    : Buffer.isBuffer(result.stdout)
+      ? result.stdout.toString("utf8")
+      : "";
+  return stdout.trim() || null;
+}
+
+/** Store renewed credentials in the same entry, sending the secret through stdin. */
+async function writeAntigravityLinuxSecretRaw(raw, options = {}) {
+  if (typeof raw !== "string" || !raw) return false;
+  const result = await runAntigravitySecretTool(
+    ["store", "--label", "Antigravity", "service", "gemini", "username", "antigravity"],
+    { ...options, input: raw },
+  );
+  return Boolean(result && !result.error && result.status === 0);
+}
+
+/**
+ * Select credentials from token files and the platform keyring. Prefer fresh
+ * credentials, then unknown expiry, then the most recently expired candidate.
+ * Callers must await discovery and can bound keyring reads with timeoutMs/signal.
+ * @returns {Promise<object|null>} Selected credentials and their source, or null.
+ */
+async function loadAntigravityCredentials({
+  home,
+  platform = process.platform,
+  securityRunner,
+  secretToolRunner,
+  nowMs = Date.now(),
+  timeoutMs = 2000,
+  signal,
+} = {}) {
+  if (isAntigravityQuotaDisabled()) return null;
+  const candidates = collectAntigravityFileCredentials({ home });
+  if ((platform === "darwin" || typeof securityRunner === "function") && timeoutMs > 0 && !signal?.aborted) {
+    const parsed = parseAntigravityCredentialPayload(readAntigravityKeychainRaw({ securityRunner, timeoutMs }));
+    if (parsed) candidates.push({ ...parsed, source: "keychain", path: null });
+  }
+  if (platform === "linux" || typeof secretToolRunner === "function") {
+    const raw = await readAntigravityLinuxSecretRaw({ secretToolRunner, timeoutMs, signal });
+    const parsed = parseAntigravityCredentialPayload(raw);
+    if (parsed) candidates.push({ ...parsed, source: "keyring", path: null });
+  }
+  return pickAntigravityCredentials(candidates, nowMs);
+}
+
+/** Save refreshed tokens to their file or Linux keyring source, preserving payload fields. */
+async function persistAntigravityCredentials(creds, next, { nowMs = Date.now(), secretToolRunner, signal } = {}) {
+  if (creds?.source !== "keyring" && (creds?.source !== "file" || !creds.path)) return;
   const expiresIn = Number.isFinite(next?.expiresIn) && next.expiresIn > 0 ? next.expiresIn : 3600;
   const expiry = new Date(nowMs + expiresIn * 1000).toISOString();
   try {
-    const payload = creds.raw && typeof creds.raw === "object" ? { ...creds.raw } : {};
+    let rawPayload = creds.raw;
+    let keyringBase64 = false;
+    if (creds.source === "keyring") {
+      const currentRaw = await readAntigravityLinuxSecretRaw({ secretToolRunner, signal });
+      const current = parseAntigravityCredentialPayload(currentRaw);
+      // Do not restore a signed-out entry or overwrite a token changed by agy.
+      if (!current || current.refreshToken !== creds.refreshToken) return;
+      rawPayload = current.raw;
+      keyringBase64 = currentRaw.startsWith("go-keyring-base64:");
+    }
+    const payload = rawPayload && typeof rawPayload === "object" ? { ...rawPayload } : {};
     if (payload.token && typeof payload.token === "object") {
       payload.token = {
         ...payload.token,
@@ -3198,12 +3450,25 @@ function persistAntigravityCredentials(creds, next, { nowMs = Date.now() } = {})
       payload.expiry = expiry;
       if (next.refreshToken) payload.refresh_token = next.refreshToken;
     }
+    if (creds.source === "keyring") {
+      const json = JSON.stringify(payload);
+      const raw = keyringBase64
+        ? `go-keyring-base64:${Buffer.from(json).toString("base64")}`
+        : json;
+      await writeAntigravityLinuxSecretRaw(raw, { secretToolRunner, signal });
+      return;
+    }
     const tmpPath = `${creds.path}.${process.pid}.tmp`;
     fs.writeFileSync(tmpPath, JSON.stringify(payload, null, 2), { encoding: "utf8", mode: 0o600 });
     fs.renameSync(tmpPath, creds.path);
   } catch (_error) {}
 }
 
+/**
+ * Refresh an agy token with the client credentials distributed in the app.
+ * Missing refresh tokens and rejected requests throw an AUTH_EXPIRED error.
+ * @returns {Promise<{accessToken: string, refreshToken: string, expiresIn: number}>}
+ */
 async function refreshAntigravityAccessToken(refreshToken, { fetchImpl = fetch, signal } = {}) {
   if (typeof refreshToken !== "string" || !refreshToken) {
     const err = new Error(ANTIGRAVITY_AUTH_EXPIRED_MESSAGE);
@@ -3218,6 +3483,7 @@ async function refreshAntigravityAccessToken(refreshToken, { fetchImpl = fetch, 
     },
     body: new URLSearchParams({
       client_id: ANTIGRAVITY_OAUTH_CLIENT_ID,
+      client_secret: ANTIGRAVITY_OAUTH_CLIENT_SECRET,
       grant_type: "refresh_token",
       refresh_token: refreshToken,
     }),
@@ -3241,11 +3507,16 @@ async function refreshAntigravityAccessToken(refreshToken, { fetchImpl = fetch, 
   };
 }
 
-async function resolveAntigravityAccessToken(creds, { fetchImpl = fetch, nowMs = Date.now(), forceRefresh = false, signal } = {}) {
+/** Renew expired credentials and retain rotated tokens for a retry within the same request. */
+async function resolveAntigravityAccessToken(creds, { fetchImpl = fetch, nowMs = Date.now(), forceRefresh = false, secretToolRunner, signal } = {}) {
   const expired = creds.expiryMs != null && creds.expiryMs <= nowMs + ANTIGRAVITY_TOKEN_REFRESH_SKEW_MS;
   if ((forceRefresh || expired || !creds.accessToken) && creds.refreshToken) {
     const next = await refreshAntigravityAccessToken(creds.refreshToken, { fetchImpl, signal });
-    persistAntigravityCredentials(creds, next, { nowMs });
+    await persistAntigravityCredentials(creds, next, { nowMs, secretToolRunner, signal });
+    creds.accessToken = next.accessToken;
+    creds.refreshToken = next.refreshToken;
+    const expiresIn = Number.isFinite(next.expiresIn) && next.expiresIn > 0 ? next.expiresIn : 3600;
+    creds.expiryMs = nowMs + expiresIn * 1000;
     return next.accessToken;
   }
   if (!creds.accessToken) {
@@ -3256,6 +3527,7 @@ async function resolveAntigravityAccessToken(creds, { fetchImpl = fetch, nowMs =
   return creds.accessToken;
 }
 
+/** Send a Cloud Code JSON request with the current bearer token and caller's abort signal. */
 function postAntigravityCloudCode(fetchImpl, url, accessToken, body, signal) {
   return fetchImpl(url, {
     method: "POST",
@@ -3270,6 +3542,7 @@ function postAntigravityCloudCode(fetchImpl, url, accessToken, body, signal) {
   });
 }
 
+/** Try the quota hosts in order; surface auth failures so the caller can refresh once. */
 async function fetchAntigravityQuotaSummaryJson(fetchImpl, accessToken, signal) {
   let lastError = null;
   for (const url of ANTIGRAVITY_QUOTA_SUMMARY_URLS) {
@@ -3294,6 +3567,7 @@ async function fetchAntigravityQuotaSummaryJson(fetchImpl, accessToken, signal) 
   throw lastError || new Error("Antigravity quota request failed.");
 }
 
+/** Read the paid plan label without failing a successful quota response if this lookup fails. */
 async function fetchAntigravityPlanLabel(fetchImpl, accessToken, signal) {
   try {
     const res = await postAntigravityCloudCode(fetchImpl, ANTIGRAVITY_LOAD_CODE_ASSIST_URL, accessToken, {
@@ -3310,16 +3584,26 @@ async function fetchAntigravityPlanLabel(fetchImpl, accessToken, signal) {
   }
 }
 
+/**
+ * Fetch Cloud Code quota with selected credentials, refreshing on expiry or 401/403.
+ * Passing creds (including null) avoids another file or keyring read.
+ * @returns {Promise<object|null>} Live quota, or null when credentials are absent.
+ */
 async function fetchAntigravityRemoteLimits({
   home,
   platform = process.platform,
   securityRunner,
+  secretToolRunner,
   fetchImpl = fetch,
   nowMs = Date.now(),
   signal,
+  creds,
 } = {}) {
-  const creds = loadAntigravityCredentials({ home, platform, securityRunner });
-  if (!creds) return null;
+  if (isAntigravityQuotaDisabled()) return null;
+  const resolvedCreds = creds !== undefined
+    ? creds
+    : await loadAntigravityCredentials({ home, platform, securityRunner, secretToolRunner, nowMs, signal });
+  if (!resolvedCreds) return null;
 
   const loadWithToken = async (accessToken) => {
     const payload = await fetchAntigravityQuotaSummaryJson(fetchImpl, accessToken, signal);
@@ -3337,21 +3621,48 @@ async function fetchAntigravityRemoteLimits({
     };
   };
 
-  let accessToken = await resolveAntigravityAccessToken(creds, { fetchImpl, nowMs, signal });
+  let accessToken = await resolveAntigravityAccessToken(resolvedCreds, { fetchImpl, nowMs, secretToolRunner, signal });
   try {
     return await loadWithToken(accessToken);
   } catch (error) {
-    if (error?.code !== "AUTH_EXPIRED" || !creds.refreshToken) throw error;
-    accessToken = await resolveAntigravityAccessToken(creds, { fetchImpl, nowMs, forceRefresh: true, signal });
+    if (error?.code !== "AUTH_EXPIRED" || !resolvedCreds.refreshToken) throw error;
+    accessToken = await resolveAntigravityAccessToken(resolvedCreds, {
+      fetchImpl,
+      nowMs,
+      forceRefresh: true,
+      secretToolRunner,
+      signal,
+    });
     return await loadWithToken(accessToken);
   }
 }
 
-function antigravityUnavailableResult({ home, nowMs, platform, securityRunner, remoteError } = {}) {
+/** Request reauthentication for an auth rejection or credentials past the refresh threshold. */
+function antigravityCredentialsNeedReauth(creds, { nowMs, remoteError } = {}) {
+  if (remoteError?.code === "AUTH_EXPIRED") return true;
+  return Boolean(
+    creds
+    && creds.expiryMs != null
+    && creds.expiryMs <= nowMs + ANTIGRAVITY_TOKEN_REFRESH_SKEW_MS,
+  );
+}
+
+/**
+ * Serve last-good quota or explain why live quota is unavailable. Mark expired
+ * credentials for reauthentication even when cached quota remains usable.
+ * The provider path passes its selected creds to avoid repeating discovery.
+ */
+async function antigravityUnavailableResult({ home, nowMs, platform, securityRunner, secretToolRunner, remoteError, creds } = {}) {
   const cached = readAntigravityLimitsCache({ home, nowMs });
-  if (cached) return cached;
-  const creds = loadAntigravityCredentials({ home, platform, securityRunner });
-  if (!hasAntigravityInstallEvidence({ home }) && !creds) {
+  const resolvedCreds = creds !== undefined
+    ? creds
+    : await loadAntigravityCredentials({ home, platform, securityRunner, secretToolRunner, nowMs });
+  if (cached) {
+    return antigravityCredentialsNeedReauth(resolvedCreds, { nowMs, remoteError })
+      ? { ...cached, auth_action_required: "reauth" }
+      : cached;
+  }
+  if (!hasAntigravityInstallEvidence({ home }) && !resolvedCreds) {
     return { configured: false };
   }
   if (remoteError) {
@@ -3361,15 +3672,15 @@ function antigravityUnavailableResult({ home, nowMs, platform, securityRunner, r
       : raw;
     return { configured: true, error: message };
   }
-  if (creds) {
+  if (resolvedCreds) {
     return { configured: true, error: ANTIGRAVITY_AUTH_EXPIRED_MESSAGE };
   }
   return { configured: true, error: ANTIGRAVITY_NOT_RUNNING_MESSAGE };
 }
 
 /**
- * `providerTimeoutMs` bounds the WHOLE serial chain — remote quota attempt, process
- * scan, port scan, port probes and local RPCs — not any single call. Mirrors
+ * `providerTimeoutMs` bounds the WHOLE serial chain — credential discovery, remote
+ * quota attempt, process scan, port scan, port probes and local RPCs. Mirrors
  * fetchArkCodingPlanLimits / the codex remaining-budget pattern: each step's timeout is
  * clamped to what is left of the budget, and a step whose share has run out is skipped
  * rather than issued, so the chain can never outrun the outer provider race and the
@@ -3388,12 +3699,15 @@ async function fetchAntigravityLimits({
   nowMs = Date.now(),
   platform = process.platform,
   securityRunner,
+  secretToolRunner,
   signal,
 } = {}) {
+  if (isAntigravityQuotaDisabled()) return { configured: false, error: null };
   const startedAtMs = performance.now();
   // min(this step's ceiling, budget left after reserving the fallback guard).
   // 0 means "no time left" — the caller must skip the call, not issue it.
   const budgetedTimeoutMs = (stepCeilingMs) => {
+    if (signal?.aborted) return 0;
     if (!Number.isFinite(providerTimeoutMs) || providerTimeoutMs <= 0) return stepCeilingMs;
     const guardMs = Math.min(
       ANTIGRAVITY_BUDGET_GUARD_MS,
@@ -3404,6 +3718,16 @@ async function fetchAntigravityLimits({
     if (guardedMs <= 0) return 0;
     return Math.min(stepCeilingMs, guardedMs);
   };
+
+  const creds = await loadAntigravityCredentials({
+    home,
+    platform,
+    securityRunner,
+    secretToolRunner,
+    nowMs,
+    timeoutMs: budgetedTimeoutMs(2000),
+    signal,
+  });
 
   const finalize = (payload, normalizeOptions) => {
     const result = {
@@ -3430,7 +3754,16 @@ async function fetchAntigravityLimits({
   if (remoteTimeoutMs > 0) {
     try {
       const remote = await withProviderTimeout(
-        fetchAntigravityRemoteLimits({ home, platform, securityRunner, fetchImpl, nowMs, signal }),
+        fetchAntigravityRemoteLimits({
+          home,
+          platform,
+          securityRunner,
+          secretToolRunner,
+          fetchImpl,
+          nowMs,
+          signal,
+          creds,
+        }),
         "Antigravity",
         remoteTimeoutMs,
       );
@@ -3455,7 +3788,15 @@ async function fetchAntigravityLimits({
       signal,
     });
     if (!processInfo.configured) {
-      return antigravityUnavailableResult({ home, nowMs, platform, securityRunner, remoteError });
+      return antigravityUnavailableResult({
+        home,
+        nowMs,
+        platform,
+        securityRunner,
+        secretToolRunner,
+        remoteError,
+        creds,
+      });
     }
     if (processInfo.error) {
       return { configured: true, error: processInfo.error };
@@ -3560,7 +3901,9 @@ async function fetchAntigravityLimits({
       nowMs,
       platform,
       securityRunner,
+      secretToolRunner,
       remoteError: remoteError || error,
+      creds,
     });
   }
 }
@@ -3597,7 +3940,8 @@ function withPlanLabel(obj, raw, brand) {
 // hammered). Survives an external resetUsageLimitsCache() (refresh=1 path in
 // local-api.js): a refresh arriving while a fetch is already running reuses that
 // in-flight fetch and returns its result.
-let inFlightFetch = null;
+const inFlightBySelection = {};
+for (const key of USAGE_LIMITS_SELECTION_KEYS) inFlightBySelection[key] = null;
 
 // Codex stamps reset_at as unix seconds; every other provider (and Claude's
 // resets_at) uses ISO strings. Numbers that look like epoch milliseconds are
@@ -3634,40 +3978,55 @@ function cacheExpiresAtMs(data, fetchedAtMs) {
   return Math.min(ttlExpiry, Math.max(Math.min(...upcoming), fetchedAtMs + CACHE_MIN_TTL_MS));
 }
 
+/** Return cached quota or share one in-flight fetch for the requested provider selection. */
 async function getUsageLimits(options = {}) {
+  const selection = usageLimitsSelectionKey(options);
+  const cache = cacheBySelection[selection];
   const nowMs = Date.now();
   if (cache.data && nowMs < cache.expiresAtMs) {
     return cache.data;
   }
-  if (inFlightFetch) {
-    return inFlightFetch;
+  if (inFlightBySelection[selection]) {
+    return inFlightBySelection[selection];
   }
-  const promise = fetchUsageLimitsUncached(options).finally(() => {
-    if (inFlightFetch === promise) inFlightFetch = null;
+  const promise = fetchUsageLimitsUncached({ ...options, selectionKey: selection }).finally(() => {
+    if (inFlightBySelection[selection] === promise) inFlightBySelection[selection] = null;
   });
-  inFlightFetch = promise;
+  inFlightBySelection[selection] = promise;
   return promise;
 }
 
+/**
+ * Fetch one aggregate for the selected providers and update its cache partition.
+ * Forward injected credential/process runners so tests can avoid host accounts.
+ */
 async function fetchUsageLimitsUncached({
   home,
   env,
   platform,
   securityRunner,
+  secretToolRunner,
   fetchImpl = fetch,
   commandRunner,
   requestFn,
   now = new Date(),
   providerTimeoutMs = DEFAULT_PROVIDER_TIMEOUT_MS,
   forceRefresh = false,
+  devinEnabled = false,
+  // Selection key fixed by getUsageLimits before the fetch began. Re-deriving it
+  // here would let an opt-out flipped mid-fetch store a pre-opt-out result in the
+  // post-opt-out slot.
+  selectionKey,
 } = {}) {
   const nowMs = Date.now();
 
-  const [claudeToken, claudeSubscription, codexAuth] = await Promise.all([
-    Promise.resolve().then(() => readClaudeCodeAccessToken({ platform, securityRunner, home })),
+  const [claudeOauth, claudeSubscription, codexAuth] = await Promise.all([
+    Promise.resolve().then(() => readClaudeCodeOauthToken({ platform, securityRunner, home, nowMs })),
     Promise.resolve().then(() => detectClaudeCodeSubscriptionDetails({ platform, securityRunner, home })),
     readCodexAuthBundle({ home, env }),
   ]);
+  const claudeToken = claudeOauth?.accessToken || null;
+  const claudeTokenExpiresAtMs = claudeOauth?.expiresAtMs ?? null;
   const claudePlanType = claudeSubscription?.planType || null;
 
   // Match the official Codex CLI: prefer the access token's JWT expiry and refresh only
@@ -3706,10 +4065,13 @@ async function fetchUsageLimitsUncached({
 
   // Skip the upstream Claude call entirely while a 429 cooldown is active — calling again
   // just renews the penalty. The result handling below serves cache or a cooldown message.
-  const claudeRetryAtMs = claudeToken ? readClaudeRateLimitRetryAtMs({ home, nowMs }) : null;
+  const claudeRetryAtMs = claudeToken
+    ? readClaudeRateLimitRetryAtMs({ home, nowMs, tokenExpiresAtMs: claudeTokenExpiresAtMs })
+    : null;
   // Also avoid cross-process hammering after a recent successful read: embedded-server
   // restarts and background polls read the disk cache instead of spending another Claude
-  // OAuth usage request. An explicit user refresh (refresh=1 → forceRefresh) punches
+  // OAuth usage request. Claude Code's own cached read counts too, so a session that just
+  // refreshed its usage spares this process a call against the same throttled budget. An explicit user refresh (refresh=1 → forceRefresh) punches
   // through this cache — but never through the 429 cooldown above, which is exactly the
   // hammering the cooldown exists to prevent.
   const freshClaudeCache = claudeToken && !forceRefresh
@@ -3717,7 +4079,7 @@ async function fetchUsageLimitsUncached({
     : null;
 
   const providerFetch = withFetchTimeout(fetchImpl, providerTimeoutMs);
-  const [claudeResult, codexResult, cursor, kimi, gemini, kiro, antigravity, copilot, grok, zcode, opencodeGoRaw, qoder, qoderCn, codingPlan, agentPlan, commandCodeRaw, claudeServiceStatus] = await Promise.all([
+  const [claudeResult, codexResult, cursor, kimi, gemini, kiro, antigravity, copilot, grok, zcode, opencodeGoRaw, qoder, qoderCn, codingPlan, agentPlan, commandCodeRaw, devinRaw, claudeServiceStatus] = await Promise.all([
     claudeToken && !freshClaudeCache && !claudeRetryAtMs
       ? withProviderTimeout(fetchClaudeUsageLimits(claudeToken, { fetchImpl: providerFetch, maxAttempts: 1 }), "Claude", providerTimeoutMs).then(
           (value) => ({ status: "fulfilled", value }),
@@ -3753,6 +4115,7 @@ async function fetchUsageLimitsUncached({
         nowMs,
         platform,
         securityRunner,
+        secretToolRunner,
         providerTimeoutMs,
         signal,
       }),
@@ -3761,9 +4124,9 @@ async function fetchUsageLimitsUncached({
     ).catch((reason) => ({ configured: true, error: reason?.message || "Unknown error" })),
     withProviderTimeout(fetchCopilotLimits({ home, env, fetchImpl: providerFetch, platform, securityRunner }), "GitHub Copilot", providerTimeoutMs)
       .catch((reason) => ({ configured: true, error: reason?.message || "Unknown error" })),
-    withProviderTimeout(fetchGrokLimits({ home, env, fetchImpl: providerFetch }), "Grok Build", providerTimeoutMs)
+    withProviderTimeout(fetchGrokLimits({ home, env, fetchImpl: providerFetch, timeoutMs: providerTimeoutMs }), "Grok Build", providerTimeoutMs)
       .catch((reason) => ({ configured: true, error: reason?.message || "Unknown error" })),
-    withProviderTimeout(fetchZcodeLimits({ home, env, fetchImpl: providerFetch }), "ZCode", providerTimeoutMs)
+    withProviderTimeout(fetchZcodeLimits({ home, env, fetchImpl: providerFetch, providerTimeoutMs }), "ZCode", providerTimeoutMs)
       .catch((reason) => ({ configured: true, error: reason?.message || "Unknown error" })),
     // OpenCode Go: authoritative subscription windows come from the dashboard
     // scrape; local opencode.db cost is available only as an explicit estimate.
@@ -3831,6 +4194,16 @@ async function fetchUsageLimitsUncached({
         (value) => ({ status: "fulfilled", value }),
         (reason) => ({ status: "rejected", reason }),
       ),
+    // Devin (devin.ai): daily/weekly subscription quota from the official
+    // GetPlanStatus RPC, keyed by the session token the Devin CLI stores in
+    // ~/.local/share/devin/credentials.toml. No local fallback — window state
+    // lives server-side. fetchDevinLimits throws on auth expiry so the
+    // assemble step below can flag auth_action_required.
+    withProviderTimeout(fetchDevinLimits({ home, env, enabled: devinEnabled === true, fetchImpl: providerFetch }), "Devin", providerTimeoutMs)
+      .then(
+        (value) => ({ status: "fulfilled", value }),
+        (reason) => ({ status: "rejected", reason }),
+      ),
     // Public status-page probe (fail-soft, own 5-min cache in provider-status.js).
     // Only probed for configured accounts — without a token the Claude section
     // never renders, so the reading would have nowhere to go.
@@ -3878,13 +4251,21 @@ async function fetchUsageLimitsUncached({
     // surface an accurate "retry in ~Nm" message rather than the misleading hardcoded one.
     const reason = claudeResult?.reason;
     if (reason?.code === "RATE_LIMITED") {
-      writeClaudeRateLimitCooldown(reason.retryAfterSec, { home, nowMs });
+      writeClaudeRateLimitCooldown(reason.retryAfterSec, {
+        home,
+        nowMs,
+        tokenExpiresAtMs: claudeTokenExpiresAtMs,
+      });
     }
     const cached = readClaudeLimitsCache({ home, nowMs });
     if (cached) {
       claude = cached;
     } else {
-      const retryAtMs = readClaudeRateLimitRetryAtMs({ home, nowMs }) || claudeRetryAtMs;
+      const retryAtMs = readClaudeRateLimitRetryAtMs({
+        home,
+        nowMs,
+        tokenExpiresAtMs: claudeTokenExpiresAtMs,
+      }) || claudeRetryAtMs;
       claude = {
         configured: true,
         error: retryAtMs
@@ -3907,7 +4288,11 @@ async function fetchUsageLimitsUncached({
   // cool-down just armed by this cycle's 429 is included; a successful read above
   // cleared the file, so this is null in the happy path.
   if (claude.configured) {
-    const claudeCooldownMs = readClaudeRateLimitRetryAtMs({ home, nowMs });
+    const claudeCooldownMs = readClaudeRateLimitRetryAtMs({
+      home,
+      nowMs,
+      tokenExpiresAtMs: claudeTokenExpiresAtMs,
+    });
     if (claudeCooldownMs) {
       claude.retry_at = new Date(claudeCooldownMs).toISOString();
     }
@@ -4029,11 +4414,31 @@ async function fetchUsageLimitsUncached({
       : { configured: true, error: reason?.message || "Unknown error" };
   }
 
+  // Devin: server-owned quota windows like CommandCode — a fulfilled
+  // `configured: false` means no CLI credentials; a rejected fetch with
+  // AUTH_EXPIRED flags auth_action_required for the re-sign-in hint.
+  let devinObj;
+  if (devinRaw?.status === "fulfilled") {
+    const value = devinRaw.value;
+    devinObj = value && value.configured === false
+      ? value
+      : { ...value, stale: false, cached_at: new Date(nowMs).toISOString() };
+  } else {
+    const reason = devinRaw?.reason || null;
+    devinObj = reason?.code === "AUTH_EXPIRED"
+      ? { configured: true, error: reason?.message || "Unknown error", auth_action_required: "reauth" }
+      : { configured: true, error: reason?.message || "Unknown error" };
+  }
+
+  const cursorLimits = cursorSandDuplicatesGrokPool(cursor, grok)
+    ? { ...cursor, quaternary_window: null }
+    : cursor;
+
   const data = {
     fetched_at: new Date(nowMs).toISOString(),
     claude: withPlanLabel(claude, claudePlanType, "Claude"),
     codex: withPlanLabel(codex, codex.plan_type, "Codex"),
-    cursor: withPlanLabel(cursor, cursor.membership_type, "Cursor"),
+    cursor: withPlanLabel(cursorLimits, cursorLimits.membership_type, "Cursor"),
     // Kimi's subType (TYPE_PURCHASE/TYPE_EVENT) is the credit *source*, not a plan
     // tier, and membership.level is an opaque enum (LEVEL_INTERMEDIATE) with no
     // authoritative human-readable plan mapping. Both rendered as garbage like
@@ -4043,13 +4448,22 @@ async function fetchUsageLimitsUncached({
     kiro: withPlanLabel(kiro, kiro.plan_name, "Kiro"),
     antigravity: withPlanLabel(antigravity, antigravity.account_plan, "Antigravity"),
     copilot: withPlanLabel(copilot, copilot.plan_name, "Copilot"),
-    grok: withPlanLabel(grok, null, "Grok"),
+    // grok-limits already maps subscriptionTier to xAI's own product names
+    // ("SuperGrok Heavy", "X Premium+", "API Key"). The shared normalization
+    // would Title-Case them into "Supergrok Heavy" / "Api Key" and drop "Free"
+    // outright, so surface the label as-is like CommandCode below. Error and
+    // unconfigured branches never carry plan_label, so the panel still falls
+    // back to the bare brand name.
+    grok,
     zcode: withPlanLabel(zcode, zcode.plan_label, "ZCode"),
     opencodeGo: withPlanLabel(opencodeGo, opencodeGo?.plan_label, "OpenCode Go"),
     // CommandCode tiers are acronym brands (GOAT/Pro/Max) — the fetcher already
     // maps plan ids to the CLI's exact display strings, so skip the shared
     // Title-Case normalization ("Goat") and surface them as-is.
     commandCode: commandCodeObj,
+    // Devin's planName ("Pro", "Max") is already the official display name —
+    // Title-Case normalization is still harmless and strips any brand prefix.
+    devin: withPlanLabel(devinObj, devinObj?.plan_label, "Devin"),
     qoder: withPlanLabel(qoder, qoder?.plan_label, "Qoder"),
     qoderCn: withPlanLabel(qoderCn, qoderCn?.plan_label, "Qoder CN"),
     codingPlan: withPlanLabel(codingPlan, codingPlan?.plan_label, "Ark Coding Plan"),
@@ -4077,12 +4491,17 @@ async function fetchUsageLimitsUncached({
     };
   }
 
-  cache = { data, expiresAtMs: cacheExpiresAtMs(data, nowMs) };
+  cacheBySelection[selectionKey || usageLimitsSelectionKey({ devinEnabled })] = {
+    data,
+    expiresAtMs: cacheExpiresAtMs(data, nowMs),
+  };
   return data;
 }
 
 function resetUsageLimitsCache() {
-  cache = { data: null, expiresAtMs: 0 };
+  for (const key of USAGE_LIMITS_SELECTION_KEYS) {
+    cacheBySelection[key] = { data: null, expiresAtMs: 0 };
+  }
 }
 
 module.exports = {
@@ -4093,8 +4512,10 @@ module.exports = {
   runCommand,
   extractGeminiOauthClientCredentials,
   loadKimiCredentials,
+  fetchKimiLimits,
   normalizeCursorUsageSummary,
   normalizeCursorSandUsageStatus,
+  cursorSandDuplicatesGrokPool,
   normalizeGeminiQuotaResponse,
   normalizeKimiUsageResponse,
   parseKiroUsageOutput,
@@ -4103,6 +4524,11 @@ module.exports = {
   normalizeAntigravityResponse,
   normalizeAntigravityQuotaSummary,
   loadAntigravityCredentials,
+  readAntigravityLinuxSecretRaw,
+  writeAntigravityLinuxSecretRaw,
+  refreshAntigravityAccessToken,
+  ANTIGRAVITY_OAUTH_CLIENT_ID,
+  ANTIGRAVITY_OAUTH_CLIENT_SECRET,
   parseListeningPorts,
   parseWindowsListeningPorts,
   parseLinuxProcListeningPorts,

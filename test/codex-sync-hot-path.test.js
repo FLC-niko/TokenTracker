@@ -227,7 +227,7 @@ test("v2 cold filtering batches shard decisions and loads by day directory", asy
 
   const filtered = await filterColdCodexRolloutFiles({
     rolloutFiles,
-    cursors: { version: 1, files: {}, codexDayInventoryCache: { version: 1, days: {} } },
+    cursors: { version: 1, files: {}, codexDayInventoryCache: { version: 2, days: {} } },
     codexCursorStore,
     nowMs: Date.UTC(2030, 5, 2, 12, 0, 0),
     recentDays: 2,
@@ -236,6 +236,59 @@ test("v2 cold filtering batches shard decisions and loads by day directory", asy
   assert.deepEqual(filtered.rolloutFiles, rolloutFiles.slice(2));
   assert.equal(filtered.skipped, 2);
   assert.deepEqual(calls, { skip: 1, load: 1 });
+});
+
+test("v2 cold filtering parses a grown recent rollout even when its day is skippable (#592)", async () => {
+  // The day-level skip keys off the directory stat, which does not change when
+  // a file inside it is appended to. A still-open cross-day session must be
+  // caught by the per-file growth check before the day skip is consulted.
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "tt-codex-cold-growth-"));
+  try {
+    const now = new Date(2030, 5, 5, 12, 0, 0).getTime();
+    const oldDir = path.join(root, ".codex", "sessions", "2030", "06", "02");
+    await fs.mkdir(oldDir, { recursive: true });
+    const grownPath = path.join(oldDir, "rollout-2030-06-02T00-00-00-a.jsonl");
+    const eofPath = path.join(oldDir, "rollout-2030-06-02T01-00-00-b.jsonl");
+    const activePath = path.join(root, ".codex", "sessions", "2030", "06", "05", "rollout-2030-06-05T00-00-00-c.jsonl");
+    await fs.writeFile(grownPath, "x".repeat(500));
+    await fs.writeFile(eofPath, "x".repeat(100));
+    const cursors = {
+      version: 1,
+      files: {
+        [grownPath]: { inode: 1, offset: 100, projectOffset: 100 },
+        [eofPath]: { inode: 2, offset: 100, projectOffset: 100 },
+        [activePath]: { inode: 3, offset: 10, projectOffset: 10 },
+      },
+      codexDayInventoryCache: { version: 2, days: {} },
+    };
+    const calls = { skip: 0 };
+    const codexCursorStore = {
+      fileCount: 3,
+      async canSkipCodexDay() {
+        calls.skip += 1;
+        return true;
+      },
+      async loadCodexFilesForPaths() {},
+    };
+
+    const filtered = await filterColdCodexRolloutFiles({
+      rolloutFiles: [
+        { path: grownPath, source: "codex" },
+        { path: eofPath, source: "codex" },
+        { path: activePath, source: "codex" },
+      ],
+      cursors,
+      codexCursorStore,
+      nowMs: now,
+      recentDays: 2,
+    });
+
+    assert.deepEqual(filtered.rolloutFiles.map((entry) => entry.path), [grownPath, activePath]);
+    assert.equal(filtered.skipped, 1);
+    assert.equal(calls.skip, 1, "the EOF file still takes the day-level skip");
+  } finally {
+    await fs.rm(root, { recursive: true, force: true });
+  }
 });
 
 test("v2 cold filtering discards partial skip decisions after generation fallback", async () => {
@@ -264,7 +317,7 @@ test("v2 cold filtering discards partial skip decisions after generation fallbac
 
   const filtered = await filterColdCodexRolloutFiles({
     rolloutFiles,
-    cursors: { version: 1, files: {}, codexDayInventoryCache: { version: 1, days: {} } },
+    cursors: { version: 1, files: {}, codexDayInventoryCache: { version: 2, days: {} } },
     codexCursorStore,
     diagnostics,
     nowMs: Date.UTC(2030, 5, 2, 12, 0, 0),
@@ -539,7 +592,10 @@ test("an inode rewrite still uses historical Codex hashes without rematerializin
     const cursors = {
       version: 1,
       files: {
-        [rolloutPath]: { inode: stat.ino + 1, offset: stat.size, lastTotal: null },
+        // NTFS inode numbers can exceed Number.MAX_SAFE_INTEGER, so adding
+        // one can round back to the same inode. A negative sentinel is
+        // guaranteed to differ from this file's actual inode on every host.
+        [rolloutPath]: { inode: -1, offset: stat.size, lastTotal: null },
       },
       codexHashes: observedHashes.proxy,
     };
@@ -705,7 +761,7 @@ test("source-scoped sync preserves audit state and reports the actual cursor com
       version: 1,
       files: {},
       codexColdScanAudit: expectedAuditState,
-      codexDayInventoryCache: { version: 1, days: {} },
+      codexDayInventoryCache: { version: 2, days: {} },
       hourly: {
         version: 3,
         buckets: {},

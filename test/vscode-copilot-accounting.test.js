@@ -33,6 +33,8 @@ test('VS Code aggregate input survives parser, real pricing and local API withou
     assert.equal(row.total_tokens, row.unclassified_input_tokens + row.input_tokens + row.output_tokens + row.cached_input_tokens + row.cache_creation_input_tokens + row.reasoning_output_tokens);
     assert.equal(computeRowCost(row), null);
     assert.equal(computeKnownRowCost(row), 0.005);
+    assert.equal(computeKnownRowCost({ ...row, source: 'grok', total_cost_usd: 999 }), 0.005,
+      'partial input cannot make a provider cost look like a proven subtotal');
     const handler = createLocalApiHandler({queuePath});
     const summary = await request(handler, 'usage-summary');
     assert.equal(summary.totals.unclassified_input_tokens, 1000000);
@@ -55,17 +57,24 @@ test('VS Code aggregate input survives parser, real pricing and local API withou
     assert.equal(fleet[0].costPartial, true);
     assert.equal(buildAllModels(fleet)[0].costPartial, true);
     assert.equal(buildAllModels(fleet)[0].cost, null);
+    assert.equal(buildAllModels(fleet)[0].tokens.unclassified, 1000000);
     // A fully classified row must not turn the mixed source/model total
     // into an apparently complete cost, even after dashboard aggregation.
     const complete = { ...row, hour_start: '2026-09-01T10:30:00Z',
       usage_precision: undefined, unclassified_input_tokens: 0,
-      input_tokens: 100, output_tokens: 10, total_tokens: 110, billable_total_tokens: 110 };
+      input_tokens: 100, output_tokens: 10, total_tokens: 110, billable_total_tokens: 110,
+      priority_input_tokens: 100, priority_output_tokens: 10,
+      long_context_input_tokens: 100, long_context_output_tokens: 10,
+      priority_long_context_input_tokens: 100, priority_long_context_output_tokens: 10 };
     await fs.appendFile(queuePath, JSON.stringify(complete) + '\n');
     const mixed = await request(handler, 'usage-summary');
     assert.equal(mixed.totals.total_tokens, 1000210);
     assert.equal(mixed.totals.total_cost_usd, null);
     assert.equal(mixed.totals.cost_status, 'partial');
     assert.ok(Math.abs(Number(mixed.totals.known_cost_usd) - (0.005 + computeRowCost(complete))) < 1e-9);
+    const mixedBreakdown = await request(handler, 'usage-model-breakdown');
+    assert.equal(mixedBreakdown.sources[0].models[0].totals.known_cost_usd, mixed.totals.known_cost_usd,
+      'per-row priority and long-context premiums survive model aggregation');
     const again = await parseVsCodeCopilotChatIncremental({sessionPaths: [sessionPath], queuePath, cursors: JSON.parse(JSON.stringify(cursors))});
     assert.equal(again.bucketsQueued, 0);
     // Upgrade an existing v2 cursor, including an unchanged snapshot. Its

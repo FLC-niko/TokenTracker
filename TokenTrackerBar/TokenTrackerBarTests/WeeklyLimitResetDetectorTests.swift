@@ -174,6 +174,66 @@ final class WeeklyLimitResetDetectorTests: XCTestCase {
         )
     }
 
+    func testZCodeStartPlanReadingsUseLabelledBuckets() throws {
+        let json = """
+        {
+          "fetched_at": "2026-09-25T00:00:00Z",
+          "claude": { "configured": false },
+          "codex": { "configured": false },
+          "cursor": { "configured": false },
+          "gemini": { "configured": false },
+          "kiro": { "configured": false },
+          "antigravity": { "configured": false },
+          "zcode": {
+            "configured": true,
+            "error": null,
+            "plan_kind": "start-plan",
+            "primary_window": { "used_percent": 100, "reset_at": "2026-09-25T16:00:00Z" },
+            "secondary_window": { "used_percent": 20, "reset_at": "2026-09-25T16:00:00Z" },
+            "buckets": [
+              { "label": "GLM-5.3", "entitlement_id": "ent_glm_5p3", "window": { "used_percent": 100, "reset_at": "2026-09-25T16:00:00Z" } },
+              { "label": "GLM-5.3-Flash", "entitlement_id": "ent_glm_5p3f", "window": { "used_percent": 20, "reset_at": "2026-09-25T16:00:00Z" } },
+              { "label": "GLM-5.3-Flash · ZCode Weekend Build", "entitlement_id": "ent-wk-1", "window": { "used_percent": 1, "reset_at": "2026-09-28T01:00:00Z" } }
+            ]
+          }
+        }
+        """
+        let response = try JSONDecoder().decode(UsageLimitsResponse.self, from: Data(json.utf8))
+        let readings = response.limitWindowReadings()
+
+        XCTAssertEqual(
+            readings.map { "\($0.windowKey)|\($0.windowLabel)" },
+            [
+                "zcode.bucket.ent_glm_5p3|GLM-5.3",
+                "zcode.bucket.ent_glm_5p3f|GLM-5.3-Flash",
+                "zcode.bucket.ent-wk-1|GLM-5.3-Flash · ZCode Weekend Build",
+            ]
+        )
+    }
+
+    func testZCodeStartPlanReadingsKeepFixedLabelsWithoutBuckets() throws {
+        let json = """
+        {
+          "fetched_at": "2026-09-25T00:00:00Z",
+          "claude": { "configured": false },
+          "codex": { "configured": false },
+          "cursor": { "configured": false },
+          "gemini": { "configured": false },
+          "kiro": { "configured": false },
+          "antigravity": { "configured": false },
+          "zcode": {
+            "configured": true,
+            "plan_kind": "start-plan",
+            "primary_window": { "used_percent": 10, "reset_at": "2026-09-25T16:00:00Z" },
+            "secondary_window": { "used_percent": 20, "reset_at": "2026-09-25T16:00:00Z" }
+          }
+        }
+        """
+        let response = try JSONDecoder().decode(UsageLimitsResponse.self, from: Data(json.utf8))
+
+        XCTAssertEqual(response.limitWindowReadings().map(\.windowLabel), ["GLM-5.2", "GLM-5-Turbo"])
+    }
+
     func testArkPlansDecodeAndKeepIndependentResetWindows() throws {
         let json = """
         {
@@ -245,6 +305,62 @@ final class WeeklyLimitResetDetectorTests: XCTestCase {
             readings.map { "\($0.provider).\($0.windowLabel)" },
             ["qoder.Plan", "qoder.Bonus", "qoderCn.Plan", "qoderCn.Bonus"]
         )
+    }
+
+    func testDevinDecodesOptionalWindowsAndEmitsReadings() throws {
+        // Devin windows are optional: a weekly-only plan must not fabricate a
+        // daily reading, and a hidden/absent window must never fire.
+        let json = """
+        {
+          "fetched_at": "2026-09-12T00:00:00Z",
+          "claude": { "configured": false },
+          "codex": { "configured": false },
+          "cursor": { "configured": false },
+          "gemini": { "configured": false },
+          "kiro": { "configured": false },
+          "antigravity": { "configured": false },
+          "devin": {
+            "configured": true,
+            "error": null,
+            "plan_label": "Pro",
+            "primary_window": { "used_percent": 40, "reset_at": "2026-09-13T08:00:00Z", "limit_window_seconds": 86400 },
+            "secondary_window": { "used_percent": 90, "reset_at": "2026-09-20T08:00:00Z", "limit_window_seconds": 604800 }
+          }
+        }
+        """
+        let response = try JSONDecoder().decode(UsageLimitsResponse.self, from: Data(json.utf8))
+        XCTAssertEqual(response.devin?.planLabel, "Pro")
+        XCTAssertEqual(response.devin?.primaryWindow?.limitWindowSeconds, 86400)
+
+        let readings = response.limitWindowReadings()
+        XCTAssertEqual(readings.map { $0.windowKey }, ["devin.primary", "devin.secondary"])
+        XCTAssertEqual(readings.map { $0.windowLabel }, ["Daily", "Weekly"])
+        XCTAssertEqual(readings.map { $0.usedPercent }, [40, 90])
+        XCTAssertEqual(LimitResetProviderIconCatalog.svgFilename(for: "devin"), "devin.svg")
+    }
+
+    func testDevinWeeklyOnlyPlanSkipsAbsentDailyWindow() throws {
+        let json = """
+        {
+          "fetched_at": "2026-09-12T00:00:00Z",
+          "claude": { "configured": false },
+          "codex": { "configured": false },
+          "cursor": { "configured": false },
+          "gemini": { "configured": false },
+          "kiro": { "configured": false },
+          "antigravity": { "configured": false },
+          "devin": {
+            "configured": true,
+            "error": null,
+            "primary_window": null,
+            "secondary_window": { "used_percent": 25, "reset_at": "2026-09-20T08:00:00Z" }
+          }
+        }
+        """
+        let response = try JSONDecoder().decode(UsageLimitsResponse.self, from: Data(json.utf8))
+        XCTAssertNil(response.devin?.primaryWindow ?? nil)
+        let readings = response.limitWindowReadings()
+        XCTAssertEqual(readings.map { $0.windowKey }, ["devin.secondary"])
     }
 
     func testCelebrationProviderIconMappingsCoverAssetAndSVGProviders() {

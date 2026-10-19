@@ -5,7 +5,26 @@ import { copy } from "./copy";
 
 const SLUG = "tokentracker-sessions";
 
-export type SessionSource = "claude" | "codex" | "grok";
+export type SessionSource = "claude" | "codex" | "grok" | "zcode" | "opencode";
+
+export interface SessionPerformance {
+  estimated_output_tokens: number;
+  estimated_duration_ms: number;
+  estimated_request_count: number;
+  estimated_tokens_per_second: number | null;
+  first_response_total_ms: number;
+  first_response_sample_count: number;
+  first_response_ms: number | null;
+}
+
+export interface SessionPricing {
+  status: "priced" | "unpriced" | "free";
+  source: string | null;
+  input: number;
+  output: number;
+  cache_read: number;
+  cache_write: number;
+}
 
 // Every field here is always present: the server densifies model_usage rows at
 // the response boundary (modelUsageForAggregation in src/lib/session-analytics.js),
@@ -25,14 +44,27 @@ export interface SessionModelUsage {
   long_context_cache_creation_input_tokens: number;
   long_context_output_tokens: number;
   long_context_reasoning_output_tokens: number;
+  priority_input_tokens: number;
+  priority_cached_input_tokens: number;
+  priority_cache_creation_input_tokens: number;
+  priority_output_tokens: number;
+  priority_reasoning_output_tokens: number;
+  priority_long_context_input_tokens: number;
+  priority_long_context_cached_input_tokens: number;
+  priority_long_context_cache_creation_input_tokens: number;
+  priority_long_context_output_tokens: number;
+  priority_long_context_reasoning_output_tokens: number;
   usage_events: number;
   rerouted_usage_events: number;
   long_context_usage_events: number;
+  priority_usage_events: number;
   edit_turns: number;
   selected_models: string[];
   reroute_reasons: string[];
   model_attribution: "selected" | "effective";
   cost_usd: number;
+  performance?: SessionPerformance;
+  pricing?: SessionPricing;
 }
 
 export interface SessionRow {
@@ -94,6 +126,8 @@ export interface SessionRow {
   productive: boolean;
   first_pass: boolean;
   resume_command: string | null;
+  performance?: SessionPerformance;
+  pricing?: SessionPricing;
 }
 
 export interface SessionsResponse {

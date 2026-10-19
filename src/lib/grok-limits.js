@@ -4,6 +4,7 @@ const path = require("node:path");
 
 const DEFAULT_BILLING_BASE_URL = "https://cli-chat-proxy.grok.com";
 const DEFAULT_BILLING_TIMEOUT_MS = 15_000;
+const DEFAULT_SETTINGS_TIMEOUT_MS = 2_000;
 const DEFAULT_OIDC_ISSUER = "https://auth.x.ai";
 const DEFAULT_TOKEN_ENDPOINT = "https://auth.x.ai/oauth2/token";
 // Refresh slightly before wall-clock expiry so Limits doesn't race a just-expired JWT.
@@ -495,6 +496,92 @@ async function resolveGrokAccessToken({
   };
 }
 
+// Grok Build enriches billing with a display tier from remote settings. The
+// billing HTTP response itself may contain only `config`.
+const GROK_PLAN_TIERS = new Map([
+  ["supergrokheavy", "SuperGrok Heavy"],
+  ["supergrokplus", "SuperGrok Plus"],
+  ["supergroklite", "SuperGrok Lite"],
+  ["supergrok", "SuperGrok"],
+  ["xpremiumplus", "X Premium+"],
+  ["premiumplus", "X Premium+"],
+  ["xpremium", "X Premium+"],
+  ["apikey", "API Key"],
+  ["free", "Free"],
+]);
+
+/**
+ * Map xAI's subscription tier to the name its own UI shows.
+ *
+ * Separators are folded away before matching so the same table covers whichever
+ * casing the API returns ("SuperGrok Heavy", "SUPER_GROK_HEAVY", "superGrokHeavy").
+ * Unknown values return null rather than being passed through: the Limits panel
+ * falls back to the bare brand name, which is better than rendering a raw enum
+ * (issue #130 shipped "Kimi Type_event" that way).
+ */
+function deriveGrokPlanLabel(rawTier) {
+  if (rawTier == null) return null;
+  const key = String(rawTier).toLowerCase().replace(/[^a-z0-9]+/g, "");
+  if (!key) return null;
+  // Exact match only. Prefix matching would read an unseen tier such as
+  // "SuperGrok Business" as plain "SuperGrok", and a confidently wrong plan on
+  // the card is worse than no plan at all.
+  return GROK_PLAN_TIERS.get(key) ?? null;
+}
+
+// Billing product ids → the name grok.com shows in the usage legend.
+// Unknown ids are humanized below so a new product still gets a row.
+const GROK_PRODUCT_LABELS = new Map([
+  ["GrokBuild", "Grok Build"],
+  ["GrokBot", "Grok Bot"],
+  ["GrokChat", "Chat"],
+  ["GrokImagine", "Imagine"],
+  ["Cursor", "Cursor"],
+]);
+
+function normalizeGrokProductId(value) {
+  if (typeof value !== "string") return null;
+  const id = value.trim();
+  if (!/^[A-Za-z][A-Za-z0-9]{0,31}$/.test(id)) return null;
+  return id;
+}
+
+function humanizeGrokProductId(productId) {
+  const spaced = productId
+    .replace(/([a-z0-9])([A-Z])/g, "$1 $2")
+    .replace(/([A-Z]+)([A-Z][a-z])/g, "$1 $2")
+    .replace(/[_-]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+  return spaced.slice(0, 40) || null;
+}
+
+/**
+ * Per-product shares of the same pool as creditUsagePercent.
+ * A 12% Grok Bot row is 12 points of the weekly cap, not its own 100% quota.
+ * Zero and non-finite rows are omitted (grok.com hides unused products).
+ * API order is preserved; a repeated product id keeps the first finite row.
+ */
+function normalizeGrokProductUsage(productUsage, resetAt) {
+  if (!Array.isArray(productUsage)) return [];
+  const seen = new Set();
+  const products = [];
+  for (const entry of productUsage) {
+    if (!entry || typeof entry !== "object") continue;
+    const product = normalizeGrokProductId(entry.product);
+    if (!product || seen.has(product)) continue;
+    const raw = Number(entry.usagePercent);
+    if (!Number.isFinite(raw) || raw <= 0) continue;
+    const window = buildWindow({ usedPercent: raw, resetAt });
+    if (!window || !(window.used_percent > 0)) continue;
+    const label = GROK_PRODUCT_LABELS.get(product) || humanizeGrokProductId(product);
+    if (!label) continue;
+    seen.add(product);
+    products.push({ product, label, window });
+  }
+  return products;
+}
+
 /**
  * Parse either:
  *   - Unified billing (`?format=credits`): weekly/monthly period + creditUsagePercent
@@ -567,6 +654,8 @@ function normalizeGrokBillingResponse(body) {
   }
 
   return {
+    // Read from the response root, not from `config`.
+    plan_label: deriveGrokPlanLabel(body?.subscriptionTier),
     period_type: periodType,
     monthly_credits_limit: monthlyLimit,
     monthly_credits_used: used,
@@ -578,6 +667,8 @@ function normalizeGrokBillingResponse(body) {
     billing_period_start: periodStart,
     primary_window: primaryWindow,
     secondary_window: secondaryWindow,
+    // Shares of primary_window. Do not add these on top of credit_usage_percent.
+    products: normalizeGrokProductUsage(config.productUsage, resetAt),
   };
 }
 
@@ -608,15 +699,28 @@ async function fetchGrokBilling(
       headers,
       deadlineMs,
     );
-    if (creditsResult.ok) return creditsResult.body;
-    creditsFailure = `HTTP ${creditsResult.status}`;
+    if (creditsResult.ok) {
+      // Keep the unified pool even when its fields are malformed. The caller
+      // must surface its parse error rather than substitute a legacy pool.
+      if (creditsResult.body?.config?.currentPeriod) return creditsResult.body;
+      try {
+        // Only a response without a unified period is eligible for shape
+        // fallback; a parseable legacy response can already be used as-is.
+        normalizeGrokBillingResponse(creditsResult.body);
+        return creditsResult.body;
+      } catch (error) {
+        creditsFailure = `unrecognized response (${error?.message || "invalid billing data"})`;
+      }
+    } else {
+      creditsFailure = `HTTP ${creditsResult.status}`;
+    }
   } catch (error) {
     if (error?.code === "GROK_AUTH_REQUIRED") throw error;
     if (error?.code === "GROK_BILLING_TIMEOUT") throw error;
   }
 
-  // Non-auth HTTP, network, or response-decoding failure → try the legacy
-  // shape once, while sharing the original request deadline.
+  // Non-auth HTTP, network, response-decoding, or shape failure → try the
+  // legacy shape once, while sharing the original request deadline.
   let legacyResult;
   try {
     legacyResult = await fetchGrokBillingAttempt(
@@ -637,6 +741,26 @@ async function fetchGrokBilling(
     );
   }
   return legacyResult.body;
+}
+
+async function fetchGrokPlanLabel(accessToken, { fetchImpl = fetch, env, timeoutMs } = {}) {
+  const root = resolveGrokBillingBaseUrl(env);
+  if (timeoutMs <= 0) return null;
+  try {
+    const result = await fetchGrokBillingAttempt(
+      fetchImpl,
+      `${root}/v1/settings`,
+      { Authorization: `Bearer ${accessToken}`, Accept: "application/json" },
+      Date.now() + Math.min(timeoutMs || DEFAULT_SETTINGS_TIMEOUT_MS, DEFAULT_SETTINGS_TIMEOUT_MS),
+    );
+    if (!result.ok) return null;
+    return deriveGrokPlanLabel(
+      result.body?.subscription_tier_display ?? result.body?.subscription_tier,
+    );
+  } catch (_error) {
+    // A failed settings lookup must not hide a successfully fetched quota.
+    return null;
+  }
 }
 
 async function fetchGrokLimits({ home, env, fetchImpl = fetch, timeoutMs, nowMs } = {}) {
@@ -664,8 +788,10 @@ async function fetchGrokLimits({ home, env, fetchImpl = fetch, timeoutMs, nowMs 
     };
   }
 
+  const startedAtMs = Date.now();
   try {
     let body;
+    let accessToken = resolved.accessToken;
     try {
       body = await fetchGrokBilling(resolved.accessToken, { fetchImpl, env, timeoutMs });
     } catch (error) {
@@ -685,15 +811,25 @@ async function fetchGrokLimits({ home, env, fetchImpl = fetch, timeoutMs, nowMs 
         if (!retry.accessToken) {
           throw retry.error || grokReauthError();
         }
+        accessToken = retry.accessToken;
         body = await fetchGrokBilling(retry.accessToken, { fetchImpl, env, timeoutMs });
       } else {
         throw error;
       }
     }
+    const limits = normalizeGrokBillingResponse(body);
+    if (!limits.plan_label) {
+      const remainingMs = Number.isFinite(timeoutMs)
+        ? timeoutMs - (Date.now() - startedAtMs) - 100
+        : DEFAULT_SETTINGS_TIMEOUT_MS;
+      limits.plan_label = await fetchGrokPlanLabel(accessToken, {
+        fetchImpl, env, timeoutMs: remainingMs,
+      });
+    }
     return {
       configured: true,
       error: null,
-      ...normalizeGrokBillingResponse(body),
+      ...limits,
     };
   } catch (error) {
     return {
@@ -721,6 +857,8 @@ module.exports = {
   normalizeGrokPeriodType,
   inferGrokPeriodTypeFromDates,
   sumProductUsagePercent,
+  deriveGrokPlanLabel,
+  normalizeGrokProductUsage,
   normalizeGrokBillingResponse,
   fetchGrokBilling,
   fetchGrokLimits,

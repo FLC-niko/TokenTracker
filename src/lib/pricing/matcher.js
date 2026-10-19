@@ -1,6 +1,7 @@
 // Pure pricing-lookup logic. No I/O, no async. Tested in isolation.
 //
 // Resolve order:
+//   0. CURATED source exact match (source-specific pricing)
 //   1. CURATED exact match (self-defined aliases like kiro-*, hy3-*)
 //   2. LiteLLM exact match (mainstream claude/gpt-5/gemini)
 //   3. CURATED alias (e.g. "auto" -> "composer-1")
@@ -121,7 +122,9 @@ function normalizeClaudeModel(model) {
 
 // Cursor decorates model ids with reasoning effort and sometimes places the
 // Claude version before the tier. Normalize those lookup-only aliases while
-// preserving Grok 4.5's distinct Fast SKU (its rate is not the base rate).
+// preserving Cursor Grok Fast SKUs (4.5/4.6/4.7 Fast rates are not the base
+// rates). Gemini 4 Argon effort suffixes (-high/-medium/-low/-minimal) are
+// stripped with the shared decorations set below.
 function normalizeCursorModel(model) {
   if (!model || typeof model !== "string") return model;
   let m = model
@@ -134,6 +137,12 @@ function normalizeCursorModel(model) {
   const parts = m.split("-");
   const isFast = parts.includes("fast");
 
+  if (/^(?:cursor-)?grok-4[.-]7(?:-|$)/.test(m)) {
+    return isFast ? "cursor-grok-4.7-fast" : "cursor-grok-4.7";
+  }
+  if (/^(?:cursor-)?grok-4[.-]6(?:-|$)/.test(m)) {
+    return isFast ? "cursor-grok-4.6-fast" : "cursor-grok-4.6";
+  }
   if (/^(?:cursor-)?grok-4[.-]5(?:-|$)/.test(m)) {
     return isFast ? "cursor-grok-4.5-fast" : "cursor-grok-4.5";
   }
@@ -141,8 +150,8 @@ function normalizeCursorModel(model) {
   // `fast` can be a separately priced SKU (for example composer-2-fast and
   // claude-opus-5-fast). Preserve it for the exact lookups below; when it is
   // merely a decoration, lookupPricing's later suffix-strip still falls back
-  // to the base LiteLLM model.
-  const decorations = new Set(["thinking", "xhigh", "high", "medium", "low"]);
+  // to the base LiteLLM model. Gemini Argon uses "minimal" as an effort level.
+  const decorations = new Set(["thinking", "xhigh", "high", "medium", "low", "minimal"]);
   m = parts.filter((part) => !decorations.has(part)).join("-");
   if (m.startsWith("claude-")) return normalizeClaudeModel(m);
   return m;
@@ -164,6 +173,15 @@ function normalizeWorkbuddyModel(model) {
   return model;
 }
 
+function normalizeIFlytekMaasModel(model) {
+  if (!model || typeof model !== "string") return model;
+  const trimmed = model.trim();
+  const lower = trimmed.toLowerCase();
+  // The default Agent slug maps to the Spark X2 service in the supplied price list.
+  if (lower === "xsparkx2agent") return "xsparkx2";
+  return trimmed;
+}
+
 // Unsloth Studio can mix local engines and paid API providers in one database.
 // The parser qualifies metered models with their provider and marks local,
 // subscription-backed, or ambiguous custom routes as unpriced. Returning a
@@ -182,6 +200,7 @@ function normalizeUnslothModel(model) {
 // raw model name is preserved for storage/display). Add a source here when its
 // model strings don't match the LiteLLM/curated keys verbatim.
 const SOURCE_MODEL_NORMALIZERS = {
+  acode: normalizeIFlytekMaasModel,
   antigravity: normalizeAntigravityModel,
   claude: normalizeClaudeModel,
   cursor: normalizeCursorModel,
@@ -227,7 +246,13 @@ function lookupContainedExactCaseInsensitive(table, model) {
   const lower = model.toLowerCase();
   const keys = Object.keys(table).sort((a, b) => b.length - a.length);
   for (const key of keys) {
-    if (lower.includes(key.toLowerCase())) return table[key];
+    const start = lower.indexOf(key.toLowerCase());
+    if (start < 0) continue;
+    // A model generation must not match a later numeric version (Opus 5.5
+    // is a separate SKU from Opus 5). Dated and provider suffixes still work.
+    const suffix = lower.slice(start + key.length);
+    if (/^[.\d]/.test(suffix)) continue;
+    return table[key];
   }
   return null;
 }
@@ -242,17 +267,44 @@ function lookupPricing(model, { curated, litellm, source } = {}) {
   const lower = lookupModel.toLowerCase();
   const dotForm = buildDotRestoredModel(lookupModel);
 
+  // 0. CURATED source exact. Source-specific prices apply only to their source,
+  // preventing collisions with public prices for same-named models from other CLIs.
+  const sourceKey = typeof source === "string" ? source.toLowerCase() : "";
+  if (sourceKey === "workbuddy-ai" && lower.trim() === "auto") {
+    return { hit: false, source: "miss", value: null };
+  }
+  if (sourceKey === "cline" && lower.endsWith(":free")) {
+    return {
+      hit: true,
+      source: "curated:cline-free-suffix",
+      value: { input: 0, output: 0, cache_read: 0, cache_write: 0 },
+    };
+  }
+  // AStudio does not disclose its routed model. Stop before generic aliases
+  // and fuzzy matching can turn an unresolved router into a priced model.
+  if (sourceKey === "acode" && (lower === "auto" || lower.endsWith("-auto"))) {
+    return { hit: false, source: "miss", value: null };
+  }
+  const sourceExact = curated.source_exact?.[sourceKey];
+  if (sourceExact) {
+    const sourceValue = lookupExactCaseInsensitive(sourceExact, lookupModel);
+    if (sourceValue) {
+      return { hit: true, source: "curated:source-exact", value: sourceValue };
+    }
+  }
+
   // 1. CURATED exact
+  // Qwen Flash's provider-qualified and dated IDs share the reference SKU.
+  // Keep the boundary strict: Flash-Next and Max have independent prices.
+  if (/(?:^|\/)qwen3[.-]8-flash(?:-\d{4}-\d{2}-\d{2})?$/.test(lower.trim()) && curated.exact?.["qwen3.8-flash"]) {
+    return { hit: true, source: "curated:exact", value: curated.exact["qwen3.8-flash"] };
+  }
   if (curated.exact && curated.exact[lookupModel]) {
     return { hit: true, source: "curated:exact", value: curated.exact[lookupModel] };
   }
   const curatedDotExact = lookupExactCaseInsensitive(curated.exact, dotForm);
   if (curatedDotExact) {
     return { hit: true, source: "curated:exact-dot", value: curatedDotExact };
-  }
-  const curatedDotContainedExact = lookupContainedExactCaseInsensitive(curated.exact, dotForm);
-  if (curatedDotContainedExact) {
-    return { hit: true, source: "curated:exact-dot", value: curatedDotContainedExact };
   }
 
   // 2. LiteLLM exact
@@ -262,6 +314,10 @@ function lookupPricing(model, { curated, litellm, source } = {}) {
   const litellmDotExact = lookupExactCaseInsensitive(litellm, dotForm);
   if (litellmDotExact) {
     return { hit: true, source: "litellm:exact-dot", value: litellmDotExact };
+  }
+  const curatedDotContainedExact = lookupContainedExactCaseInsensitive(curated.exact, dotForm);
+  if (curatedDotContainedExact) {
+    return { hit: true, source: "curated:exact-dot", value: curatedDotContainedExact };
   }
 
   // 3. CURATED alias (literal mapping like "auto" -> "composer-1")
@@ -382,6 +438,7 @@ module.exports = {
   lookupPricing,
   stripReasoningSuffix,
   normalizeAntigravityModel,
+  normalizeIFlytekMaasModel,
   normalizeClaudeModel,
   normalizeCursorModel,
   normalizeZedModel,

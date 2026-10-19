@@ -19,9 +19,12 @@ internal sealed class TrayApplicationContext : ApplicationContext
         ?? System.Windows.Threading.Dispatcher.CurrentDispatcher;
     private readonly NotifyIcon _trayIcon;
     private readonly ServerManager _server = new();
+    private readonly WidgetWebViewEnvironment _widgetWebViewEnvironment = new();
     private readonly UsagePoller _poller;
     private DashboardWindow? _dashboard;
     private PetWindow? _petWindow;
+    private QuotaWidgetWindow? _quotaWindow;
+    private readonly ToolStripMenuItem _quotaItem;
 
     private readonly ContextMenuStrip _menu;
     private readonly TrayMenuRenderer _menuRenderer;
@@ -76,26 +79,33 @@ internal sealed class TrayApplicationContext : ApplicationContext
     private UpdateStrings _updateStrings = UpdateStrings.For(NativeLocalization.CurrentResolvedLocale);
     private bool _updateBalloonShown;
 
-    // Lightweight UI-thread tick so the tooltip follows a currency change within a
-    // couple of seconds without needing a right-click. Cheap: it only touches the
-    // WebView (to read the currency) once the dashboard has been opened.
+    // Theme and tray state refresh independently of WebView script execution.
     private readonly System.Windows.Forms.Timer _refreshTimer = new() { Interval = 2000 };
     private readonly System.Windows.Forms.Timer _syncTimer = new() { Interval = 5 * 60 * 1000 };
-    // WebView currency reads are asynchronous. Timer ticks, menu opens, and
-    // poller callbacks can arrive while one read is still pending; keep one
-    // pass active and request one follow-up pass for the newest stats instead
-    // of stacking ExecuteScript calls on the WebView renderer.
+    // Tray apps stay resident for days, so the launch-time update check alone can
+    // miss releases for as long as the app runs. Re-check periodically; the checker
+    // self-skips while a check/download is already in flight.
+    private const int UpdateCheckIntervalMinutes = 6 * 60;
+    private readonly System.Windows.Forms.Timer _updateCheckTimer = new()
+    {
+        Interval = UpdateCheckIntervalMinutes * 60 * 1000,
+    };
+    // Coalesce timer, menu, and poller callbacks into the latest summary.
     private Task? _summaryRefreshTask;
     private bool _summaryRefreshRequested;
+    private (string Symbol, decimal Rate) _summaryCurrency = Currency.ReadPersisted() ?? ("$", 1m);
+    private int _currencyReadRevision;
 
     public TrayApplicationContext(bool showPetOnLaunch = false)
     {
         _poller = new UsagePoller(() => _server.BaseUrl);
+        SystemEvents.UserPreferenceChanged += OnSystemUserPreferenceChanged;
         _menuRenderer = new TrayMenuRenderer(_menuPalette);
 
         _summaryItem = CreateMenuItem("", (_, _) => OpenDashboard());
         _openDashboardItem = CreateMenuItem("", (_, _) => OpenDashboard());
         _syncItem = CreateMenuItem("", (_, _) => _server.TriggerSync());
+        _quotaItem = CreateMenuItem("", (_, _) => ToggleQuota());
         _petItem = CreateMenuItem("", (_, _) => TogglePet());
         _petSizeSmall = CreateMenuItem("", (_, _) => SetPetSize(PetWindow.SizeSmall));
         _petSizeMedium = CreateMenuItem("", (_, _) => SetPetSize(PetWindow.SizeMedium));
@@ -180,6 +190,7 @@ internal sealed class TrayApplicationContext : ApplicationContext
         _menu.Items.Add(CreateSeparator());
         _menu.Items.Add(_openDashboardItem);
         _menu.Items.Add(_syncItem);
+        _menu.Items.Add(_quotaItem);
         _menu.Items.Add(_petItem);
         _menu.Items.Add(_petSizeItem);
         _menu.Items.Add(_petCharacterItem);
@@ -224,6 +235,7 @@ internal sealed class TrayApplicationContext : ApplicationContext
         _server.SyncCompleted += OnSyncCompleted;
         _poller.StatsUpdated += OnStatsUpdated;
         _poller.LimitsUpdated += OnLimitsUpdated;
+        _poller.LimitsFailed += () => PostToUi(() => _quotaWindow?.MarkFailed());
         _refreshTimer.Tick += (_, _) => RefreshSummary();
         _syncTimer.Tick += (_, _) => TriggerBackgroundSync();
         _refreshTimer.Start();
@@ -238,12 +250,24 @@ internal sealed class TrayApplicationContext : ApplicationContext
             PushDashboardNativeSettings();
         });
         _updateChecker.QuitRequested += () => PostToUi(Quit);
+        // A failed checksum is not transient noise — the download was discarded and
+        // nothing was installed, so say so instead of silently reverting the menu item.
+        _updateChecker.IntegrityCheckFailed += () => PostToUi(() =>
+            _trayIcon.ShowBalloonTip(8000, _updateStrings.IntegrityErrorTitle,
+                _updateStrings.IntegrityErrorMessage, ToolTipIcon.Warning));
         _ = _updateChecker.CheckAsync(silent: true);
+        _updateCheckTimer.Tick += (_, _) => _ = _updateChecker.CheckAsync(silent: true);
+        _updateCheckTimer.Start();
 
-        // The desktop pet is the app's visible presence now — the dashboard no longer
-        // auto-opens. A stored preference (user toggled the pet at least once) always
-        // wins; only first launches fall back to the show-on-manual-run default.
+        // A stored preference (user toggled the pet at least once) always wins;
+        // only first launches fall back to the show-on-manual-run default.
         // Deferred onto the dispatcher so it shows once the message pump is running.
+        _quotaWindow = new QuotaWidgetWindow(_server, OpenDashboard, _widgetWebViewEnvironment);
+        _quotaWindow.EnabledChanged += () => { _quotaItem.Checked = _quotaWindow.Enabled; UpdateLimitsPolling(); };
+        _quotaItem.Checked = _quotaWindow.Enabled;
+        if (_quotaWindow.Enabled)
+            _uiDispatcher.BeginInvoke(new Action(() => { _quotaWindow.SetEnabled(true); UpdateLimitsPolling(); _poller.RefreshNow(); }));
+
         if (PetWindow.StoredVisible ?? showPetOnLaunch)
         {
             _uiDispatcher.BeginInvoke(new Action(() =>
@@ -251,11 +275,23 @@ internal sealed class TrayApplicationContext : ApplicationContext
                 EnsurePet();
                 _petWindow!.ShowPet();
                 _poller.IncludeRichStats = true;   // gather the pet's quip-pool stats
-                _poller.IncludeLimits = true;
+                UpdateLimitsPolling();
                 UpdatePetMenuText();
                 RefreshSummary();
             }));
         }
+    }
+
+    private void UpdateLimitsPolling() => _poller.IncludeLimits = _petWindow?.IsVisible == true || _quotaWindow?.Enabled == true;
+
+    private void ToggleQuota()
+    {
+        _quotaWindow ??= new QuotaWidgetWindow(_server, OpenDashboard, _widgetWebViewEnvironment);
+        _quotaWindow.SetEnabled(!_quotaWindow.Enabled);
+        _quotaItem.Checked = _quotaWindow.Enabled;
+        if (_lastLimitsJson is not null) _quotaWindow.ApplyLimits(_lastLimitsJson);
+        UpdateLimitsPolling();
+        if (_quotaWindow.Enabled) _poller.RefreshNow();
     }
 
     private ToolStripMenuItem CreateMenuItem(string text, EventHandler onClick)
@@ -320,6 +356,8 @@ internal sealed class TrayApplicationContext : ApplicationContext
         _summaryItem.Text = $"{_strings.TodayTitle}: {_strings.NoData}";
         _openDashboardItem.Text = _strings.OpenDashboard;
         _syncItem.Text = _strings.SyncNow;
+        _quotaItem.Text = _strings.DesktopQuota;
+        _quotaWindow?.ApplyLocale(NativeLocalization.ResolveLocale(_localePreference));
         UpdatePetMenuText();
         _petSizeItem.Text = _strings.PetSize;
         _petSizeSmall.Text = _strings.SizeSmall;
@@ -386,6 +424,7 @@ internal sealed class TrayApplicationContext : ApplicationContext
     private void ApplyThemePreference(string preference)
     {
         var normalized = NativeTheme.NormalizePreference(preference);
+        _quotaWindow?.ApplyTheme(NativeTheme.ResolveIsLight(normalized));
         var nextPalette = TrayMenuRenderer.PaletteFor(NativeTheme.ResolveIsLight(normalized));
         if (_themePreference == normalized && _menuPalette == nextPalette) return;
 
@@ -403,6 +442,12 @@ internal sealed class TrayApplicationContext : ApplicationContext
         ApplyThemePreference(preference);
     }
 
+    private void OnSystemUserPreferenceChanged(object? sender, UserPreferenceChangedEventArgs e)
+    {
+        if (e.Category is not (UserPreferenceCategory.Color or UserPreferenceCategory.General)) return;
+        PostToUi(RefreshThemeFromDashboard);
+    }
+
     private async void RefreshLocaleFromDashboard()
     {
         var preference = _dashboard is not null
@@ -415,6 +460,8 @@ internal sealed class TrayApplicationContext : ApplicationContext
         NativeLocalization.StorePreference(preference);
         ApplyLocaleToMenu();
     }
+
+    public void ActivateDashboard() => PostToUi(OpenDashboard);
 
     private void OpenDashboard()
     {
@@ -437,7 +484,7 @@ internal sealed class TrayApplicationContext : ApplicationContext
         // The pet's quip pool needs the heatmap + model-breakdown stats; only gather them
         // (two extra calls per poll) while the pet is actually on screen.
         _poller.IncludeRichStats = _petWindow.IsVisible;
-        _poller.IncludeLimits = _petWindow.IsVisible;
+        UpdateLimitsPolling();
         if (_petWindow.IsVisible)
         {
             RefreshSummary();      // push the current numbers right away
@@ -449,7 +496,7 @@ internal sealed class TrayApplicationContext : ApplicationContext
     private void EnsurePet()
     {
         if (_petWindow is not null) return;
-        _petWindow = new PetWindow(_server);
+        _petWindow = new PetWindow(_server, _widgetWebViewEnvironment);
         // Right-clicking the pet pops a context menu (open dashboard / size / close).
         _petWindow.ContextMenuRequested += () => PostToUi(ShowPetContextMenu);
     }
@@ -606,7 +653,7 @@ internal sealed class TrayApplicationContext : ApplicationContext
         _petWindow.HidePet();
         _petWindow.StoreVisible(false);
         _poller.IncludeRichStats = false;   // stop gathering the pet-only stats
-        _poller.IncludeLimits = false;
+        UpdateLimitsPolling();
         UpdatePetMenuText();
         PushDashboardPetSettings();
     }
@@ -621,7 +668,7 @@ internal sealed class TrayApplicationContext : ApplicationContext
         // it natively so a future cold-launched pet shows the same unit before the
         // dashboard exists. CurrencyChanged only fires once the page is loaded, so the
         // read here is real (never the transient USD default).
-        _dashboard.CurrencyChanged += () => PostToUi(() => { RefreshSummary(); PersistCurrencyFromDashboard(); });
+        _dashboard.CurrencyChanged += () => PostToUi(PersistCurrencyFromDashboard);
         _dashboard.LocaleChanged += () => PostToUi(RefreshLocaleFromDashboard);
         _dashboard.ThemeChanged += () => PostToUi(RefreshThemeFromDashboard);
         _dashboard.PetSettingsRequested += () => PostToUi(PushDashboardPetSettings);
@@ -654,7 +701,7 @@ internal sealed class TrayApplicationContext : ApplicationContext
                     _petWindow!.ShowPet();
                     _petWindow.StoreVisible(true);
                     _poller.IncludeRichStats = true;
-                    _poller.IncludeLimits = true;
+                    UpdateLimitsPolling();
                     _poller.RefreshNow();
                 }
                 else
@@ -662,7 +709,7 @@ internal sealed class TrayApplicationContext : ApplicationContext
                     _petWindow!.HidePet();
                     _petWindow.StoreVisible(false);
                     _poller.IncludeRichStats = false;
-                    _poller.IncludeLimits = false;
+                    UpdateLimitsPolling();
                 }
                 UpdatePetMenuText();
                 // Echo the applied state back; the size/character cases push inside
@@ -745,6 +792,12 @@ internal sealed class TrayApplicationContext : ApplicationContext
                 if (launch) LaunchAtStartup.Enable();
                 else LaunchAtStartup.Disable();
                 break;
+            case TokenUnits.SettingKey when value is string unitSystem:
+                // Display-only preference: persist it, then re-render the tray summary
+                // and pet so they pick up 万/亿 vs K/M/B without waiting for a poll.
+                TokenUnits.Store(unitSystem);
+                RefreshSummary();
+                return;
             default:
                 return;
         }
@@ -769,33 +822,29 @@ internal sealed class TrayApplicationContext : ApplicationContext
 
     /// <summary>
     /// Handle a <c>tokentracker://</c> deep link (forwarded from a second launch, or a
-    /// cold start argument). Currently only the OAuth callback
-    /// <c>tokentracker://auth/callback?insforge_code=…</c> is used; the code is routed
-    /// into the dashboard WebView to finish the InsForge session exchange. Mirrors the
-    /// macOS <c>application(_:open:)</c> → <c>handleAuthCallback</c> path.
+    /// cold start argument). OAuth codes return to their callback page; billing
+    /// returns only open the order page, whose server request checks the current account.
     /// </summary>
     public void HandleDeepLink(string url)
     {
-        DiagLog($"HandleDeepLink url={url}");
-        string? code = null;
-        try
+        DiagLog($"HandleDeepLink present={!string.IsNullOrEmpty(url)} len={url?.Length ?? 0}");
+        if (NativeReturnUri.TryGetBillingOrder(url, out var order))
         {
-            var uri = new Uri(url);
-            if (!uri.Host.Equals("auth", StringComparison.OrdinalIgnoreCase)) return;
-            foreach (var pair in uri.Query.TrimStart('?').Split('&'))
+            DiagLog("HandleDeepLink type=billing");
+            PostToUi(() =>
             {
-                var i = pair.IndexOf('=');
-                if (i <= 0 || pair[..i] != "insforge_code") continue;
-                var raw = pair[(i + 1)..];
-                if (raw.Length > 0) code = Uri.UnescapeDataString(raw);
-                break;
-            }
+                EnsureDashboard();
+                _dashboard!.HandleBillingReturn(order);
+            });
+            return;
         }
-        catch { return; }
-
-        if (string.IsNullOrEmpty(code)) { DiagLog("HandleDeepLink no insforge_code in query"); return; }
+        if (!NativeReturnUri.TryGetAuthCode(url, out var code))
+        {
+            DiagLog("HandleDeepLink type=unsupported");
+            return;
+        }
         var resolved = code;
-        DiagLog($"HandleDeepLink resolved code.len={resolved.Length}");
+        DiagLog($"HandleDeepLink type=oauth code.len={resolved.Length}");
         PostToUi(() =>
         {
             EnsureDashboard();
@@ -850,9 +899,16 @@ internal sealed class TrayApplicationContext : ApplicationContext
                     MessageBoxButtons.OK, MessageBoxIcon.Information);
                 break;
             case UpdateChecker.CheckOutcome.Failed:
-                MessageBox.Show(
-                    _updateStrings.ErrorMessage, _updateStrings.ErrorTitle,
-                    MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                var message = _updateStrings.ErrorMessage;
+                if (_updateChecker.ApiRetryAt is { } retryAt && retryAt > DateTimeOffset.UtcNow)
+                    message += "\n\n" + string.Format(_updateStrings.ApiRetryAtMessage,
+                        retryAt.ToLocalTime().ToString("g", CultureInfo.CurrentCulture));
+                message += "\n\n" + _updateStrings.OpenReleasePagePrompt;
+                var openReleasePage = MessageBox.Show(
+                    message, _updateStrings.ErrorTitle,
+                    MessageBoxButtons.YesNo, MessageBoxIcon.Warning, MessageBoxDefaultButton.Button2);
+                if (openReleasePage == DialogResult.Yes)
+                    OpenInBrowser(UpdateReleaseClient.ReleasePageUrl);
                 break;
             // Skipped: nothing to report.
         }
@@ -942,7 +998,7 @@ internal sealed class TrayApplicationContext : ApplicationContext
     private void OnSyncCompleted()
     {
         _isSyncing = false;
-        _poller.RefreshNow();
+        _poller.RefreshNow(forceAccount: false);
         PostToUi(() =>
         {
             _petWindow?.ApplySyncing(false);
@@ -964,6 +1020,7 @@ internal sealed class TrayApplicationContext : ApplicationContext
         {
             _lastLimitsJson = limitsJson;
             _petWindow?.ApplyLimits(limitsJson);
+            _quotaWindow?.ApplyLimits(limitsJson);
         });
     }
 
@@ -994,29 +1051,23 @@ internal sealed class TrayApplicationContext : ApplicationContext
         }
     }
 
-    private async Task RefreshSummaryOnceAsync()
+    private Task RefreshSummaryOnceAsync()
     {
-        // Convert USD → the dashboard's chosen currency. Reading the currency is a
-        // WebView2 ExecuteScript round-trip — the 2s _refreshTimer would otherwise
-        // poke the WebView forever, even while the window is hidden. Currency
-        // changes originate in the (visible) dashboard and already arrive via
-        // CurrencyChanged → persisted, so a hidden window can safely serve the
-        // natively-cached symbol/rate (which also covers a cold-launched pet).
-        var (symbol, rate) = IsDashboardOpen()
-            ? await _dashboard!.ReadCurrencyAsync()
-            : Currency.ReadPersisted() ?? ("$", 1m);
+        // CurrencyChanged reads once when the value changes or the page loads.
+        var (symbol, rate) = _summaryCurrency;
         // Push currency + language to the pet even before the first usage poll lands, so
         // a freshly launched pet never sits in default USD/English until polling finishes
         // (connection state is owned by OnServerStatusChanged).
         _petWindow?.ApplyCurrency(symbol, rate);
         _petWindow?.ApplyLocale(NativeLocalization.ResolveLocale(_localePreference));
+        _petWindow?.ApplyTokenUnitSystem(TokenUnits.Current);
         _petWindow?.ApplyLimits(_lastLimitsJson);
 
         if (_lastStats is not { } s)
         {
             _petWindow?.ApplyStats(default);
             _summaryItem.Text = $"{_strings.TodayTitle}: {_strings.NoData}";
-            return;
+            return Task.CompletedTask;
         }
 
         // Feed the floating pet the SAME numbers the tray shows (same poller, same moment).
@@ -1025,12 +1076,13 @@ internal sealed class TrayApplicationContext : ApplicationContext
         var cost = s.CostPartial ? "—" : symbol + (s.TodayCostUsd * rate).ToString("0.00", CultureInfo.InvariantCulture);
         var text = s.TodayTokens <= 0
             ? $"{_strings.TodayTitle}: {_strings.NoData}"
-            : $"{_strings.TodayTitle}: {UsagePoller.FormatTokens(s.TodayTokens)} {_strings.TokensUnit} · {cost}";
+            : $"{_strings.TodayTitle}: {UsagePoller.FormatTokens(s.TodayTokens, TokenUnits.UsesChinese)} {_strings.TokensUnit} · {cost}";
 
         _summaryItem.Text = text;
         // The tray-icon tooltip stays the app name (set once in the ctor). The floating
         // pet now surfaces live usage, so the hover tooltip no longer mirrors the summary.
         RefreshTrayIconForTheme();
+        return Task.CompletedTask;
     }
 
     /// <summary>Cache the dashboard's current currency natively so a cold-launched pet
@@ -1046,8 +1098,13 @@ internal sealed class TrayApplicationContext : ApplicationContext
         try
         {
             if (_dashboard is null) return;
-            var (symbol, rate) = await _dashboard.ReadCurrencyAsync();
+            var revision = ++_currencyReadRevision;
+            var currency = await _dashboard.ReadCurrencyAsync();
+            if (revision != _currencyReadRevision || currency is null) return;
+            var (symbol, rate) = currency.Value;
+            _summaryCurrency = (symbol, rate);
             Currency.Persist(symbol, rate);
+            RefreshSummary();
         }
         catch (Exception ex)
         {
@@ -1125,6 +1182,7 @@ internal sealed class TrayApplicationContext : ApplicationContext
 
     private void Quit()
     {
+        _quotaWindow?.Shutdown();
         _refreshTimer.Stop();
         _syncTimer.Stop();
         _trayIcon.Visible = false;
@@ -1139,7 +1197,9 @@ internal sealed class TrayApplicationContext : ApplicationContext
         {
             _refreshTimer.Dispose();
             _syncTimer.Dispose();
+            _updateCheckTimer.Dispose();
             _poller.Dispose();
+            SystemEvents.UserPreferenceChanged -= OnSystemUserPreferenceChanged;
             _server.Dispose();
             _trayIcon.Dispose();
             _menu.Dispose();
@@ -1148,6 +1208,7 @@ internal sealed class TrayApplicationContext : ApplicationContext
             _summaryFont?.Dispose();
             _dashboard?.Shutdown();   // WPF Window has no Dispose; really close it
             _petWindow?.Shutdown();
+            _quotaWindow?.Shutdown();
         }
         base.Dispose(disposing);
     }

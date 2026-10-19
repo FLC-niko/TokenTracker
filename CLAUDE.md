@@ -41,6 +41,7 @@ node bin/tracker.js serve --no-sync       # local dashboard server on :7680
 | Wire a provider into sync | `src/commands/sync.js` (call site + totals aggregation) + `src/commands/status.js` (status reporting) |
 | Add pricing for a model | `src/lib/pricing/curated-overrides.json` **+ the canonical edge block in `dashboard/edge-patches/tokentracker-leaderboard-refresh.ts`, copied verbatim into the other 4 edge files** (account-daily / account-summary / account-model-breakdown / leaderboard-profile). `test/edge-pricing-parity.test.js` fails on any drift. Deploy the touched edge functions after editing. |
 | Add an OpenCode Go usage-limits row | `src/lib/opencode-go-limits.js` + provider entry in `src/lib/usage-limits.js` + `PROVIDER_LIMIT_SPECS.opencodeGo` in `dashboard/src/ui/dashboard/components/usage-limits-provider-specs.js`. **Authoritative source = the official Go usage API** (`source:'api'`) using `OPENCODE_GO_API_KEY`; the signed-in dashboard scrape (`source:'web'`) remains a legacy compatibility fallback. Local `opencode.db` cost ÷ Go's dollar caps ($12/5h, $30/wk, $60/mo) is only an explicit `TOKENTRACKER_OPENCODE_GO_LOCAL_ESTIMATE=1` estimate because history cannot prove an active subscription. Reads via `readSqliteJsonRowsAsync` so the limits poll never blocks the event loop. |
+| Add a Devin usage-limits row | `src/lib/devin-limits.js` + provider entry in `src/lib/usage-limits.js` + `PROVIDER_LIMIT_SPECS.devin`. Source = official `GetPlanStatus` RPC on `server.codeium.com` via `x-auth-token` from the Devin CLI's `credentials.toml`; proto3 implicit-zero decode rules in `docs/devin-limits.md`. **Opt-in**: the provider switch defaults off; only an authenticated `?devin=1` request reaches credentials/network. |
 | Add a dashboard page | `dashboard/src/pages/` (lazy-loaded via `React.lazy()` in `App.jsx` — **except `NativeAuthCallbackPage`, which must stay eager-imported**, see Lessons learned) |
 | Add UI components | `dashboard/src/ui/dashboard/components/` |
 | Add a provider icon | `dashboard/src/ui/dashboard/components/ProviderIcon.jsx` (`PROVIDER_ICON_MAP` keyed by `source.toUpperCase()`) |
@@ -56,11 +57,12 @@ node bin/tracker.js serve --no-sync       # local dashboard server on :7680
 input_tokens                  = non-cached input only (no cache reads/writes)
 cached_input_tokens           = cache reads
 cache_creation_input_tokens   = cache writes
-reasoning_output_tokens       = reasoning tokens (Codex/every-code fold them into output_tokens for cost)
-total_tokens                  = input + output + cache_creation + cache_read + reasoning_output (sum of all columns; Gemini-style rows that omit reasoning still pass invariants if you set the column to 0)
+unclassified_input_tokens     = reported input with unknown fresh/cache split; disjoint from every other input column
+reasoning_output_tokens       = reasoning tokens (Codex/acode/every-code/OmO/Cline/Muse fold them into output_tokens for cost)
+total_tokens                  = input + unclassified_input + output + cache_creation + cache_read (+ reasoning_output when output excludes reasoning); Codex/acode/every-code/OmO/Cline/Muse keep reasoning as an informational subset because it is already included in output_tokens
 ```
 
-**Cost is computed from `input_tokens + output_tokens + cached_input_tokens + cache_creation_input_tokens + reasoning_output_tokens` only — never `total_tokens`** (`computeRowCost` in `src/lib/pricing/index.js`). If a new provider only fills `total_tokens` with input=0/output=0, the dashboard renders **$0 cost** regardless of pricing entries. Distribute the total across columns or extend `computeRowCost`.
+**Cost is computed from `input_tokens + output_tokens + cached_input_tokens + cache_creation_input_tokens + reasoning_output_tokens` only — never `total_tokens`** (`computeRowCost` in `src/lib/pricing/index.js`). Unknown cache splits belong in `unclassified_input_tokens`, not uncached input: include them in volume but return a null total cost and `cost_status: partial`, with only the provable subtotal in `known_cost_usd`. `computeKnownRowCost` prices each original row (preserving priority/long-context subsets); never re-price aggregated base columns. Cloud accounting-v3 migration and edge deployment must precede a client release that uploads this column.
 
 ### Queue entry
 
@@ -70,6 +72,7 @@ total_tokens                  = input + output + cache_creation + cache_read + r
   "source": "claude|codex|cursor|gemini|...",
   "model": "claude-opus-4-6|gpt-5.4|...",
   "input_tokens": 0, "output_tokens": 0,
+  "unclassified_input_tokens": 0,
   "cached_input_tokens": 0, "cache_creation_input_tokens": 0,
   "reasoning_output_tokens": 0,
   "total_tokens": 0, "conversation_count": 1
@@ -118,6 +121,7 @@ When the user says "release" or "发 release", that is explicit approval for the
 1. Bump the version in **one** place — `package.json` is the single source of truth. Run `npm version <X.Y.Z|patch|minor>` (or, if you edited `package.json` by hand, `npm run sync-versions`): the `version` npm-lifecycle hook runs `scripts/sync-versions.cjs`, which syncs the version into every file listed in `scripts/version-files.cjs` (`project.yml`'s two `MARKETING_VERSION` entries, the Windows `<Version>`, and the Linux `package.json` / `package-lock.json` / `Cargo.toml` / `Cargo.lock` / `tauri.conf.json` / `PKGBUILD`), then `git add`s them so they land in the version commit. They all stay in lockstep automatically — don't hand-edit any of them. (`npm version` also creates a local `vX.Y.Z` tag and a `vX.Y.Z`-style commit message rather than `chore(release): vX.Y.Z`; CI triggers on the package.json version change, not the message.)
 2. `git commit && git push origin main` → the canonical `CI` workflow runs. Only after that exact main-branch commit passes the full Linux validators + macOS tests + Windows build does `npm-publish.yml` check out the tested SHA and publish when the version is new. A failed or cancelled CI never reaches npm. **Never push the local `vX.Y.Z` tag (no `--follow-tags`)** — the release workflow creates the tag itself, and a pre-existing tag makes its `create-release` job fail with "version already consumed" (recovery: delete the remote tag, re-dispatch).
 3. For DMG-eligible changes: `gh workflow run "release (macOS + Windows + Linux)" -f version=X.Y.Z` → the macOS, Windows and Linux jobs run **in parallel**, producing the DMG, the Windows zip + installer, and — from the Linux job's single `tauri build` — the three Linux packages, each job attaching its own assets to the GitHub Release.
+   For pre-publication acceptance, add `-f publish=false`: the same six-asset and downloaded-byte `SHA256SUMS` verification runs, but the release stays a draft and Homebrew is not notified. This reserves the version tag at the workflow commit; only that exact commit can resume the draft. After acceptance, publish that verified draft under the user's release authorization; never silently move its tag or reuse the version for different code.
 4. Homebrew tap `xiufengsun/homebrew-tokentracker` self-updates via dispatch (~40s if `HOMEBREW_DISPATCH_TOKEN` set) or hourly cron (≤1h fallback). **Never edit the tap repo manually for routine releases.**
 
 Release notes: one English line, no markdown sections (`Fix token stats inflation caused by duplicate queue entries`).
@@ -164,6 +168,11 @@ After `SMAppService.mainApp.register/unregister` from the bridge (not via `Launc
 - **`contextTokensUsed`-style fields are usually snapshots, not cumulative.** PR #74 (Grok) shipped on that bad assumption.
 - **Mimo (mimocode) mirrors your Claude Code + claude-mem history into its own DB.** It's an OpenCode-fork SQLite (`~/.local/share/mimocode/mimocode.db`) but pulls `~/.claude` sessions in via `claude_import` AND a live observer/session sync — so >99% of rows are anthropic-endpoint turns the Claude parser already counts as `source=claude` (~3.9B mirrored vs ~22M genuine on the dev's box). `readMimoDbMessages()` keys off `providerID`: keep only `mimo`/`xiaomi` (mimo's own runtime); drop everything `anthropic`. That `anthropic` bucket includes mimo-named models the user ran *inside* Claude Code (e.g. `model=mimo-v2.5-pro`, logged in `~/.claude`) — so do NOT key off the model id (re-counts it) and do NOT rely on `claude_import` (misses the observer mirror).
 - **Data-migration releases**: stress-test `sync` twice consecutively after touching `sync.js` / cursor schema — second run exposes state pollution the first hides.
+
+### Skills registry mutations
+
+- **`installSkill()` downloads for minutes before it writes, so read every field from a fresh `readRegistry()` at the sync checkpoint, never from the pre-download snapshot.** The guard before `removePath(dest)` (`skills-manager.js:984`) is the last point where nothing has awaited, so existence *and* `targets` (`:982`) must both be read there. #613 refreshed existence but kept `targets` from the stale copy, so toggling an agent mid-download silently reverted it.
+- **Temp dirs use `fs.mkdtempSync` (`skills-manager.js:963`), never `${name}-${Date.now()}`.** Millisecond names collide once mutations overlap, and `removePath(temp)` then deletes the other run's in-flight download. `SkillsPage.jsx:855` serialises the UI behind an `operationInFlight` ref because `busyKey` state commits too late to block a fast second click. `/functions/tokentracker-skills` has no such lock.
 
 ### Cloud moderation (leaderboard bans / quarantine)
 

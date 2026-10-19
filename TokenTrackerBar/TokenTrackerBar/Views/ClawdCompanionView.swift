@@ -1466,6 +1466,8 @@ struct ClawdCompanionView: View {
         let window: String
         let usedPercent: Double
         let resetAt: Date?
+        /// A share of another window. Remaining mode must not redraw it as 100 − used.
+        var share: Bool = false
     }
 
     private enum PetLimitTone {
@@ -1498,13 +1500,14 @@ struct ClawdCompanionView: View {
             LimitsSettingsStore.displayNames[id] ?? id.capitalized
         }
 
-        func add(_ id: String, _ label: String, _ used: Double, _ resetAt: Date?) {
+        func add(_ id: String, _ label: String, _ used: Double, _ resetAt: Date?, share: Bool = false) {
             guard !hidden.contains(id), used.isFinite else { return }
             readings.append(PetLimitReading(
                 provider: providerName(id),
                 window: label,
                 usedPercent: min(max(used, 0), 100),
-                resetAt: resetAt
+                resetAt: resetAt,
+                share: share
             ))
         }
 
@@ -1562,8 +1565,17 @@ struct ClawdCompanionView: View {
         ])
         if let grok = limits.grok {
             generic("grok", configured: grok.configured, error: grok.error, windows: [
-                (Strings.grokPrimaryLabel(periodType: grok.periodType), grok.primaryWindow), (Strings.grokOndemandLabel, grok.secondaryWindow)
+                (Strings.grokPrimaryLabel(periodType: grok.periodType), grok.primaryWindow),
+                (Strings.grokOndemandLabel, grok.secondaryWindow),
             ])
+            if grok.configured, grok.error == nil {
+                for entry in grok.products ?? [] {
+                    guard let product = entry.product, !product.isEmpty, let window = entry.window else { continue }
+                    let label = Strings.grokProductLabel(product: product, fallback: entry.label)
+                    guard !label.isEmpty else { continue }
+                    add("grok", label, window.usedPercent, isoDate(window.resetAt), share: true)
+                }
+            }
         }
         if let copilot = limits.copilot {
             generic("copilot", configured: copilot.configured, error: copilot.error, windows: [
@@ -1595,6 +1607,11 @@ struct ClawdCompanionView: View {
                 ("Ultimate Free Calls", qoder.secondaryWindow)
             ])
         }
+        if let devin = limits.devin {
+            generic("devin", configured: devin.configured, error: devin.error, windows: [
+                ("Daily", devin.primaryWindow), ("Weekly", devin.secondaryWindow)
+            ])
+        }
 
         return readings
             .filter { $0.usedPercent > 0 && $0.usedPercent < 100 }
@@ -1609,7 +1626,7 @@ struct ClawdCompanionView: View {
     }
 
     private func petLimitDisplay(for reading: PetLimitReading) -> PetLimitDisplay {
-        let isRemaining = limitsStore.displayMode == .remaining
+        let isRemaining = limitsStore.displayMode == .remaining && !reading.share
         let value = isRemaining ? 100 - reading.usedPercent : reading.usedPercent
         let label: String
         let tone: PetLimitTone

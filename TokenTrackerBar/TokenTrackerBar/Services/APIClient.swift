@@ -27,7 +27,8 @@ actor APIClient {
     private init() {
         self.session = URLSession(configuration: LocalAPIConfiguration.makeSessionConfiguration())
 
-        let syncConfig = URLSessionConfiguration.default
+        // Same loopback target, so it needs the same system-proxy bypass.
+        let syncConfig = LocalAPIConfiguration.makeSessionConfiguration()
         syncConfig.timeoutIntervalForRequest = Self.localSyncResourceTimeout
         syncConfig.timeoutIntervalForResource = Self.localSyncResourceTimeout
         self.syncSession = URLSession(configuration: syncConfig)
@@ -103,10 +104,15 @@ actor APIClient {
 		]))
 	}
 
-    func fetchUsageLimits() async throws -> UsageLimitsResponse {
+    /// `devinEnabled` is the user's Settings provider selection. Only when it is
+    /// true does the request carry `devin=1` plus the local-auth header that
+    /// lets the server read the Devin CLI credentials; omitted means off.
+    func fetchUsageLimits(devinEnabled: Bool = false) async throws -> UsageLimitsResponse {
         try await fetch(
             "/functions/tokentracker-usage-limits",
-            requestTimeout: Self.usageLimitsRequestTimeout
+            queryItems: devinEnabled ? [URLQueryItem(name: "devin", value: "1")] : [],
+            requestTimeout: Self.usageLimitsRequestTimeout,
+            requiresLocalAuth: devinEnabled
         )
     }
 
@@ -184,12 +190,14 @@ actor APIClient {
     private func fetch<T: Decodable>(
         _ path: String,
         queryItems: [URLQueryItem] = [],
-        requestTimeout: TimeInterval? = nil
+        requestTimeout: TimeInterval? = nil,
+        requiresLocalAuth: Bool = false
     ) async throws -> T {
         let (data, _) = try await request(
             path,
             queryItems: queryItems,
-            requestTimeout: requestTimeout
+            requestTimeout: requestTimeout,
+            requiresLocalAuth: requiresLocalAuth
         )
         return try decoder.decode(T.self, from: data)
     }
@@ -197,7 +205,8 @@ actor APIClient {
     private func request(
         _ path: String,
         queryItems: [URLQueryItem] = [],
-        requestTimeout: TimeInterval? = nil
+        requestTimeout: TimeInterval? = nil,
+        requiresLocalAuth: Bool = false
     ) async throws -> (Data, HTTPURLResponse) {
         guard var components = URLComponents(string: baseURL + path) else {
             throw APIError.invalidURL
@@ -210,9 +219,14 @@ actor APIClient {
         }
         let data: Data
         let response: URLResponse
-        if let requestTimeout {
+        if requestTimeout != nil || requiresLocalAuth {
             var request = URLRequest(url: url)
-            request.timeoutInterval = requestTimeout
+            if let requestTimeout {
+                request.timeoutInterval = requestTimeout
+            }
+            if requiresLocalAuth {
+                request.setValue(try await fetchLocalAuthToken(), forHTTPHeaderField: "x-tokentracker-local-auth")
+            }
             (data, response) = try await session.data(for: request)
         } else {
             (data, response) = try await session.data(from: url)

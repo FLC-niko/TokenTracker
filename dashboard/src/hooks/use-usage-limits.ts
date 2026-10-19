@@ -1,9 +1,31 @@
-import { useCallback, useEffect, useState } from "react";
-import { getUsageLimits } from "../lib/api";
+import { useCallback, useEffect, useRef, useState } from "react";
+import { getUsageLimits, isLocalhostHost } from "../lib/api";
 import { publishUsageLimitsPreloadState } from "../lib/dashboard-preload.js";
 import { LIMIT_ALERTS_PREF_KEY } from "./use-limit-alert-prefs";
 import { sendPredictiveLimitAlerts } from "../lib/limit-alerts.js";
 import { useLatestRequestGuard } from "./use-latest-request-guard";
+import {
+  isDevinProviderSelected,
+  isLimitsPrefsStorageKey,
+  LIMITS_PREFS_CHANGED_EVENT,
+} from "./use-limits-display-prefs.js";
+
+/**
+ * Devin rows must never outlive the user's provider selection: when the
+ * switch is off the server is not asked, and any retained/preloaded payload
+ * that still carries Devin data is rewritten to the not-configured shape.
+ */
+function withoutUnselectedDevin(
+  value: UsageLimitsData | null,
+  devinSelected: boolean,
+): UsageLimitsData | null {
+  if (!value || devinSelected) return value;
+  if (!value.devin) return value;
+  // Preserve identity only for the exact empty sentinel, never a disabled
+  // payload that still carries quota windows or provider metadata.
+  if (value.devin.configured === false && Object.keys(value.devin).length === 1) return value;
+  return { ...value, devin: { configured: false } };
+}
 
 type CodexLimitWindow = {
   readonly used_percent: number;
@@ -54,9 +76,9 @@ interface UsageLimitsData {
   gemini: { configured: boolean; error?: string | null; plan_label?: string | null; account_email?: string | null; account_plan?: string | null; primary_window?: { used_percent: number; reset_at?: string | null } | null; secondary_window?: { used_percent: number; reset_at?: string | null } | null; tertiary_window?: { used_percent: number; reset_at?: string | null } | null };
   kimi: { configured: boolean; error?: string | null; plan_label?: string | null; membership_level?: string | null; subscription_type?: string | null; parallel_limit?: number | null; primary_window?: { used_percent: number; reset_at?: string | null } | null; secondary_window?: { used_percent: number; reset_at?: string | null } | null; tertiary_window?: { used_percent: number; reset_at?: string | null } | null };
   kiro: { configured: boolean; error?: string | null; plan_label?: string | null; plan_name?: string | null; primary_window?: { used_percent: number; reset_at?: string | null } | null; secondary_window?: { used_percent: number; reset_at?: string | null } | null };
-  grok: { configured: boolean; error?: string | null; plan_label?: string | null; primary_window?: { used_percent: number; reset_at?: string | null } | null; secondary_window?: { used_percent: number; reset_at?: string | null } | null };
-  antigravity: { configured: boolean; error?: string | null; plan_label?: string | null; account_email?: string | null; account_plan?: string | null; cached?: boolean; cached_at?: string | null; primary_window?: { used_percent: number; reset_at?: string | null } | null; secondary_window?: { used_percent: number; reset_at?: string | null } | null; tertiary_window?: { used_percent: number; reset_at?: string | null } | null; quaternary_window?: { used_percent: number; reset_at?: string | null } | null };
-  zcode: { configured: boolean; error?: string | null; plan_label?: string | null; plan_id?: string | null; plan_kind?: string | null; primary_window?: { used_percent: number; reset_at?: string | null } | null; secondary_window?: { used_percent: number; reset_at?: string | null } | null; tertiary_window?: { used_percent: number; reset_at?: string | null } | null };
+  grok: { configured: boolean; error?: string | null; plan_label?: string | null; period_type?: "weekly" | "daily" | "monthly" | string | null; primary_window?: { used_percent: number; reset_at?: string | null } | null; secondary_window?: { used_percent: number; reset_at?: string | null } | null; products?: Array<{ product: string; label: string; window?: { used_percent: number; reset_at?: string | null } | null }> | null };
+  antigravity: { configured: boolean; error?: string | null; plan_label?: string | null; auth_action_required?: string | null; account_email?: string | null; account_plan?: string | null; cached?: boolean; cached_at?: string | null; primary_window?: { used_percent: number; reset_at?: string | null } | null; secondary_window?: { used_percent: number; reset_at?: string | null } | null; tertiary_window?: { used_percent: number; reset_at?: string | null } | null; quaternary_window?: { used_percent: number; reset_at?: string | null } | null };
+  zcode: { configured: boolean; error?: string | null; plan_label?: string | null; plan_id?: string | null; plan_kind?: string | null; reset_credits?: { error?: string; five_hour?: Array<{ expires_at: string }>; weekly?: Array<{ expires_at: string }> }; start_plan?: { configured: boolean; error?: string | null; plan_label?: string | null; plan_kind?: string | null; buckets?: Array<{ label?: string; entitlement_id?: string; plan_name?: string | null; period?: string | null; remaining_units?: number | null; total_units?: number | null; window?: { used_percent: number; reset_at?: string | null } | null }> } | null; primary_window?: { used_percent: number; reset_at?: string | null } | null; secondary_window?: { used_percent: number; reset_at?: string | null } | null; tertiary_window?: { used_percent: number; reset_at?: string | null } | null ; buckets?: Array<{ label?: string; entitlement_id?: string; plan_name?: string | null; period?: string | null; window?: { used_percent: number; reset_at?: string | null } | null }> };
   opencodeGo: { configured: boolean; error?: string | null; plan_label?: string | null; source?: string | null; subscription_status?: "active" | "inactive" | "unknown" | null; primary_window?: { used_percent: number; reset_at?: string | null } | null; secondary_window?: { used_percent: number; reset_at?: string | null } | null; tertiary_window?: { used_percent: number; reset_at?: string | null } | null };
   qoder: {
     configured: boolean;
@@ -93,6 +115,16 @@ interface UsageLimitsData {
     cached_at?: string | null;
     source?: string | null;
   };
+  devin: {
+    configured: boolean;
+    error?: string | null;
+    plan_label?: string | null;
+    auth_action_required?: string | null;
+    primary_window?: { used_percent: number; reset_at?: string | null; limit_window_seconds?: number | null } | null;
+    secondary_window?: { used_percent: number; reset_at?: string | null; limit_window_seconds?: number | null } | null;
+    stale?: boolean;
+    cached_at?: string | null;
+  };
 }
 
 interface UsageLimitsInitialState {
@@ -108,66 +140,114 @@ interface UseUsageLimitsOptions {
 }
 
 export function useUsageLimits(options?: UseUsageLimitsOptions) {
-  const hasInitialState = Boolean(options?.initialState);
+  const localEnabled = isLocalhostHost();
+  const hasInitialState = localEnabled && Boolean(options?.initialState);
+  // The saved provider selection — the opt-in fact forwarded on every request.
+  // Kept in state so a toggle invalidates in-flight work via the
+  // latest-request guard below and re-renders with the new selection.
+  const [devinSelected, setDevinSelected] = useState(isDevinProviderSelected);
   const [data, setData] = useState<UsageLimitsData | null>(() => (
-    hasInitialState ? options?.initialState?.data ?? null : null
+    hasInitialState
+      ? withoutUnselectedDevin(
+          options?.initialState?.data ?? null,
+          isDevinProviderSelected(),
+        )
+      : null
   ));
   const [error, setError] = useState<string | null>(() => (
     hasInitialState ? options?.initialState?.error ?? null : null
   ));
-  const [isLoading, setIsLoading] = useState(!hasInitialState);
+  const [isLoading, setIsLoading] = useState(localEnabled && !hasInitialState);
   const initialRefresh = Boolean(options?.initialRefresh);
   const publishToPreloadCache = Boolean(options?.publishToPreloadCache);
   // Mount/cache reads and an explicit refresh can overlap (for example when a
   // user clicks Refresh while the dashboard's preload request is still
   // resolving). Keep only the newest response. Without this guard a slower
   // cache response can overwrite fresh limits fetched by the manual request.
-  const beginRequest = useLatestRequestGuard([]);
+  // The selection is a guard dependency: flipping the Devin switch
+  // invalidates every request issued under the previous selection, so a late
+  // response fetched while it was enabled can never republish Devin rows.
+  const beginRequest = useLatestRequestGuard([devinSelected, localEnabled]);
+
+  // Re-read the saved selection when limits preferences change. Same-window
+  // toggles and native-mirror writes arrive via LIMITS_PREFS_CHANGED_EVENT;
+  // cross-tab changes arrive via the storage event.
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    const syncSelection = () => setDevinSelected(isDevinProviderSelected());
+    const onStorage = (event: StorageEvent) => {
+      if (isLimitsPrefsStorageKey(event.key)) syncSelection();
+    };
+    window.addEventListener(LIMITS_PREFS_CHANGED_EVENT, syncSelection);
+    window.addEventListener("storage", onStorage);
+    return () => {
+      window.removeEventListener(LIMITS_PREFS_CHANGED_EVENT, syncSelection);
+      window.removeEventListener("storage", onStorage);
+    };
+  }, []);
 
   useEffect(() => {
-    if (!data || typeof window === "undefined") return;
+    if (!localEnabled || !data || typeof window === "undefined") return;
     try {
       if (window.localStorage.getItem(LIMIT_ALERTS_PREF_KEY) === "1") {
         sendPredictiveLimitAlerts(data);
       }
     } catch { /* restricted webview */ }
-  }, [data]);
+  }, [data, localEnabled]);
 
   const publishSuccessfulState = useCallback(
     (value: UsageLimitsData | null, source: "page-load" | "manual-refresh") => {
-      if (!publishToPreloadCache || !value || typeof value !== "object") return;
-      publishUsageLimitsPreloadState(value, { source });
+      if (!localEnabled || !publishToPreloadCache || !value || typeof value !== "object") return;
+      publishUsageLimitsPreloadState(
+        withoutUnselectedDevin(value, isDevinProviderSelected()),
+        { source },
+      );
     },
-    [publishToPreloadCache],
+    [localEnabled, publishToPreloadCache],
   );
 
-  const refresh = useCallback(async () => {
+  // Forced manual refresh. Resolves with the payload that was applied (the
+  // same object handed to setData, so a caller can read `fetched_at` off it),
+  // or null when nothing new was applied — fetch failure, a superseded
+  // request, or a non-local host. Callers that just want the refresh keep
+  // working: the previous contract was Promise<void>.
+  const refresh = useCallback(async (): Promise<UsageLimitsData | null> => {
+    if (!localEnabled) return null;
     const isCurrent = beginRequest();
     try {
-      const res = await getUsageLimits({ refresh: true });
-      if (!isCurrent()) return;
+      const res = await getUsageLimits({
+        refresh: true,
+        devinEnabled: isDevinProviderSelected(),
+      });
+      if (!isCurrent()) return null;
       const nextData = res && typeof res === "object" ? res as UsageLimitsData : null;
-      setData(nextData);
+      const next = withoutUnselectedDevin(nextData, isDevinProviderSelected());
+      setData(next);
       setError(null);
       setIsLoading(false);
-      publishSuccessfulState(nextData, "manual-refresh");
+      publishSuccessfulState(next, "manual-refresh");
+      return next;
     } catch (err) {
-      if (!isCurrent()) return;
+      if (!isCurrent()) return null;
       setError((err as Error)?.message || String(err));
       setIsLoading(false);
+      return null;
     }
-  }, [beginRequest, publishSuccessfulState]);
+  }, [beginRequest, localEnabled, publishSuccessfulState]);
 
   const refreshFromServerCache = useCallback(async () => {
+    if (!localEnabled) return;
     const isCurrent = beginRequest();
     try {
       // Non-forcing read: serve from the server's cache rather than hitting
       // upstream providers, mirroring the mount fetch (forcing on every focus
       // is what tripped Claude's OAuth usage endpoint rate limit).
-      const res = await getUsageLimits();
+      const res = await getUsageLimits({
+        devinEnabled: isDevinProviderSelected(),
+      });
       if (!isCurrent()) return;
       const nextData = res && typeof res === "object" ? res as UsageLimitsData : null;
-      setData(nextData);
+      setData(withoutUnselectedDevin(nextData, isDevinProviderSelected()));
       setError(null);
       setIsLoading(false);
       publishSuccessfulState(nextData, "page-load");
@@ -176,13 +256,13 @@ export function useUsageLimits(options?: UseUsageLimitsOptions) {
       setError((err as Error)?.message || String(err));
       setIsLoading(false);
     }
-  }, [beginRequest, publishSuccessfulState]);
+  }, [beginRequest, localEnabled, publishSuccessfulState]);
 
   // Auto-refresh when the dashboard regains focus / becomes visible again —
   // same throttled pattern as use-usage-data.ts, so a left-open Limits page
   // picks up new window utilization without a manual reload.
   useEffect(() => {
-    if (typeof window === "undefined" || typeof document === "undefined") return;
+    if (!localEnabled || typeof window === "undefined" || typeof document === "undefined") return;
     const MIN_GAP_MS = 15_000;
     let lastAt = Date.now(); // mount already fired the initial fetch below
     const maybeRefresh = () => {
@@ -198,9 +278,29 @@ export function useUsageLimits(options?: UseUsageLimitsOptions) {
       window.removeEventListener("focus", maybeRefresh);
       document.removeEventListener("visibilitychange", maybeRefresh);
     };
-  }, [refreshFromServerCache]);
+  }, [localEnabled, refreshFromServerCache]);
+
+  // A selection change invalidates in-flight work via the guard dependency,
+  // drops retained Devin rows immediately when the provider was turned off,
+  // and re-reads the server cache under the new selection.
+  const previousDevinSelected = useRef(devinSelected);
+  useEffect(() => {
+    if (previousDevinSelected.current === devinSelected) return;
+    previousDevinSelected.current = devinSelected;
+    if (!localEnabled) return;
+    if (!devinSelected) {
+      setData((current) => withoutUnselectedDevin(current, false));
+    }
+    void refreshFromServerCache();
+  }, [devinSelected, localEnabled, refreshFromServerCache]);
 
   useEffect(() => {
+    if (!localEnabled) {
+      setData(null);
+      setError(null);
+      setIsLoading(false);
+      return;
+    }
     if (hasInitialState && !initialRefresh) return;
     const isCurrent = beginRequest();
     (async () => {
@@ -208,10 +308,12 @@ export function useUsageLimits(options?: UseUsageLimitsOptions) {
         // Mount fetch reads the server's cache (in-memory + disk-backed) rather than forcing
         // a live upstream call on every navigation — that repeated forcing is what tripped
         // Claude's OAuth usage endpoint rate limit. Only the manual refresh() forces upstream.
-        const res = await getUsageLimits();
+        const res = await getUsageLimits({
+          devinEnabled: isDevinProviderSelected(),
+        });
         if (!isCurrent()) return;
         const nextData = res && typeof res === "object" ? res as UsageLimitsData : null;
-        setData(nextData);
+        setData(withoutUnselectedDevin(nextData, isDevinProviderSelected()));
         setError(null);
         publishSuccessfulState(nextData, "page-load");
       } catch (err) {
@@ -221,7 +323,7 @@ export function useUsageLimits(options?: UseUsageLimitsOptions) {
         if (isCurrent()) setIsLoading(false);
       }
     })();
-  }, [beginRequest, hasInitialState, initialRefresh, publishSuccessfulState]);
+  }, [beginRequest, hasInitialState, initialRefresh, localEnabled, publishSuccessfulState]);
 
   return { data, error, isLoading, refresh };
 }

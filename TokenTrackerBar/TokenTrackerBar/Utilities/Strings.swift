@@ -90,6 +90,21 @@ enum Strings {
         default: return grokMonthLabel
         }
     }
+
+    /// Product-share row. Known billing ids use the same names as the dashboard;
+    /// anything else falls back to the server label.
+    static func grokProductLabel(product: String, fallback: String?) -> String {
+        switch product {
+        case "GrokBuild": return t("Grok Build", "Grok Build", "Grok Build", "Grok Build", "Grok Build")
+        case "GrokBot": return cursorGrokBotLabel
+        case "GrokChat": return t("Chat", "聊天", "聊天", "チャット", "채팅")
+        case "GrokImagine": return t("Imagine", "Imagine", "Imagine", "Imagine", "Imagine")
+        case "Cursor": return t("Cursor", "Cursor", "Cursor", "Cursor", "Cursor")
+        default:
+            let trimmed = fallback?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            return trimmed.isEmpty ? product : trimmed
+        }
+    }
     static var limitResetNow: String { t("now", "现在", "現在", "今", "지금") }
     static func kimiParallelLabel(_ count: Int) -> String {
         t("Parallel: \(count)", "并发：\(count)", "併發：\(count)", "並列：\(count)", "병렬: \(count)")
@@ -313,6 +328,22 @@ enum Strings {
         t("Failed to launch server: \(error)", "启动服务失败：\(error)", "啟動服務失敗：\(error)", "サーバーの起動に失敗しました：\(error)", "서버 실행에 실패했습니다: \(error)")
     }
     static var serverBecameUnreachable: String { t("Server became unreachable.", "服务已不可访问。", "服務已不可訪問。", "サーバーに接続できなくなりました。", "서버에 연결할 수 없게 되었습니다.") }
+
+    static var dashboardLoadFailedTitle: String {
+        t("Couldn't Load Dashboard", "无法加载仪表盘", "無法載入儀表盤", "ダッシュボードを読み込めませんでした", "대시보드를 불러오지 못했습니다")
+    }
+    static func dashboardLoadFailedReason(_ reason: String) -> String {
+        t("Reason: \(reason)", "原因：\(reason)", "原因：\(reason)", "原因：\(reason)", "원인: \(reason)")
+    }
+    static var dashboardLoadFailedProxyHint: String {
+        t(
+            "If a system proxy or VPN is running, add localhost and 127.0.0.1 to its bypass list, then retry.",
+            "如果开启了系统代理或 VPN，请把 localhost 和 127.0.0.1 加入绕过列表后重试。",
+            "如果開啟了系統代理或 VPN，請把 localhost 和 127.0.0.1 加入繞過清單後重試。",
+            "システムプロキシや VPN を使用している場合は、localhost と 127.0.0.1 をバイパスリストに追加してから再試行してください。",
+            "시스템 프록시나 VPN을 사용 중이라면 localhost와 127.0.0.1을 우회 목록에 추가한 뒤 다시 시도하세요."
+        )
+    }
 
     static var updateChecking: String { t("Checking for updates...", "正在检查更新...", "正在檢查更新...", "アップデートを確認中...", "업데이트 확인 중...") }
     static func updateSkipped(target: String, current: String) -> String {

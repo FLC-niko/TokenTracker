@@ -4,15 +4,13 @@ using System.IO.Pipes;
 namespace TokenTrackerWin;
 
 /// <summary>
-/// Single-instance deep-link forwarding. The first launch owns a named pipe and listens
-/// for messages; a second launch (e.g. Windows starting the app to handle a
-/// <c>tokentracker://</c> deep link) connects, forwards its argument, and exits. This
-/// lets the OAuth callback reach the already-running tray instance — the Windows
-/// analogue of macOS <c>application(_:open:)</c>.
+/// Single-instance activation and deep-link forwarding. Subsequent manual launches
+/// bring the dashboard forward; <c>tokentracker://</c> links retain their own handler.
 /// </summary>
 internal static class SingleInstance
 {
     private const string PipeName = "TokenTracker.Windows.Tray.DeepLink";
+    public const string ActivateMessage = "activate";
 
     /// <summary>
     /// Try to hand <paramref name="payload"/> to an already-running instance. Returns
@@ -33,11 +31,10 @@ internal static class SingleInstance
     }
 
     /// <summary>
-    /// Start listening (primary instance only). <paramref name="onPayload"/> is invoked
-    /// on a thread-pool thread for each forwarded message; the handler must marshal to
-    /// the UI thread itself.
+    /// Start listening (primary instance only). Handlers run on a thread-pool thread
+    /// and must marshal to the UI thread themselves.
     /// </summary>
-    public static void StartListener(Action<string> onPayload, CancellationToken token)
+    public static void StartListener(Action onActivate, Action<string> onDeepLink, CancellationToken token)
     {
         _ = Task.Run(async () =>
         {
@@ -51,7 +48,8 @@ internal static class SingleInstance
                     await server.WaitForConnectionAsync(token);
                     using var reader = new StreamReader(server);
                     var line = await reader.ReadLineAsync();
-                    if (!string.IsNullOrWhiteSpace(line)) onPayload(line);
+                    if (line == ActivateMessage) onActivate();
+                    else if (!string.IsNullOrWhiteSpace(line)) onDeepLink(line);
                 }
                 catch (OperationCanceledException) { break; }
                 catch { /* drop this connection, keep listening */ }

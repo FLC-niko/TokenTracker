@@ -21,7 +21,7 @@ impl DashboardBaseUrl {
         }
     }
 
-    fn get(&self) -> Option<String> {
+    pub fn get(&self) -> Option<String> {
         self.0.lock().ok()?.clone()
     }
 }
@@ -149,6 +149,33 @@ fn run_command_with_timeout(
     }
 }
 
+/// Refresh GIO's desktop database for the directory holding our `.desktop`.
+///
+/// `xdg-mime default` edits `mimeapps.list` only, but portals and app choosers
+/// resolve the callback scheme by enumerating *registered* handlers from
+/// `mimeinfo.cache`. Without this refresh the association reads back correctly
+/// from `xdg-mime query` yet no application is found to open `tokentracker://`,
+/// so browser sign-in dies at the system-browser handoff.
+///
+/// Best-effort: `update-desktop-database` lives in `desktop-file-utils` and may
+/// be absent, and a missing cache does not invalidate the `mimeapps.list`
+/// association, so a failure is logged rather than fatal.
+fn refresh_desktop_database(applications_dir: &Path) {
+    match run_command_with_timeout(
+        Command::new("update-desktop-database").arg(applications_dir),
+        "update-desktop-database refresh",
+        Duration::from_secs(3),
+    ) {
+        Ok(output) if output.status.success() => {}
+        Ok(output) => eprintln!(
+            "[TokenTracker] update-desktop-database exited with {}: {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        ),
+        Err(error) => eprintln!("[TokenTracker] could not refresh the desktop database: {error}"),
+    }
+}
+
 /// Register the custom callback scheme for a directly launched AppImage.
 ///
 /// Arch installs the repository's desktop file system-wide. A bare AppImage
@@ -189,6 +216,12 @@ pub fn ensure_appimage_protocol_registration() -> Result<bool, String> {
             String::from_utf8_lossy(&registration.stderr).trim()
         ));
     }
+
+    // `xdg-mime default` is not enough on its own: the browser opens the
+    // callback scheme through the desktop portal, which only offers handlers
+    // listed in the desktop database. Regenerate it so the entry just written
+    // is discoverable.
+    refresh_desktop_database(&applications_dir);
 
     let query = run_command_with_timeout(
         Command::new("xdg-mime").args(["query", "default", "x-scheme-handler/tokentracker"]),
@@ -243,12 +276,19 @@ mod appimage_registration_tests {
         let started = Instant::now();
         let mut command = Command::new("sh");
         command
-            .args(["-c", "sleep 10 & echo $! > \"$1\"; wait", "sh"])
+            .args([
+                "-c",
+                "sleep 10 & printf '%s\\n' \"$!\" > \"$1.tmp\"; mv \"$1.tmp\" \"$1\"; wait",
+                "sh",
+            ])
             .arg(&pid_path);
+        // A busy CI runner can take longer than 250 ms to start the shell and
+        // record its child. Use the production registration deadline so the
+        // test exercises process-group cleanup, not scheduler startup speed.
         let result =
-            run_command_with_timeout(&mut command, "timeout probe", Duration::from_millis(250));
+            run_command_with_timeout(&mut command, "timeout probe", Duration::from_secs(3));
         assert!(result.unwrap_err().contains("timed out"));
-        assert!(started.elapsed() < Duration::from_secs(2));
+        assert!(started.elapsed() < Duration::from_secs(5));
 
         let descendant_pid: libc::pid_t = fs::read_to_string(&pid_path)
             .expect("background child pid should be recorded before timeout")

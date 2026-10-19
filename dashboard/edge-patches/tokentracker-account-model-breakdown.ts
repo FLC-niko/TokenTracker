@@ -3,8 +3,9 @@
  * Mirrors local-api.js `tokentracker-usage-model-breakdown` response schema.
  */
 import { createClient } from "npm:@insforge/sdk";
+import { cloudReadAccess, cloudFailure, cloudHistoryFailure } from "./cloud/access.ts";
 
-const SOURCES_WITH_AUTHORITATIVE_COST = new Set(["grok"]);
+const SOURCES_WITH_AUTHORITATIVE_COST = new Set(["grok", "cline"]);
 
 const corsHeaders = {
   "Access-Control-Allow-Origin": "*",
@@ -12,11 +13,69 @@ const corsHeaders = {
   "Access-Control-Allow-Headers": "Content-Type, Authorization, apikey",
 };
 
+/**
+ * The legacy /functions gateway decompresses encoded edge responses and sends
+ * identity to clients. On 2026-09-20 its public leaderboard response stayed
+ * 77529 bytes with or without gzip; encoding was stripped and length/ETag were
+ * recomputed over the plain body. The verified direct function2 route now
+ * preserves gzip. The response wrapper negotiates that transfer encoding after
+ * the existing handler; legacy clients still receive the original JSON body.
+ */
 function json(data: unknown, status = 200) {
   return new Response(JSON.stringify(data), {
     status,
     headers: { ...corsHeaders, "Content-Type": "application/json" },
   });
+}
+
+function acceptsGzip(value: string | null): boolean {
+  let gzip: number | null = null;
+  let wildcard = 0;
+  let identity: number | null = null;
+  for (const entry of (value || "").split(",")) {
+    const [coding, ...parameters] = entry.trim().toLowerCase().split(";");
+    const name = coding.trim();
+    const weight = parameters.find((part) => /^\s*q\s*=/.test(part));
+    const parsed = weight === undefined ? 1 : Number(weight.split("=")[1].trim());
+    const quality = Number.isFinite(parsed) && parsed >= 0 && parsed <= 1 ? parsed : 0;
+    if (name === "gzip") gzip = gzip === null ? quality : Math.min(gzip, quality);
+    if (name === "*") wildcard = quality;
+    if (name === "identity") identity = quality;
+  }
+  const quality = gzip ?? wildcard;
+  return quality > 0 && (identity === null || quality >= identity);
+}
+
+async function encodeJsonResponse(req: Request, response: Response): Promise<Response> {
+  if (req.method !== "GET" || response.status !== 200 ||
+      !response.headers.get("Content-Type")?.toLowerCase().startsWith("application/json") ||
+      response.headers.has("Content-Encoding") || response.headers.has("Content-Range") ||
+      /\bno-transform\b/i.test(response.headers.get("Cache-Control") || "")) return response;
+  const headers = new Headers(response.headers);
+  if (!(headers.get("Vary") || "").split(",").some((part) => part.trim().toLowerCase() === "accept-encoding")) {
+    headers.append("Vary", "Accept-Encoding");
+  }
+  const identity = () => new Response(response.body, {
+    status: response.status, statusText: response.statusText, headers,
+  });
+  if (!acceptsGzip(req.headers.get("Accept-Encoding")) || typeof CompressionStream === "undefined") return identity();
+  try {
+    const bytes = new Uint8Array(await response.clone().arrayBuffer());
+    if (bytes.byteLength < 1024) return identity();
+    const compressed = new Uint8Array(await new Response(
+      new Response(bytes).body!.pipeThrough(new CompressionStream("gzip")),
+    ).arrayBuffer());
+    if (compressed.byteLength >= bytes.byteLength) return identity();
+    const encodedHeaders = new Headers(headers);
+    encodedHeaders.set("Content-Encoding", "gzip");
+    encodedHeaders.set("Content-Length", String(compressed.byteLength));
+    encodedHeaders.delete("ETag");
+    return new Response(compressed, {
+      status: response.status, statusText: response.statusText, headers: encodedHeaders,
+    });
+  } catch {
+    return identity();
+  }
 }
 
 /**
@@ -107,7 +166,10 @@ const MODEL_PRICING: Record<string, { input: number; output: number; cache_read:
   "claude-opus-5-fast": { input: 10, output: 50, cache_read: 1, cache_write: 12.5 },
   "claude-opus-4-6": { input: 5, output: 25, cache_read: 0.5, cache_write: 6.25 },
   "claude-opus-4-5-20250414": { input: 5, output: 25, cache_read: 0.5, cache_write: 6.25 },
-  "claude-sonnet-5": { input: 3, output: 15, cache_read: 0.3, cache_write: 3.75 },
+  "claude-sonnet-5": { input: 2, output: 10, cache_read: 0.2, cache_write: 2.5 },
+  "claude-opus-5-5": { input: 4, output: 20, cache_read: 0.2, cache_write: 5 },
+  "claude-sonnet-5-5": { input: 2, output: 10, cache_read: 0.1, cache_write: 2.5 },
+  "k3-256k": { input: 3, output: 15, cache_read: 0.3 },
   "claude-sonnet-4-6": { input: 3, output: 15, cache_read: 0.3, cache_write: 3.75 },
   "claude-sonnet-4-5-20250514": { input: 3, output: 15, cache_read: 0.3, cache_write: 3.75 },
   "claude-sonnet-4-20250514": { input: 3, output: 15, cache_read: 0.3, cache_write: 3.75 },
@@ -156,6 +218,12 @@ const MODEL_PRICING: Record<string, { input: number; output: number; cache_read:
   // Cloud buckets do not retain per-request context/service tier. Use the
   // standard short-context estimate; never infer long context from totals.
   "gpt-6-astra": { input: 10, output: 50, cache_read: 1, cache_write: 12.5 },
+  // GPT-6 Sol Standard USD/MTok, verified 2026-09-24:
+  // https://developers.openai.com/api/docs/models/gpt-6-sol
+  "gpt-6-sol": { input: 2, output: 10, cache_read: 0.2, cache_write: 2.5 },
+  // GPT-6.1 Sol Standard pricing (issue #737), verified 2026-10-02.
+  // https://developers.openai.com/api/docs/models/gpt-6.1-sol
+  "gpt-6.1-sol": { input: 2, output: 10, cache_read: 0.1, cache_write: 2.5 },
   "gpt-5-mini": { input: 0.25, output: 2, cache_read: 0.025 },
   "o3": { input: 2, output: 8, cache_read: 0.5 },
   // ── Google Gemini ──
@@ -171,6 +239,10 @@ const MODEL_PRICING: Record<string, { input: number; output: number; cache_read:
   "composer-1.5": { input: 3.5, output: 17.5, cache_read: 0.35 },
   "composer-2": { input: 0.5, output: 2.5, cache_read: 0.2 },
   "composer-2-fast": { input: 1.5, output: 7.5, cache_read: 0.15 },
+  "composer-2.5": { input: 0.5, output: 2.5, cache_read: 0.2 },
+  "composer-2.5-fast": { input: 3, output: 15, cache_read: 0.5 },
+  // Google Gemini 4 Argon (Cursor Other Models / Google introductory list rate)
+  "gemini-4-argon": { input: 2, output: 10, cache_read: 0.1, cache_write: 0 },
   // ── Moonshot Kimi ──
   "kimi-for-coding": { input: 0.6, output: 2, cache_read: 0.15 },
   "kimi-k2.5": { input: 0.6, output: 2, cache_read: 0.15 },
@@ -212,6 +284,11 @@ const MODEL_PRICING: Record<string, { input: number; output: number; cache_read:
   "deepseek-v4-flash": { input: 0.44, output: 1.32, cache_read: 0.014, cache_write: 0.44 },
   "deepseek-v4-pro": { input: 1.32, output: 3.96, cache_read: 0.044, cache_write: 1.32 },
   "deepseek-v4-flash-vision-exp": { input: 0.44, output: 1.32, cache_read: 0.014, cache_write: 0.44 },
+  // DeepSeek V4.1 Flash (official id deepseek-flash, released 2026-09-10):
+  // $0.30 / $1.20 / $0.006 cache read per MTok peak; getRowPricing halves it
+  // off-peak. deepseek-v4.1-flash is the OpenRouter / Command Code / WorkBuddy id.
+  "deepseek-v4.1-flash": { input: 0.3, output: 1.2, cache_read: 0.006, cache_write: 0.3 },
+  "deepseek-flash": { input: 0.3, output: 1.2, cache_read: 0.006, cache_write: 0.3 },
   "deepseek-chat": { input: 0.14, output: 0.28, cache_read: 0.0028, cache_write: 0.14 },
   "deepseek-reasoner": { input: 0.14, output: 0.28, cache_read: 0.0028, cache_write: 0.14 },
   // ── xAI Grok (mirrored from src/lib/pricing/curated-overrides.json;
@@ -220,6 +297,10 @@ const MODEL_PRICING: Record<string, { input: number; output: number; cache_read:
   "grok-build": { input: 1.25, output: 2.50, cache_read: 0.20 },
   "cursor-grok-4.5": { input: 2, output: 6, cache_read: 0.5, cache_write: 0 },
   "cursor-grok-4.5-fast": { input: 4, output: 18, cache_read: 1, cache_write: 0 },
+  "cursor-grok-4.6": { input: 2, output: 6, cache_read: 0.5, cache_write: 0 },
+  "cursor-grok-4.6-fast": { input: 4, output: 12, cache_read: 1, cache_write: 0 },
+  "cursor-grok-4.7": { input: 2, output: 6, cache_read: 0.5, cache_write: 0 },
+  "cursor-grok-4.7-fast": { input: 4, output: 12, cache_read: 1, cache_write: 0 },
   "grok-4-0709": { input: 3.00, output: 15.00, cache_read: 0.75 },
   "grok-4": { input: 3.00, output: 15.00, cache_read: 0.75 },
   "grok-4-latest": { input: 3.00, output: 15.00, cache_read: 0.75 },
@@ -237,6 +318,11 @@ const MODEL_PRICING: Record<string, { input: number; output: number; cache_read:
   //    converted at ~7.2 RMB/USD. DeepSeek-style cache: cache_write = input. ──
   "hy3-preview-agent": { input: 0.167, output: 0.556, cache_read: 0.056, cache_write: 0.167 },
   "hy3-preview": { input: 0.167, output: 0.556, cache_read: 0.056, cache_write: 0.167 },
+  // Hy4 preview: 6 / 0.3 (cache hit) / 18 RMB per MTok at ~7.2 RMB/USD (#633).
+  // Alibaba Model Studio Singapore reference rates; see curated-overrides.json (#715).
+  "qwen3.8-flash": { input: 0.15, output: 0.47, cache_read: 0.016, cache_write: 0.2 },
+  "hy4-preview": { input: 0.833, output: 2.5, cache_read: 0.042, cache_write: 0.833 },
+  "hy4-preview-agent": { input: 0.833, output: 2.5, cache_read: 0.042, cache_write: 0.833 },
   // ── Misc / Free ──
   "glm-4.7-free": { input: 0, output: 0, cache_read: 0 },
   "nemotron-3-super-free": { input: 0, output: 0, cache_read: 0 },
@@ -273,21 +359,119 @@ const MODEL_PRICING: Record<string, { input: number; output: number; cache_read:
   "step-3.5-flash": { input: 0.1, output: 0.3, cache_read: 0.02, cache_write: 0.1 },
 };
 const ZERO_PRICING = { input: 0, output: 0, cache_read: 0, cache_write: 0 };
+// iFlytek MaaS prices used by the AStudio source: RMB per million tokens,
+// converted at 7.2 RMB/USD and rounded to two decimal places. Models without a cache-hit
+// price use the regular input price; cache writes use the regular input price as well.
+// AStudio homepage: https://agent.xfyun.cn/
+// Official pricing source: https://maas.xfyun.cn/modelSquare
+const IFLYTEK_MAAS_MODEL_PRICING: Record<string, { input: number; output: number; cache_read: number; cache_write?: number }> = {
+  "spark-x2.5": { input: 0.13, output: 0.50, cache_read: 0.02, cache_write: 0.13 },
+  "spark-x2.5-4b": { input: 0.00, output: 0.00, cache_read: 0.00, cache_write: 0.00 },
+  "spark-x2.5-1.7b": { input: 0.00, output: 0.00, cache_read: 0.00, cache_write: 0.00 },
+  "xopglm53": { input: 1.11, output: 3.89, cache_read: 0.28, cache_write: 1.11 },
+  "xopdeepseekv4pro0813": { input: 1.25, output: 3.75, cache_read: 0.04, cache_write: 1.25 },
+  "xopdeepseekv4flash0731": { input: 0.14, output: 0.28, cache_read: 0.03, cache_write: 0.14 },
+  "xopkimik27code": { input: 0.90, output: 3.75, cache_read: 0.90, cache_write: 0.90 },
+  "xopglm52": { input: 1.11, output: 3.89, cache_read: 0.28, cache_write: 1.11 },
+  "xopdeepseekv4flash": { input: 0.14, output: 0.28, cache_read: 0.03, cache_write: 0.14 },
+  "xopkimik26": { input: 0.90, output: 3.75, cache_read: 0.18, cache_write: 0.90 },
+  "xopdeepseekv4pro": { input: 1.67, output: 3.33, cache_read: 0.14, cache_write: 1.67 },
+  "xopqwen36v35b": { input: 0.15, output: 0.90, cache_read: 0.15, cache_write: 0.15 },
+  "xophunyuan7bmt": { input: 0.07, output: 0.28, cache_read: 0.07, cache_write: 0.07 },
+  "xoppaddleocrv16": { input: 0.00, output: 0.00, cache_read: 0.00, cache_write: 0.00 },
+  "xsparkx2flash": { input: 0.14, output: 0.28, cache_read: 0.14, cache_write: 0.14 },
+  "xopglm51": { input: 1.11, output: 3.89, cache_read: 0.22, cache_write: 1.11 },
+  "xsparkx2": { input: 0.42, output: 0.42, cache_read: 0.42, cache_write: 0.42 },
+  "xop35qwen2b": { input: 0.03, output: 0.06, cache_read: 0.03, cache_write: 0.03 },
+  "xopqwen35397b": { input: 0.17, output: 1.00, cache_read: 0.17, cache_write: 0.17 },
+  "xminimaxm25": { input: 0.29, output: 1.17, cache_read: 0.29, cache_write: 0.29 },
+  "xopglm5": { input: 0.83, output: 3.06, cache_read: 0.17, cache_write: 0.83 },
+  "xopkimik25": { input: 0.56, output: 2.92, cache_read: 0.56, cache_write: 0.56 },
+  "xopdeepseekv32": { input: 0.14, output: 0.21, cache_read: 0.14, cache_write: 0.14 },
+  "xop3qwencodernext": { input: 0.35, output: 1.39, cache_read: 0.35, cache_write: 0.35 },
+  "xopglmv47flash": { input: 0.14, output: 0.21, cache_read: 0.14, cache_write: 0.14 },
+  "xopglm47blth2": { input: 0.56, output: 2.22, cache_read: 0.56, cache_write: 0.56 },
+  "xop3qwen32bvl": { input: 0.28, output: 1.11, cache_read: 0.28, cache_write: 0.28 },
+  "xopdeepseekocr": { input: 0.00, output: 0.00, cache_read: 0.00, cache_write: 0.00 },
+  "xophunyuanocr": { input: 0.00, output: 0.00, cache_read: 0.00, cache_write: 0.00 },
+  "xop3qwen80bnext": { input: 0.08, output: 0.33, cache_read: 0.08, cache_write: 0.08 },
+  "xop3qwen235b2507": { input: 0.17, output: 1.67, cache_read: 0.17, cache_write: 0.17 },
+  "xop3qwen30b2507": { input: 0.06, output: 0.63, cache_read: 0.06, cache_write: 0.06 },
+  "xop3qwen235b": { input: 0.17, output: 1.67, cache_read: 0.17, cache_write: 0.17 },
+  "xop3qwen30b": { input: 0.06, output: 0.63, cache_read: 0.06, cache_write: 0.06 },
+  "xop3qwen32b": { input: 0.17, output: 1.67, cache_read: 0.17, cache_write: 0.17 },
+  "xdeepseekv3": { input: 0.22, output: 0.89, cache_read: 0.22, cache_write: 0.22 },
+  "xdeepseekr1": { input: 0.44, output: 1.78, cache_read: 0.44, cache_write: 0.44 },
+  "xdeepseekr1qwen32b": { input: 0.22, output: 0.67, cache_read: 0.22, cache_write: 0.22 },
+  "xopkimik2blth": { input: 0.56, output: 2.22, cache_read: 0.56, cache_write: 0.56 },
+  "xopkimik2blins": { input: 0.56, output: 2.22, cache_read: 0.56, cache_write: 0.56 },
+  "xop3qwen8breranker": { input: 0.00, output: 0.00, cache_read: 0.00, cache_write: 0.00 },
+  "xop3qwen8bembedding": { input: 0.00, output: 0.00, cache_read: 0.00, cache_write: 0.00 },
+  "xop3qwen0b6": { input: 0.04, output: 0.42, cache_read: 0.04, cache_write: 0.04 },
+  "xop3qwen4b": { input: 0.04, output: 0.42, cache_read: 0.04, cache_write: 0.04 },
+  "xqwen257bchat": { input: 0.07, output: 0.14, cache_read: 0.07, cache_write: 0.07 },
+  "xop3qwen14b": { input: 0.14, output: 1.39, cache_read: 0.14, cache_write: 0.14 },
+  "xop3qwen8b": { input: 0.07, output: 0.69, cache_read: 0.07, cache_write: 0.07 },
+  "xsparkprox": { input: 1.11, output: 5.56, cache_read: 1.11, cache_write: 1.11 },
+  "xspark13b6k": { input: 0.28, output: 0.83, cache_read: 0.28, cache_write: 0.28 },
+  "spark mini": { input: 0.28, output: 1.11, cache_read: 0.28, cache_write: 0.28 },
+  "spark mini instruct": { input: 0.28, output: 1.11, cache_read: 0.28, cache_write: 0.28 },
+  "spark tiny": { input: 0.28, output: 1.11, cache_read: 0.28, cache_write: 0.28 },
+  "internlm2.5_7b_chat": { input: 0.28, output: 1.11, cache_read: 0.28, cache_write: 0.28 },
+  "internlm2.5_1.8b_chat": { input: 0.28, output: 1.11, cache_read: 0.28, cache_write: 0.28 },
+  "qwen_v2.5_7b_base": { input: 0.28, output: 1.11, cache_read: 0.28, cache_write: 0.28 },
+  "xsqwen2d53b": { input: 0.28, output: 1.11, cache_read: 0.28, cache_write: 0.28 },
+  "qwen_v2.5_3b_base": { input: 0.28, output: 1.11, cache_read: 0.28, cache_write: 0.28 },
+  "qwen_v2.5_1.5b_instruct": { input: 0.28, output: 1.11, cache_read: 0.28, cache_write: 0.28 },
+  "qwen_v2.5_1.5b_base": { input: 0.28, output: 1.11, cache_read: 0.28, cache_write: 0.28 },
+  "qwen_v2.5_0.5b_instruct": { input: 0.28, output: 1.11, cache_read: 0.28, cache_write: 0.28 },
+  "qwen_v2.5_0.5b_base": { input: 0.28, output: 1.11, cache_read: 0.28, cache_write: 0.28 },
+  "xsqwenv2s1b5c": { input: 0.14, output: 0.28, cache_read: 0.14, cache_write: 0.14 },
+  "xsqwenv2s0b5c": { input: 0.28, output: 0.56, cache_read: 0.28, cache_write: 0.28 },
+  "xqwen14bchat": { input: 0.28, output: 0.83, cache_read: 0.28, cache_write: 0.28 },
+};
+function normalizeIFlytekMaasModel(model: string) {
+  const lower = model.trim().toLowerCase();
+  if (lower === "xsparkx2agent") return "xsparkx2";
+  return lower;
+}
 
-function getModelPricing(model: string) {
+function getModelPricing(model: string, source = "") {
   if (!model) return ZERO_PRICING;
+  if (source.toLowerCase() === "workbuddy-ai" && model.trim().toLowerCase() === "auto") return ZERO_PRICING;
+  if (source.toLowerCase() === "acode") {
+    const normalized = normalizeIFlytekMaasModel(model);
+    // Undisclosed routing must not inherit generic aliases or fuzzy prices.
+    if (normalized === "auto" || normalized.endsWith("-auto")) return ZERO_PRICING;
+    const iFlytekMaasPricing = IFLYTEK_MAAS_MODEL_PRICING[normalized];
+    if (iFlytekMaasPricing) return iFlytekMaasPricing;
+  }
   const exact = MODEL_PRICING[model];
   if (exact) return exact;
   const lower = model.toLowerCase();
+  if (source === "cline" && lower.endsWith(":free")) return ZERO_PRICING;
+  // Cline's own gateway namespaces (`cline-free/*` free tier, `cline-pass/*`
+  // flat-rate Cline Pass) bill nothing per token, and the model id after the
+  // slash must not inherit a public rate — cline-pass/glm-5.3 is not GLM-5.3
+  // list price. Matched before every model-name matcher, mirroring the
+  // curated-overrides.json `cline-gateway-models` fuzzy entries; a turn that
+  // reports its own positive cost still wins earlier via
+  // SOURCES_WITH_AUTHORITATIVE_COST.
+  if (lower.includes("cline-free/") || lower.includes("cline-pass/")) return ZERO_PRICING;
   if (lower.includes("fable")) return MODEL_PRICING["claude-fable-5"];
   // Opus 5 fast mode bills at 2x the standard Opus tier ($10/$50), so the
   // -fast matcher must precede both the opus-5 and the generic opus fallback.
+  if (/opus-5[.-]5(?:$|[^0-9.])/.test(lower)) return MODEL_PRICING["claude-opus-5-5"];
+  if (/sonnet-5[.-]5(?:$|[^0-9.])/.test(lower)) return MODEL_PRICING["claude-sonnet-5-5"];
+  if (/sonnet-5(?:$|[^0-9.-])/.test(lower)) return MODEL_PRICING["claude-sonnet-5"];
   if (lower.includes("opus-5-fast")) return MODEL_PRICING["claude-opus-5-fast"];
   if (lower.includes("opus-5")) return MODEL_PRICING["claude-opus-5"];
   if (lower.includes("opus")) return MODEL_PRICING["claude-opus-4-6"];
   if (lower.includes("haiku")) return MODEL_PRICING["claude-haiku-4-5-20251001"];
   if (lower.includes("sonnet")) return MODEL_PRICING["claude-sonnet-4-6"];
   if (lower.includes("gpt-6-astra")) return MODEL_PRICING["gpt-6-astra"];
+  if (lower.includes("gpt-6-sol")) return MODEL_PRICING["gpt-6-sol"];
+  if (lower.includes("gpt-6.1-sol")) return MODEL_PRICING["gpt-6.1-sol"];
   // gpt-5.6 tiers: sol/terra/luna carry reasoning-effort suffixes (solhigh,
   // etc.), so match by substring. Specific tiers precede the generic gpt-5.6
   // fallback (the public gpt-5.6 alias points to the flagship sol tier).
@@ -306,6 +490,8 @@ function getModelPricing(model: string) {
   if (lower.includes("gpt-5.1-codex-mini")) return MODEL_PRICING["gpt-5.1-codex-mini"];
   if (lower.includes("gpt-5.1")) return MODEL_PRICING["gpt-5.1-codex"];
   if (lower.includes("gpt-5")) return MODEL_PRICING["gpt-5"];
+  // gemini-4-argon must precede gemini-3 / gemini-2.5 substring matchers.
+  if (lower.includes("gemini-4-argon") || lower.includes("gemini-4.argon")) return MODEL_PRICING["gemini-4-argon"];
   // gemini-3 pro tiers (gemini-3-pro, gemini-3.1-pro, -high, -customtools…)
   // must not fall through to the flash rate (4x undercount).
   if (lower.includes("gemini-3") && lower.includes("pro")) return MODEL_PRICING["gemini-3-pro-preview"];
@@ -314,10 +500,18 @@ function getModelPricing(model: string) {
   if (lower.includes("minimax-m3")) return MODEL_PRICING["minimax-m3"];
   if (lower.includes("minimax-m2.7-highspeed")) return MODEL_PRICING["MiniMax-M2.7-highspeed"];
   if (lower.includes("minimax-m2.7")) return MODEL_PRICING["MiniMax-M2.7"];
+  if (lower.includes("deepseek-v4.1-flash")) return MODEL_PRICING["deepseek-v4.1-flash"];
+  if (lower.includes("deepseek-flash")) return MODEL_PRICING["deepseek-flash"];
   if (lower.includes("deepseek-v4-flash")) return MODEL_PRICING["deepseek-v4-flash"];
   if (lower.includes("deepseek-v4-pro")) return MODEL_PRICING["deepseek-v4-pro"];
   if (lower.includes("deepseek-reasoner")) return MODEL_PRICING["deepseek-reasoner"];
   if (lower.includes("deepseek-chat")) return MODEL_PRICING["deepseek-chat"];
+  // Cursor Grok 4.7/4.6/4.5 Fast SKUs must precede the generic grok-4 matcher
+  // (substring "grok-4" would otherwise bill Cursor Fast rows at xAI grok-4 rates).
+  if (lower.includes("grok-4.7") && lower.includes("fast")) return MODEL_PRICING["cursor-grok-4.7-fast"];
+  if (lower.includes("grok-4.7")) return MODEL_PRICING["cursor-grok-4.7"];
+  if (lower.includes("grok-4.6") && lower.includes("fast")) return MODEL_PRICING["cursor-grok-4.6-fast"];
+  if (lower.includes("grok-4.6")) return MODEL_PRICING["cursor-grok-4.6"];
   if (lower.includes("grok-4.5") && lower.includes("fast")) return MODEL_PRICING["cursor-grok-4.5-fast"];
   if (lower.includes("grok-4.5")) return MODEL_PRICING["cursor-grok-4.5"];
   if (lower.includes("grok-build")) return MODEL_PRICING["grok-build"];
@@ -362,6 +556,13 @@ function getModelPricing(model: string) {
   if (lower.includes("glm-5")) return MODEL_PRICING["glm-5"];
   if (lower.includes("kiro")) return MODEL_PRICING["kiro-cli-agent"];
   if (lower.includes("hy3")) return MODEL_PRICING["hy3-preview-agent"];
+  if (/(?:^|\/)qwen3[.-]8-flash(?:-\d{4}-\d{2}-\d{2})?$/.test(lower.trim())) return MODEL_PRICING["qwen3.8-flash"];
+  if (lower.includes("hy4")) return MODEL_PRICING["hy4-preview"];
+  if (lower.includes("composer-2.5") && lower.includes("fast")) return MODEL_PRICING["composer-2.5-fast"];
+  if (lower.includes("composer-2.5")) return MODEL_PRICING["composer-2.5"];
+  if (lower.includes("composer-2-fast")) return MODEL_PRICING["composer-2-fast"];
+  if (lower.includes("composer-2")) return MODEL_PRICING["composer-2"];
+  if (lower.includes("composer-1.5")) return MODEL_PRICING["composer-1.5"];
   if (lower.includes("composer")) return MODEL_PRICING["composer-1"];
   if (lower.includes("fugu")) return MODEL_PRICING["sakana/fugu-ultra"];
   if (lower.includes("longcat")) return MODEL_PRICING["longcat-2.0"];
@@ -374,10 +575,16 @@ function getModelPricing(model: string) {
   return ZERO_PRICING;
 }
 
-function getRowPricing(row: { model?: string; hour_start?: string; pricing_tier?: string }) {
-  const pricing = getModelPricing(row.model || "");
+function getRowPricing(row: { model?: string; source?: string; hour_start?: string; pricing_tier?: string }) {
+  const pricing = getModelPricing(row.model || "", row.source);
+  if ((row.source || "").toLowerCase() === "acode") return pricing;
   const lower = String(row.model || "").toLowerCase();
-  if (!lower.includes("deepseek-v4-flash") && !lower.includes("deepseek-v4-pro")) return pricing;
+  if (
+    !lower.includes("deepseek-v4-flash") &&
+    !lower.includes("deepseek-v4.1-flash") &&
+    !lower.includes("deepseek-flash") &&
+    !lower.includes("deepseek-v4-pro")
+  ) return pricing;
   let offPeak = row.pricing_tier === "off_peak";
   if (!row.pricing_tier && row.hour_start) {
     const timestamp = Date.parse(row.hour_start);
@@ -441,65 +648,130 @@ interface GroupedRow {
   pricing_tier?: string;
 }
 
-const GROUPED_ROWS_TTL_MS = 30_000;
-const GROUPED_ROWS_STALE_IF_ERROR_MS = 5 * 60_000;
-const groupedRowsCache = new Map<string, { fetchedAt: number; rows: GroupedRow[] }>();
-const groupedRowsInFlight = new Map<string, Promise<GroupedRow[]>>();
+// [source, model, pricing_tier, total, input, output, cache_read, cache_write,
+// reasoning] already summed over [from, to], as returned by
+// account_model_breakdown_compact.
+type CompactDim = [string | null, string | null, string | null, number | string,
+  number | string, number | string, number | string, number | string, number | string, (number | string)?];
+
+interface ModelBreakdownWire {
+  source_names: (string | null)[];
+  model_names: (string | null)[];
+  pricing_tiers: (string | null)[];
+  dims: [number, number, number, ...(number | string)[]][];
+}
+
+function decodeModelBreakdownWire(data: unknown): CompactDim[] {
+  // Small results keep their legacy array when dictionaries would cost more.
+  if (Array.isArray(data)) return data as CompactDim[];
+  if (data == null) return [];
+  const wire = data as ModelBreakdownWire;
+  if (!Array.isArray(wire.dims)) return [];
+  const token = (row: ModelBreakdownWire["dims"][number], index: number): number | string =>
+    index < row.length ? row[index] : 0;
+  return wire.dims.map((row): CompactDim => [
+    wire.source_names[row[0]], wire.model_names[row[1]], wire.pricing_tiers[row[2]],
+    token(row, 3), token(row, 4), token(row, 5), token(row, 6), token(row, 7), token(row, 8),
+    ...(row.length > 9 ? [token(row, 9)] : []),
+  ]);
+}
+
+const COMPACT_TTL_MS = 30_000;
+const COMPACT_STALE_IF_ERROR_MS = 5 * 60_000;
+const compactCache = new Map<string, { fetchedAt: number; dims: CompactDim[] }>();
+const compactInFlight = new Map<string, Promise<CompactDim[]>>();
 
 /**
- * Server-side aggregation. One RPC replaces the old N paginated 1000-row raw
- * fetches: account_usage_grouped() GROUPs BY (tz-local day, source, model) in
- * Postgres and returns a single JSONB array. We still filter to local days in
- * [from, to] and collapse to (source, model) in-edge — SUM across the user's
- * active devices is byte-identical; tz-local day bucketing uses `AT TIME ZONE`
- * (same IANA database as the old JS Intl path, incl. DST).
+ * Server-side aggregation, folded down to what this endpoint emits.
+ *
+ * account_model_breakdown_compact() runs the very same
+ * account_usage_grouped_cached() scan underneath — same 30s shared Postgres
+ * cache, same cross-device dedup — but drops the day dimension in Postgres.
+ * This endpoint groups by (source, model) and hardcodes `days: 0`, so the
+ * per-day rows only ever crossed the network to be summed and discarded; for a
+ * typical account they are 9-23% as many rows once folded.
+ *
+ * pricing_tier stays in the key so DeepSeek V4 peak/off_peak rows for one model
+ * keep their separate prices, and the loop below re-splits them into the same
+ * model entry exactly as the per-day rows did.
  */
-async function fetchGroupedRows(
+async function fetchCompactDims(
   client: ReturnType<typeof createClient>,
   userId: string,
   requestedDeviceId: string | null,
   fromIso: string,
   toIso: string,
-  trunc: "hour" | "day" | "month" | "none",
+  rangeFrom: string,
+  rangeTo: string,
   tz: string | null,
   tzOffsetMinutes: number | null,
-): Promise<GroupedRow[]> {
-  const cacheKey = JSON.stringify([userId, requestedDeviceId, fromIso, toIso, trunc, tz, tzOffsetMinutes]);
-  const cached = groupedRowsCache.get(cacheKey);
-  if (cached && Date.now() - cached.fetchedAt < GROUPED_ROWS_TTL_MS) return cached.rows;
-  const existing = groupedRowsInFlight.get(cacheKey);
+): Promise<CompactDim[]> {
+  const cacheKey = JSON.stringify([userId, requestedDeviceId, fromIso, toIso, rangeFrom, rangeTo, tz, tzOffsetMinutes]);
+  const cached = compactCache.get(cacheKey);
+  if (cached && Date.now() - cached.fetchedAt < COMPACT_TTL_MS) return cached.dims;
+  const existing = compactInFlight.get(cacheKey);
   if (existing) return existing;
 
   const pending = (async () => {
     try {
-      const { data, error } = await client.database.rpc("account_usage_grouped_cached", {
+      const { data, error } = await client.database.rpc("account_model_breakdown_wire", {
         p_user_id: userId,
         p_device_id: requestedDeviceId,
         p_from: fromIso,
         p_to: toIso,
-        p_trunc: trunc,
         p_tz: tz,
         p_offset_min: tzOffsetMinutes,
+        p_range_from: rangeFrom,
+        p_range_to: rangeTo,
       });
       if (error) throw new Error(error.message);
-      const rows = (Array.isArray(data) ? data : []) as GroupedRow[];
-      groupedRowsCache.set(cacheKey, { fetchedAt: Date.now(), rows });
-      if (groupedRowsCache.size > 64) {
-        const oldest = groupedRowsCache.keys().next().value;
-        if (oldest) groupedRowsCache.delete(oldest);
+      const dims = decodeModelBreakdownWire(data);
+      compactCache.set(cacheKey, { fetchedAt: Date.now(), dims });
+      if (compactCache.size > 64) {
+        const oldest = compactCache.keys().next().value;
+        if (oldest) compactCache.delete(oldest);
       }
-      return rows;
+      return dims;
     } catch (error) {
-      const stale = groupedRowsCache.get(cacheKey);
-      if (stale && Date.now() - stale.fetchedAt < GROUPED_ROWS_STALE_IF_ERROR_MS) return stale.rows;
+      const stale = compactCache.get(cacheKey);
+      if (stale && Date.now() - stale.fetchedAt < COMPACT_STALE_IF_ERROR_MS) return stale.dims;
       throw error;
     }
-  })().finally(() => groupedRowsInFlight.delete(cacheKey));
-  groupedRowsInFlight.set(cacheKey, pending);
+  })().finally(() => compactInFlight.delete(cacheKey));
+  compactInFlight.set(cacheKey, pending);
   return pending;
 }
 
-export default async function (req: Request): Promise<Response> {
+function getUsageModelPricing(model: string, source: string) {
+  const lower = model.toLowerCase();
+  const localInference = source === "lmstudio";
+  const subscriptionBacked = source === "pi-github-copilot" || source === "pi-copilot";
+  const modelForPricing = source === "unsloth" && /^(local|unpriced)\//i.test(model)
+    ? "__tokentracker_unpriced_unsloth_model__"
+    : source === "workbuddy" && lower === "auto" ? "hy3-preview-agent" : model;
+  const pricing = localInference || subscriptionBacked
+    ? ZERO_PRICING : getModelPricing(modelForPricing, source);
+  const pricingModel = modelForPricing.toLowerCase();
+  const hasRates = [pricing.input, pricing.output, pricing.cache_read, pricing.cache_write]
+    .some((rate) => Number(rate) > 0);
+  // A matched zero-rate table entry is free. The shared fallback object also
+  // represents missing rates, so only explicit no-charge routes override it.
+  const free = localInference || subscriptionBacked || pricing !== ZERO_PRICING ||
+    (source === "cline" && pricingModel.endsWith(":free")) ||
+    pricingModel.includes("cline-free/") || pricingModel.includes("cline-pass/");
+  return {
+    status: hasRates ? "priced" : free ? "free" : "unpriced",
+    source: localInference ? "local_inference"
+      : subscriptionBacked || pricingModel.includes("cline-pass/") ? "subscription"
+      : hasRates || free ? source === "acode" ? "iflytek_maas" : "curated" : null,
+    input: Number(pricing.input) || 0,
+    output: Number(pricing.output) || 0,
+    cache_read: Number(pricing.cache_read) || 0,
+    cache_write: Number(pricing.cache_write) || 0,
+  };
+}
+
+async function handleAccountRequest(req: Request): Promise<Response> {
   if (req.method === "OPTIONS")
     return new Response(null, { status: 204, headers: corsHeaders });
   if (req.method !== "GET") return json({ error: "Method not allowed" }, 405);
@@ -540,6 +812,14 @@ export default async function (req: Request): Promise<Response> {
   const userId = await verifiedUserIdFromJwt(req.headers.get("Authorization"));
   if (!userId) return json({ error: "Unauthorized" }, 401);
 
+  let cloudAccess;
+  try { cloudAccess = await cloudReadAccess(client, userId, "daily"); }
+  catch { return json({ error: "Cloud access unavailable", code: "cloud_access_unavailable" }, 503); }
+  if (!cloudAccess.ok) return cloudFailure(cloudAccess, corsHeaders);
+  const historyFailure = cloudHistoryFailure(cloudAccess, to);
+  if (historyFailure) return cloudFailure(historyFailure, corsHeaders);
+  if (cloudAccess.available_from && from < cloudAccess.available_from) from = cloudAccess.available_from;
+
   const rawDeviceId = url.searchParams.get("device_id");
   const requestedDeviceId = rawDeviceId && /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(rawDeviceId)
     ? rawDeviceId
@@ -556,17 +836,32 @@ export default async function (req: Request): Promise<Response> {
   const rangeStart = startDate.toISOString();
   const rangeEnd = endDate.toISOString();
 
-  let rows: GroupedRow[];
+  let dims: CompactDim[];
   try {
-    rows = await fetchGroupedRows(client, userId, requestedDeviceId, rangeStart, rangeEnd, "day", tz, tzOffsetMinutes);
-  } catch (e) {
-    return json({ error: (e as Error).message }, 500);
+    dims = await fetchCompactDims(client, userId, requestedDeviceId, rangeStart, rangeEnd, from, to, tz, tzOffsetMinutes);
+  } catch {
+    return json({ error: "Failed to fetch model breakdown" }, 500);
   }
 
-  // Keep only the tz-local days in [from, to]. The RPC already bucketed each
-  // row to its local day (honoring tz / tz_offset_minutes), so this compares
-  // the bucket directly — same inclusive [from, to] semantics as before.
-  const filtered = rows.filter((r) => r.bucket >= from && r.bucket <= to);
+  // The RPC bucketed each row to its local day (honoring tz / tz_offset_minutes)
+  // and kept only the days in [from, to] — same inclusive semantics as the
+  // `r.bucket >= from && r.bucket <= to` filter this used to do here — then
+  // summed the days away. `bucket` and `conversations` are gone because nothing
+  // below reads them.
+  const filtered: GroupedRow[] = dims.map((d) => ({
+    bucket: "",
+    source: d[0] as string,
+    model: d[1] as string,
+    pricing_tier: d[2] ?? undefined,
+    total_tokens: Number(d[3]) || 0,
+    input_tokens: Number(d[4]) || 0,
+    output_tokens: Number(d[5]) || 0,
+    cached_input_tokens: Number(d[6]) || 0,
+    cache_creation_input_tokens: Number(d[7]) || 0,
+    reasoning_output_tokens: Number(d[8]) || 0,
+    unclassified_input_tokens: Number(d[9]) || 0,
+    conversations: 0,
+  }));
 
   interface ModelAgg {
     model: string;
@@ -633,7 +928,9 @@ export default async function (req: Request): Promise<Response> {
     const p = getRowPricing({ ...row, model: modelForPricing });
     const subscriptionBacked =
       src === "pi-github-copilot" || src === "pi-copilot" || src === "lmstudio";
-    const reasoningIncludedInOutput = src === "codex" || src === "every-code";
+    const reasoningIncludedInOutput =
+      src === "codex" || src === "acode" || src === "every-code" ||
+      src === "cline" || src === "omo" || src === "muse";
     const reportedCost = Number(row.total_cost_usd);
     ma.totalCostUsd += subscriptionBacked
       ? 0
@@ -656,6 +953,8 @@ export default async function (req: Request): Promise<Response> {
         return {
           model: m.model,
           model_id: m.model_id,
+          pricing: getUsageModelPricing(m.model, s.source),
+          cost_source: "model_pricing",
           totals: { ...m.totals, ...costFields(m.totalCostUsd.toFixed(6), m.totals.unclassified_input_tokens) },
         };
       })
@@ -688,4 +987,8 @@ function costFields(known: number | string, unclassified: number) {
     known_cost_usd: known,
     cost_status: unclassified > 0 ? "partial" : "complete",
   };
+}
+
+export default async function (req: Request): Promise<Response> {
+  return encodeJsonResponse(req, await handleAccountRequest(req));
 }

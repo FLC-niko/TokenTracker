@@ -99,6 +99,9 @@ export const PROVIDER_LIMIT_SPECS = {
     // Grok unified billing is weekly for SuperGrok / free-tier accounts and
     // monthly for legacy credit counters. period_type comes from the billing
     // API (USAGE_PERIOD_TYPE_WEEKLY / MONTHLY) via grok-limits.js.
+    // Product rows are shares of that same pool, not separate quotas.
+    // They must not get windowSeconds: pace would treat a 12% share as its
+    // own quota and project an ETA to 100%.
     windows(data) {
       const period = typeof data.period_type === "string" ? data.period_type : null;
       const primaryLabelKey =
@@ -117,6 +120,7 @@ export const PROVIDER_LIMIT_SPECS = {
           windowSeconds,
         },
         { key: "ondemand", labelKey: "limits.label.grok_ondemand", window: data.secondary_window },
+        ...grokProductWindowSpecs(data),
       ];
     },
   },
@@ -140,9 +144,12 @@ export const PROVIDER_LIMIT_SPECS = {
     },
   },
   zcode: {
+    extra: "zcode_reset_bank",
+    /** Limit rows for ZCode: fixed coding-plan windows, or one row per labelled start-plan bucket. */
     windows(data) {
       // Coding plans expose 5h / weekly / tools windows (ZCode 3.3.x).
-      // Start plans keep the per-model GLM-5.2 / GLM-5-Turbo balances.
+      // Start plans list one row per balance bucket; the label comes from the API
+      // (model name, plus the promotion name for one-time grants), so `label` is set.
       if (data.plan_kind === "coding-plan") {
         return [
           { key: "5h", labelKey: "limits.label.zcode_5h", window: data.primary_window },
@@ -150,6 +157,16 @@ export const PROVIDER_LIMIT_SPECS = {
           { key: "tools", labelKey: "limits.label.zcode_tools", window: data.tertiary_window },
         ];
       }
+      const labeled = Array.isArray(data.buckets) ? data.buckets.filter((b) => b?.label && b.window) : [];
+      if (labeled.length) {
+        return labeled.map((b, i) => ({
+          key: `bucket-${b.entitlement_id || i}`,
+          label: b.label,
+          window: b.window,
+          ...(b.period === "one_time" ? { timeKind: "expiry" } : {}),
+        }));
+      }
+      // Payloads from older servers carry no bucket labels.
       return [
         { key: "glm52", labelKey: "limits.label.zcode_glm52", window: data.primary_window },
         { key: "glm5t", labelKey: "limits.label.zcode_glm5t", window: data.secondary_window },
@@ -186,6 +203,7 @@ export const PROVIDER_LIMIT_SPECS = {
     windows(data) {
       return [
         { key: "credits", labelKey: "limits.label.qoder_cn_credits", window: data.primary_window },
+        { key: "addon", labelKey: "limits.label.qoder_cn_addon_credits", window: data.tertiary_window },
         {
           key: "ultimate",
           labelKey: "limits.label.qoder_cn_ultimate",
@@ -230,7 +248,47 @@ export const PROVIDER_LIMIT_SPECS = {
       ];
     },
   },
+  devin: {
+    // Devin subscription quota: fixed daily + weekly windows straight from the
+    // official GetPlanStatus RPC. The server supplies each window's reset time
+    // and length (86400/604800), so pacing uses `limit_window_seconds`.
+    windows(data) {
+      return [
+        { key: "daily", labelKey: "limits.label.devin_daily", window: data.primary_window, windowSecondsField: "limit_window_seconds" },
+        { key: "weekly", labelKey: "limits.label.devin_weekly", window: data.secondary_window, windowSecondsField: "limit_window_seconds" },
+      ];
+    },
+  },
 };
+
+const GROK_PRODUCT_LABEL_KEYS = {
+  GrokBuild: "limits.label.grok_build",
+  GrokBot: "limits.label.grok_bot",
+  GrokChat: "limits.label.grok_chat",
+  GrokImagine: "limits.label.grok_imagine",
+  Cursor: "limits.label.grok_cursor",
+};
+
+/** Product-share rows. Known ids use copy keys; a future product uses the server label. */
+function grokProductWindowSpecs(data) {
+  if (!Array.isArray(data?.products)) return [];
+  const rows = [];
+  for (const entry of data.products) {
+    const product = typeof entry?.product === "string" ? entry.product : "";
+    if (!product || !entry?.window) continue;
+    const labelKey = GROK_PRODUCT_LABEL_KEYS[product];
+    const label = typeof entry.label === "string" ? entry.label.trim() : "";
+    if (!labelKey && !label) continue;
+    rows.push({
+      key: `product-${product}`,
+      ...(labelKey ? { labelKey } : { label }),
+      window: entry.window,
+      // A share of the pool. Remaining mode must not redraw it as 100 − used.
+      share: true,
+    });
+  }
+  return rows;
+}
 
 /** Static copy() anchors for validate:copy — labels resolve at runtime via spec.labelKey. */
 export function usageLimitsLabelCopyAnchor() {
@@ -261,6 +319,11 @@ export function usageLimitsLabelCopyAnchor() {
     copy("limits.label.grok_week"),
     copy("limits.label.grok_day"),
     copy("limits.label.grok_ondemand"),
+    copy("limits.label.grok_build"),
+    copy("limits.label.grok_bot"),
+    copy("limits.label.grok_chat"),
+    copy("limits.label.grok_imagine"),
+    copy("limits.label.grok_cursor"),
     copy("limits.label.antigravity_claude_weekly"),
     copy("limits.label.antigravity_claude_5h"),
     copy("limits.label.antigravity_gemini_weekly"),
@@ -278,6 +341,7 @@ export function usageLimitsLabelCopyAnchor() {
     copy("limits.label.qoder_credits"),
     copy("limits.label.qoder_ultimate"),
     copy("limits.label.qoder_cn_credits"),
+    copy("limits.label.qoder_cn_addon_credits"),
     copy("limits.label.qoder_cn_ultimate"),
     copy("limits.label.command_code_5h"),
     copy("limits.label.command_code_weekly"),
@@ -287,5 +351,7 @@ export function usageLimitsLabelCopyAnchor() {
     copy("limits.label.ark_agent_plan_5h"),
     copy("limits.label.ark_agent_plan_weekly"),
     copy("limits.label.ark_agent_plan_monthly"),
+    copy("limits.label.devin_daily"),
+    copy("limits.label.devin_weekly"),
   ];
 }

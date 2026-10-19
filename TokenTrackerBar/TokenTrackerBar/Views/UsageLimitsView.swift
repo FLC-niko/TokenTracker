@@ -9,6 +9,9 @@ struct UsageLimitsView: View {
     /// Width of the widest visible row label; all label columns match it so
     /// bars align without reserving space for labels that aren't on screen.
     @State private var labelColumnWidth: CGFloat = 0
+    /// Width of the widest trailing reset label ("5d", "已过期", …); reset
+    /// columns match it so bars also share the same right edge.
+    @State private var resetColumnWidth: CGFloat = 0
     /// Provider id whose explanation popover is open. Each provider block is
     /// clickable (CodexBar-style); clicking opens a side popover that explains how
     /// to read its bars. A click toggle — not hover — so nothing reflows/jitters.
@@ -18,9 +21,28 @@ struct UsageLimitsView: View {
 
     private static let rowColumnSpacing: CGFloat = 5
     private static let percentColumnWidth: CGFloat = 34
+    /// Floor for the trailing reset column; it grows with the widest reset
+    /// label (see `resetColumnWidth`) but never gets narrower than this.
     private static let relativeResetColumnWidth: CGFloat = 24
-    private static var resetExpiryColumnWidth: CGFloat {
-        percentColumnWidth + rowColumnSpacing + relativeResetColumnWidth
+    /// Upper bound for the shared label column. A label past it truncates with
+    /// an ellipsis (full text stays in the row tooltip) instead of squeezing
+    /// every row's bar — model + plan names can run well past this width.
+    /// 60pt keeps labels to a short recognizable prefix so long names barely
+    /// affect bar width (reporter-chosen value).
+    private static let labelColumnMaxWidth: CGFloat = 60
+
+    /// Measured reset-column width with the fixed floor applied. Before the
+    /// first measurement lands it equals the old fixed width, so reset rows
+    /// lay out exactly as before on the first pass.
+    private var effectiveResetColumnWidth: CGFloat {
+        max(resetColumnWidth, Self.relativeResetColumnWidth)
+    }
+
+    /// Reset-bank rows show one wider trailing column (expiry) where the limit
+    /// rows show the percent + reset pair; keeping it equal to that pair's
+    /// total width makes every bar in the section share the same right edge.
+    private var resetExpiryColumnWidth: CGFloat {
+        Self.percentColumnWidth + Self.rowColumnSpacing + effectiveResetColumnWidth
     }
 
     /// At least one provider is configured and error-free.
@@ -29,35 +51,66 @@ struct UsageLimitsView: View {
         limits.hasAnyProviderWithoutError
     }
 
+    /// Provider id → the asset name `brandIcon` expects. Mirrors the
+    /// per-provider `assetName` arguments in `sectionIfContent`, so a provider
+    /// with no usable quota record can still render its own logo.
+    private static let providerIconAssetNames: [String: String] = [
+        "claude": "ClaudeLogo",
+        "codex": "CodexLogo",
+        "cursor": "CursorLogo",
+        "gemini": "GeminiLogo",
+        "kimi": "KimiLogo",
+        "kiro": "KiroLogo",
+        "grok": "GrokLogo",
+        "copilot": "CopilotLogo",
+        "antigravity": "AntigravityLogo",
+        "zcode": "ZcodeLogo",
+        "opencodeGo": "OpenCodeLogo",
+        "commandCode": "CommandCodeLogo",
+        "qoder": "QoderLogo",
+        "qoderCn": "QoderCnLogo",
+        "codingPlan": "VolcanoArkLogo",
+        "agentPlan": "VolcanoArkLogo",
+        "devin": "DevinLogo",
+    ]
+
     var body: some View {
-        if let limits, hasAnyAvailable(limits) {
+        if let limits {
             let visibleGroups = buildVisibleGroups(limits)
 
-            VStack(alignment: .leading, spacing: 8) {
-                SectionHeader(title: "\(Strings.usageLimitsTitle) · \(displayModeTitle)") {
-                    SettingsGearButton(isPresented: $showSettings) {
-                        LimitsSettingsView(store: settings)
-                    }
-                }
-
-                if visibleGroups.isEmpty {
-                    // All hidden by user — show hint so they know gear exists
-                    Text(Strings.allProvidersHidden)
-                        .font(.caption2)
-                        .foregroundStyle(.tertiary)
-                } else {
-                    ForEach(Array(visibleGroups.enumerated()), id: \.offset) { index, group in
-                        if index > 0 {
-                            Divider()
-                                .opacity(0.4)
-                                .padding(.vertical, 2)
+            // A response with no usable quota record still has something to
+            // show when the user linked a subscription to one of its providers:
+            // `visibleGroups` then carries subscription-only sections.
+            if hasAnyAvailable(limits) || !visibleGroups.isEmpty {
+                VStack(alignment: .leading, spacing: 8) {
+                    SectionHeader(title: "\(Strings.usageLimitsTitle) · \(displayModeTitle)") {
+                        SettingsGearButton(isPresented: $showSettings) {
+                            LimitsSettingsView(store: settings)
                         }
-                        group
+                    }
+
+                    if visibleGroups.isEmpty {
+                        // Missing quota content does not mean the user hid it.
+                        if LimitsSettingsStore.allProviders.allSatisfy({ !settings.isVisible($0) }) {
+                            Text(Strings.allProvidersHidden)
+                                .font(.caption2)
+                                .foregroundStyle(.tertiary)
+                        }
+                    } else {
+                        ForEach(Array(visibleGroups.enumerated()), id: \.offset) { index, group in
+                            if index > 0 {
+                                Divider()
+                                    .opacity(0.4)
+                                    .padding(.vertical, 2)
+                            }
+                            group
+                        }
                     }
                 }
+                .onPreferenceChange(LimitLabelWidthKey.self) { labelColumnWidth = ceil($0) }
+                .onPreferenceChange(LimitResetWidthKey.self) { resetColumnWidth = ceil($0) }
             }
-            .onPreferenceChange(LimitLabelWidthKey.self) { labelColumnWidth = ceil($0) }
-        } else if limits == nil {
+        } else {
             LimitsSkeleton()
         }
     }
@@ -97,70 +150,114 @@ struct UsageLimitsView: View {
     }
 
     private func buildVisibleGroups(_ limits: UsageLimitsResponse) -> [AnyView] {
-        var groups: [AnyView] = []
+        settings.providerOrder.compactMap { sectionIfContent(id: $0, limits: limits) }
+    }
 
-        for id in settings.providerOrder {
-            guard settings.isVisible(id) else { continue }
+    /// Builds one provider's section, or nil when it would carry no quota rows
+    /// and no manual subscription/reset/status content — an empty heading is
+    /// never collected. Shared rule for every provider, not a per-provider
+    /// symptom guard.
+    private func sectionIfContent(id: String, limits: UsageLimitsResponse) -> AnyView? {
+        guard settings.isVisible(id) else { return nil }
 
-            switch id {
-            case "claude" where limits.claude.configured && limits.claude.error == nil:
-                groups.append(AnyView(toolSection(id: id, title: planTitle("Claude", limits.claude.planLabel), assetName: "ClaudeLogo", toolName: "Claude", specs: claudeSpecs(limits.claude), updatedAtISO: limits.claude.cachedAt, isStale: limits.claude.stale ?? false, retryAtISO: limits.claude.retryAt, serviceStatus: limits.claude.serviceStatus)))
-            case "codex" where limits.codex.configured && limits.codex.error == nil:
-                let resetState = codexResetBankViewData(limits.codex.resetCredits)
-                groups.append(AnyView(toolSection(id: id, title: planTitle("Codex", limits.codex.planLabel), assetName: "CodexLogo", toolName: "Codex", specs: codexSpecs(limits.codex), resetRows: resetState.rows, resetStatus: resetState.statusText, updatedAtISO: limits.codex.cachedAt, isStale: limits.codex.stale ?? false)))
-            case "cursor" where limits.cursor.configured && limits.cursor.error == nil:
-                groups.append(AnyView(toolSection(id: id, title: planTitle("Cursor", limits.cursor.planLabel), assetName: "CursorLogo", toolName: "Cursor", specs: cursorSpecs(limits.cursor))))
-            case "gemini" where limits.gemini.configured && limits.gemini.error == nil:
-                groups.append(AnyView(toolSection(id: id, title: planTitle("Gemini", limits.gemini.planLabel), assetName: "GeminiLogo", toolName: "Gemini", specs: geminiSpecs(limits.gemini))))
-            case "kimi":
-                if let kimi = limits.kimi, kimi.configured, kimi.error == nil {
-                    groups.append(AnyView(toolSection(id: id, title: planTitle("Kimi", kimi.planLabel), assetName: "KimiLogo", toolName: "Kimi", specs: kimiSpecs(kimi), titleSuffix: kimi.parallelLimit.map { "· \(Strings.kimiParallelLabel($0))" })))
-                }
-            case "kiro" where limits.kiro.configured && limits.kiro.error == nil:
-                groups.append(AnyView(toolSection(id: id, title: planTitle("Kiro", limits.kiro.planLabel), assetName: "KiroLogo", toolName: "Kiro", specs: kiroSpecs(limits.kiro))))
-            case "grok":
-                if let grok = limits.grok, grok.configured, grok.error == nil {
-                    groups.append(AnyView(toolSection(id: id, title: planTitle("Grok Build", grok.planLabel), assetName: "GrokLogo", toolName: "Grok Build", specs: grokSpecs(grok))))
-                }
-            case "antigravity" where limits.antigravity.configured && limits.antigravity.error == nil:
-                groups.append(AnyView(toolSection(id: id, title: planTitle("Antigravity", limits.antigravity.planLabel), assetName: "AntigravityLogo", toolName: "Antigravity", specs: antigravitySpecs(limits.antigravity))))
-            case "copilot":
-                if let copilot = limits.copilot, copilot.configured, copilot.error == nil {
-                    groups.append(AnyView(toolSection(id: id, title: planTitle("GitHub Copilot", copilot.planLabel), assetName: "CopilotLogo", toolName: "GitHub Copilot", specs: copilotSpecs(copilot))))
-                }
-            case "zcode":
-                if let zcode = limits.zcode, zcode.configured, zcode.error == nil {
-                    groups.append(AnyView(toolSection(id: id, title: planTitle("ZCode", zcode.planLabel), assetName: "ZcodeLogo", toolName: "ZCode", specs: zcodeSpecs(zcode))))
-                }
-            case "opencodeGo":
-                if let opencodeGo = limits.opencodeGo, opencodeGo.configured, opencodeGo.error == nil {
-                    groups.append(AnyView(toolSection(id: id, title: planTitle("OpenCode Go", opencodeGo.planLabel), assetName: "OpenCodeLogo", toolName: "OpenCode Go", specs: opencodeGoSpecs(opencodeGo))))
-                }
-            case "commandCode":
-                if let commandCode = limits.commandCode, commandCode.configured, commandCode.error == nil {
-                    groups.append(AnyView(toolSection(id: id, title: planTitle("Command Code", commandCode.planLabel), assetName: "CommandCodeLogo", toolName: "Command Code", specs: commandCodeSpecs(commandCode), updatedAtISO: commandCode.cachedAt, isStale: commandCode.stale ?? false)))
-                }
-            case "qoder":
-                if let qoder = limits.qoder, qoder.configured, qoder.error == nil {
-                    groups.append(AnyView(toolSection(id: id, title: planTitle("Qoder", qoder.planLabel), assetName: "QoderLogo", toolName: "Qoder", specs: qoderSpecs(qoder), updatedAtISO: qoder.cachedAt, isStale: qoder.stale ?? false)))
-                }
-            case "qoderCn":
-                if let qoderCn = limits.qoderCn, qoderCn.configured, qoderCn.error == nil {
-                    groups.append(AnyView(toolSection(id: id, title: planTitle("Qoder CN", qoderCn.planLabel), assetName: "QoderCnLogo", toolName: "Qoder CN", specs: qoderSpecs(qoderCn), updatedAtISO: qoderCn.cachedAt, isStale: qoderCn.stale ?? false)))
-                }
-            case "codingPlan":
-                if let codingPlan = limits.codingPlan, codingPlan.configured, codingPlan.error == nil {
-                    groups.append(AnyView(toolSection(id: id, title: planTitle("Ark Coding Plan", codingPlan.planLabel), assetName: "VolcanoArkLogo", toolName: "Ark Coding Plan", specs: codingPlanSpecs(codingPlan), updatedAtISO: codingPlan.cachedAt, isStale: codingPlan.stale ?? false)))
-                }
-            case "agentPlan":
-                if let agentPlan = limits.agentPlan, agentPlan.configured, agentPlan.error == nil {
-                    groups.append(AnyView(toolSection(id: id, title: planTitle("Ark Agent Plan", agentPlan.planLabel), assetName: "VolcanoArkLogo", toolName: "Ark Agent Plan", specs: agentPlanSpecs(agentPlan), updatedAtISO: agentPlan.cachedAt, isStale: agentPlan.stale ?? false)))
-                }
-            default:
-                break
+        switch id {
+        case "claude" where limits.claude.configured && limits.claude.error == nil:
+            return toolSection(id: id, title: planTitle("Claude", limits.claude.planLabel), assetName: "ClaudeLogo", toolName: "Claude", specs: claudeSpecs(limits.claude), updatedAtISO: limits.claude.cachedAt, isStale: limits.claude.stale ?? false, retryAtISO: limits.claude.retryAt, serviceStatus: limits.claude.serviceStatus)
+        case "codex" where limits.codex.configured && limits.codex.error == nil:
+            let resetState = codexResetBankViewData(limits.codex.resetCredits)
+            return toolSection(id: id, title: planTitle("Codex", limits.codex.planLabel), assetName: "CodexLogo", toolName: "Codex", specs: codexSpecs(limits.codex), resetRows: resetState.rows, resetStatus: resetState.statusText, updatedAtISO: limits.codex.cachedAt, isStale: limits.codex.stale ?? false)
+        case "cursor" where limits.cursor.configured && limits.cursor.error == nil:
+            return toolSection(id: id, title: planTitle("Cursor", limits.cursor.planLabel), assetName: "CursorLogo", toolName: "Cursor", specs: cursorSpecs(limits.cursor))
+        case "gemini" where limits.gemini.configured && limits.gemini.error == nil:
+            return toolSection(id: id, title: planTitle("Gemini", limits.gemini.planLabel), assetName: "GeminiLogo", toolName: "Gemini", specs: geminiSpecs(limits.gemini))
+        case "kimi":
+            if let kimi = limits.kimi, kimi.configured, kimi.error == nil {
+                return toolSection(id: id, title: planTitle("Kimi", kimi.planLabel), assetName: "KimiLogo", toolName: "Kimi", specs: kimiSpecs(kimi), titleSuffix: kimi.parallelLimit.map { "· \(Strings.kimiParallelLabel($0))" })
             }
+        case "kiro" where limits.kiro.configured && limits.kiro.error == nil:
+            return toolSection(id: id, title: planTitle("Kiro", limits.kiro.planLabel), assetName: "KiroLogo", toolName: "Kiro", specs: kiroSpecs(limits.kiro))
+        case "grok":
+            if let grok = limits.grok, grok.configured, grok.error == nil {
+                return toolSection(id: id, title: planTitle("Grok Build", grok.planLabel), assetName: "GrokLogo", toolName: "Grok Build", specs: grokSpecs(grok))
+            }
+        case "antigravity" where limits.antigravity.configured && limits.antigravity.error == nil:
+            return toolSection(id: id, title: planTitle("Antigravity", limits.antigravity.planLabel), assetName: "AntigravityLogo", toolName: "Antigravity", specs: antigravitySpecs(limits.antigravity))
+        case "copilot":
+            if let copilot = limits.copilot, copilot.configured, copilot.error == nil {
+                return toolSection(id: id, title: planTitle("GitHub Copilot", copilot.planLabel), assetName: "CopilotLogo", toolName: "GitHub Copilot", specs: copilotSpecs(copilot))
+            }
+        case "zcode":
+            if let zcode = limits.zcode, zcode.configured, zcode.error == nil {
+                return toolSection(id: id, title: planTitle("ZCode", zcode.planLabel), assetName: "ZcodeLogo", toolName: "ZCode", specs: zcodeSpecs(zcode))
+            }
+        case "opencodeGo":
+            if let opencodeGo = limits.opencodeGo, opencodeGo.configured, opencodeGo.error == nil {
+                return toolSection(id: id, title: planTitle("OpenCode Go", opencodeGo.planLabel), assetName: "OpenCodeLogo", toolName: "OpenCode Go", specs: opencodeGoSpecs(opencodeGo))
+            }
+        case "commandCode":
+            if let commandCode = limits.commandCode, commandCode.configured, commandCode.error == nil {
+                return toolSection(id: id, title: planTitle("Command Code", commandCode.planLabel), assetName: "CommandCodeLogo", toolName: "Command Code", specs: commandCodeSpecs(commandCode), updatedAtISO: commandCode.cachedAt, isStale: commandCode.stale ?? false)
+            }
+        case "qoder":
+            if let qoder = limits.qoder, qoder.configured, qoder.error == nil {
+                return toolSection(id: id, title: planTitle("Qoder", qoder.planLabel), assetName: "QoderLogo", toolName: "Qoder", specs: qoderSpecs(qoder), updatedAtISO: qoder.cachedAt, isStale: qoder.stale ?? false)
+            }
+        case "qoderCn":
+            if let qoderCn = limits.qoderCn, qoderCn.configured, qoderCn.error == nil {
+                return toolSection(id: id, title: planTitle("Qoder CN", qoderCn.planLabel), assetName: "QoderCnLogo", toolName: "Qoder CN", specs: qoderSpecs(qoderCn), updatedAtISO: qoderCn.cachedAt, isStale: qoderCn.stale ?? false)
+            }
+        case "codingPlan":
+            if let codingPlan = limits.codingPlan, codingPlan.configured, codingPlan.error == nil {
+                return toolSection(id: id, title: planTitle("Ark Coding Plan", codingPlan.planLabel), assetName: "VolcanoArkLogo", toolName: "Ark Coding Plan", specs: codingPlanSpecs(codingPlan), updatedAtISO: codingPlan.cachedAt, isStale: codingPlan.stale ?? false)
+            }
+        case "agentPlan":
+            if let agentPlan = limits.agentPlan, agentPlan.configured, agentPlan.error == nil {
+                return toolSection(id: id, title: planTitle("Ark Agent Plan", agentPlan.planLabel), assetName: "VolcanoArkLogo", toolName: "Ark Agent Plan", specs: agentPlanSpecs(agentPlan), updatedAtISO: agentPlan.cachedAt, isStale: agentPlan.stale ?? false)
+            }
+        case "devin":
+            if let devin = limits.devin, devin.configured, devin.error == nil {
+                return toolSection(id: id, title: planTitle("Devin", devin.planLabel), assetName: "DevinLogo", toolName: "Devin", specs: devinSpecs(devin), updatedAtISO: devin.cachedAt, isStale: devin.stale ?? false)
+            }
+        default:
+            break
         }
-        return groups
+        // No usable quota record for this provider (not connected, subscription
+        // inactive, or a fetch error). A subscription the user entered by hand
+        // still belongs on the panel: it is manual data, so its bar and date
+        // must not disappear because the tool's own quota fetch failed.
+        return subscriptionOnlySection(id: id)
+    }
+
+    /// Provider heading plus the subscription row, for providers whose quota
+    /// data is unavailable. Deliberately carries no quota rows, no explanation
+    /// popover and no status line — only the renewal progress the user entered.
+    private func subscriptionOnlySection(id: String) -> AnyView? {
+        guard let subscription = subscriptionByProvider[id] else { return nil }
+        return AnyView(VStack(alignment: .leading, spacing: 5) {
+            HStack(spacing: 5) {
+                if let assetName = Self.providerIconAssetNames[id] {
+                    brandIcon(assetName)
+                        .frame(width: 14, height: 14)
+                }
+                Text(LimitsSettingsStore.displayNames[id] ?? id)
+                    .font(.system(.caption, design: .default))
+                    .modifier(FontWeightModifier(weight: .medium))
+                subscriptionBadge(subscription)
+                Spacer()
+            }
+            VStack(spacing: 4) {
+                subscriptionRow(for: subscription)
+            }
+        })
+    }
+
+    /// Auto-renew / stops-at-expiry glyph shown next to a provider's name.
+    private func subscriptionBadge(_ subscription: SubscriptionRecord) -> some View {
+        Image(systemName: subscription.autoRenew ? "infinity" : "clock")
+            .font(.system(size: 10, weight: .medium))
+            .foregroundStyle(subscription.autoRenew ? Color.accentColor : Color.secondary)
+            .help(subscription.autoRenew ? Strings.subscriptionAutoRenewBadge : Strings.subscriptionStopsBadge)
+            .accessibilityLabel(subscription.autoRenew ? Strings.subscriptionAutoRenewBadge : Strings.subscriptionStopsBadge)
     }
 
     // MARK: - Tool Section
@@ -187,15 +284,29 @@ struct UsageLimitsView: View {
         // Active status-page incident (Claude), rendered as a tappable row under the
         // bars so upstream outages explain themselves instead of reading as app bugs.
         serviceStatus: ProviderServiceStatus? = nil
-    ) -> some View {
+    ) -> AnyView? {
+        let subscription = subscriptionByProvider[id]
+        // No quota rows and no subscription/reset/status content means there is
+        // nothing meaningful under the heading — return nil rather than render
+        // a bare provider title.
+        guard !specs.isEmpty || subscription != nil || !resetRows.isEmpty
+            || resetStatus != nil || serviceStatus != nil else {
+            return nil
+        }
+        if subscription != nil && SubscriptionSectionPolicy.usesSubscriptionOnly(
+            hasQuotaRows: !specs.isEmpty,
+            hasResetContent: !resetRows.isEmpty || resetStatus != nil,
+            hasServiceStatus: serviceStatus != nil
+        ) {
+            return subscriptionOnlySection(id: id)
+        }
         let isOpen = Binding(
             get: { explainingProvider == id },
             set: { explainingProvider = $0 ? id : nil }
         )
         let updatedAt = resetDate(iso: updatedAtISO ?? limits?.fetchedAt)
         let retryAt = resetDate(iso: retryAtISO)
-        let subscription = subscriptionByProvider[id]
-        return VStack(alignment: .leading, spacing: 5) {
+        return AnyView(VStack(alignment: .leading, spacing: 5) {
             HStack(spacing: 5) {
                 if let assetName {
                     brandIcon(assetName)
@@ -205,11 +316,7 @@ struct UsageLimitsView: View {
                     .font(.system(.caption, design: .default))
                     .modifier(FontWeightModifier(weight: .medium))
                 if let sub = subscription {
-                    Image(systemName: sub.autoRenew ? "infinity" : "clock")
-                        .font(.system(size: 10, weight: .medium))
-                        .foregroundStyle(sub.autoRenew ? Color.accentColor : Color.secondary)
-                        .help(sub.autoRenew ? Strings.subscriptionAutoRenewBadge : Strings.subscriptionStopsBadge)
-                        .accessibilityLabel(sub.autoRenew ? Strings.subscriptionAutoRenewBadge : Strings.subscriptionStopsBadge)
+                    subscriptionBadge(sub)
                 }
                 if let titleSuffix {
                     Text(titleSuffix)
@@ -220,7 +327,7 @@ struct UsageLimitsView: View {
             }
             VStack(spacing: 4) {
                 ForEach(specs) { spec in
-                    limitRow(label: spec.label, pct: spec.pct, reset: spec.resetText, toolName: toolName, windowSeconds: spec.windowSeconds, resetDate: spec.resetDate)
+                    limitRow(label: spec.label, pct: spec.pct, reset: spec.resetText, toolName: toolName, windowSeconds: spec.windowSeconds, resetDate: spec.resetDate, share: spec.share)
                 }
                 if let sub = subscription {
                     subscriptionRow(for: sub)
@@ -239,7 +346,7 @@ struct UsageLimitsView: View {
             // Keep on one line: codex-reset-bank guardrail tests assert this exact
             // call shape to prove reset-bank rows never leak into the explanation.
             LimitsExplainContent(providerName: title, specs: specs, remainingMode: settings.displayMode == .remaining, updatedAt: updatedAt, isStale: isStale, retryAt: retryAt)
-        }
+        })
     }
 
     // MARK: - Service status (status-page incident row)
@@ -279,14 +386,14 @@ struct UsageLimitsView: View {
 
     // MARK: - Window specs (one source of truth for rows + the explain popover)
 
-    private func makeSpec(_ label: String, _ pct: Double, windowSeconds: Double? = nil, iso: String?) -> LimitWindowSpec {
+    private func makeSpec(_ label: String, _ pct: Double, windowSeconds: Double? = nil, iso: String?, share: Bool = false) -> LimitWindowSpec {
         let date = resetDate(iso: iso)
-        return LimitWindowSpec(label: label, pct: pct, windowSeconds: windowSeconds, resetDate: date, resetText: date.map(relativeString))
+        return LimitWindowSpec(label: label, pct: pct, windowSeconds: windowSeconds, resetDate: date, resetText: date.map(relativeString), share: share)
     }
 
-    private func makeSpec(_ label: String, _ pct: Double, windowSeconds: Double? = nil, epoch: Int?) -> LimitWindowSpec {
+    private func makeSpec(_ label: String, _ pct: Double, windowSeconds: Double? = nil, epoch: Int?, share: Bool = false) -> LimitWindowSpec {
         let date = resetDate(epoch: epoch)
-        return LimitWindowSpec(label: label, pct: pct, windowSeconds: windowSeconds, resetDate: date, resetText: date.map(relativeString))
+        return LimitWindowSpec(label: label, pct: pct, windowSeconds: windowSeconds, resetDate: date, resetText: date.map(relativeString), share: share)
     }
 
     private func claudeSpecs(_ c: ClaudeLimits) -> [LimitWindowSpec] {
@@ -411,15 +518,26 @@ struct UsageLimitsView: View {
             s.append(makeSpec(Strings.grokPrimaryLabel(periodType: g.periodType), w.usedPercent, windowSeconds: windowSeconds, iso: w.resetAt))
         }
         if let w = g.secondaryWindow { s.append(makeSpec(Strings.grokOndemandLabel, w.usedPercent, iso: w.resetAt)) }
+        // No windowSeconds: a product percent is a share of the pool, not its own quota.
+        for entry in g.products ?? [] {
+            guard let window = entry.window, let product = entry.product, !product.isEmpty else { continue }
+            let label = Strings.grokProductLabel(product: product, fallback: entry.label)
+            guard !label.isEmpty else { continue }
+            s.append(makeSpec(label, window.usedPercent, iso: window.resetAt, share: true))
+        }
         return s
     }
 
+    /// Rows for ZCode: fixed coding-plan windows, labelled start-plan buckets, or the legacy GLM labels.
     private func zcodeSpecs(_ z: ZcodeLimits) -> [LimitWindowSpec] {
         var s: [LimitWindowSpec] = []
         if z.planKind == "coding-plan" {
             if let w = z.primaryWindow { s.append(makeSpec("5h", w.usedPercent, iso: w.resetAt)) }
             if let w = z.secondaryWindow { s.append(makeSpec("Weekly", w.usedPercent, iso: w.resetAt)) }
             if let w = z.tertiaryWindow { s.append(makeSpec("Tools", w.usedPercent, iso: w.resetAt)) }
+        } else if let buckets = z.labeledBuckets {
+            // One row per balance bucket, labelled by the server (model, plus promotion name for one-time grants).
+            for b in buckets { s.append(makeSpec(b.label, b.window.usedPercent, iso: b.window.resetAt)) }
         } else {
             if let w = z.primaryWindow { s.append(makeSpec("GLM-5.2", w.usedPercent, iso: w.resetAt)) }
             if let w = z.secondaryWindow { s.append(makeSpec("GLM-5-Turbo", w.usedPercent, iso: w.resetAt)) }
@@ -439,6 +557,13 @@ struct UsageLimitsView: View {
         var s: [LimitWindowSpec] = []
         if let w = c.primaryWindow { s.append(makeSpec("5h", w.usedPercent, windowSeconds: 5 * 3600, iso: w.resetAt)) }
         if let w = c.secondaryWindow { s.append(makeSpec("Weekly", w.usedPercent, windowSeconds: 7 * 86400, iso: w.resetAt)) }
+        return s
+    }
+
+    private func devinSpecs(_ d: DevinLimits) -> [LimitWindowSpec] {
+        var s: [LimitWindowSpec] = []
+        if let w = d.primaryWindow { s.append(makeSpec("Daily", w.usedPercent, windowSeconds: w.limitWindowSeconds ?? 86400, iso: w.resetAt)) }
+        if let w = d.secondaryWindow { s.append(makeSpec("Weekly", w.usedPercent, windowSeconds: w.limitWindowSeconds ?? 7 * 86400, iso: w.resetAt)) }
         return s
     }
 
@@ -487,25 +612,57 @@ struct UsageLimitsView: View {
 
     // MARK: - Row
 
+    /// Shared row-label column: every row matches the widest visible label so
+    /// bars align. The visible text truncates with an ellipsis once the column
+    /// hits `labelColumnMaxWidth` — a long model/plan name must not squeeze
+    /// every bar — while a hidden fixed-size copy keeps reporting the label's
+    /// natural width so the column still grows with the widest label. The full
+    /// text stays reachable through the hover tooltip.
+    private func rowLabel(_ text: String) -> some View {
+        Text(text)
+            .font(.system(.caption, design: .default))
+            .foregroundStyle(.secondary)
+            .lineLimit(1)
+            // Unmeasured first pass renders at natural width (as if fixedSize);
+            // from the second pass on, the shared column width applies and
+            // truncation kicks in past the cap.
+            .fixedSize(horizontal: labelColumnWidth == 0, vertical: false)
+            .frame(width: labelColumnWidth > 0 ? min(labelColumnWidth, Self.labelColumnMaxWidth) : nil, alignment: .leading)
+            .background(alignment: .topLeading) {
+                Text(text)
+                    .font(.system(.caption, design: .default))
+                    .lineLimit(1)
+                    .fixedSize(horizontal: true, vertical: false)
+                    .opacity(0)
+                    .accessibilityHidden(true)
+                    .background(GeometryReader { proxy in
+                        Color.clear.preference(key: LimitLabelWidthKey.self, value: proxy.size.width)
+                    })
+            }
+            .help(text)
+    }
+
     private func limitRow(
         label: String,
         pct: Double,
         reset: String?,
         toolName: String,
         windowSeconds: Double? = nil,
-        resetDate: Date? = nil
+        resetDate: Date? = nil,
+        share: Bool = false
     ) -> some View {
         let rawClamped = min(max(pct, 0), 100)
         let usedFraction = rawClamped / 100.0
-        let displayValue = settings.displayMode == .remaining ? (100 - rawClamped) : rawClamped
+        // A product share stays the used percent. Flipping it would draw 13% of the pool as 87% left.
+        let flipsToRemaining = settings.displayMode == .remaining && !share
+        let displayValue = flipsToRemaining ? (100 - rawClamped) : rawClamped
 
         // Unified threshold fill (green → amber → red), based on actual usage so
         // the color reads the same in used and remaining modes.
         let fillColor = Color.limitBar(fraction: usedFraction)
 
         // Time-aware pace mark (CodexBar-style notch). Shown once the window has
-        // meaningful usage (≥5%) so a fresh window doesn't float a mark in empty
-        // track. Green when on/under pace, red when ahead (deficit). Requires a
+        // nonzero usage. Green when on/under pace, red when ahead (deficit). Requires a
         // trusted window length; monthly / billing-cycle windows show no mark.
         var pacePercent: Double?
         var paceOver = false
@@ -513,7 +670,7 @@ struct UsageLimitsView: View {
             let pace = LimitPace.compute(
                 usedFraction: usedFraction,
                 windowSeconds: windowSeconds,
-                secondsUntilReset: max(0, resetDate.timeIntervalSinceNow),
+                secondsUntilReset: resetDate.timeIntervalSinceNow,
                 remainingMode: settings.displayMode == .remaining
             )
             pacePercent = pace.pacePercent
@@ -525,19 +682,11 @@ struct UsageLimitsView: View {
             label: label,
             percent: Int(displayValue.rounded()),
             reset: reset,
-            modeSuffix: settings.displayMode == .remaining ? Strings.limitSuffixRemaining : Strings.limitSuffixUsed
+            modeSuffix: flipsToRemaining ? Strings.limitSuffixRemaining : Strings.limitSuffixUsed
         )
 
         return HStack(spacing: Self.rowColumnSpacing) {
-            Text(label)
-                .font(.system(.caption, design: .default))
-                .foregroundStyle(.secondary)
-                .lineLimit(1)
-                .fixedSize(horizontal: true, vertical: false)
-                .background(GeometryReader { proxy in
-                    Color.clear.preference(key: LimitLabelWidthKey.self, value: proxy.size.width)
-                })
-                .frame(width: labelColumnWidth > 0 ? labelColumnWidth : nil, alignment: .leading)
+            rowLabel(label)
 
             UsageLimitBar(
                 percent: displayValue,
@@ -558,7 +707,15 @@ struct UsageLimitsView: View {
                     .font(.system(.caption2, design: .default))
                     .monospacedDigit()
                     .foregroundStyle(.tertiary)
-                    .frame(width: Self.relativeResetColumnWidth, alignment: .trailing)
+                    .lineLimit(1)
+                    // Never wrap: the column grows to the widest reset label,
+                    // so a long "已过期" stays on one line instead of raising
+                    // the row height.
+                    .fixedSize(horizontal: true, vertical: false)
+                    .background(GeometryReader { proxy in
+                        Color.clear.preference(key: LimitResetWidthKey.self, value: proxy.size.width)
+                    })
+                    .frame(width: resetColumnWidth > 0 ? effectiveResetColumnWidth : nil, alignment: .trailing)
             }
         }
         .accessibilityElement(children: .ignore)
@@ -581,15 +738,7 @@ struct UsageLimitsView: View {
         let a11y = "\(Strings.subscriptionLabel) \(percentLabel) \(remaining)"
         return AnyView(
             HStack(spacing: Self.rowColumnSpacing) {
-                Text(Strings.subscriptionLabel)
-                    .font(.system(.caption, design: .default))
-                    .foregroundStyle(.secondary)
-                    .lineLimit(1)
-                    .fixedSize(horizontal: true, vertical: false)
-                    .background(GeometryReader { proxy in
-                        Color.clear.preference(key: LimitLabelWidthKey.self, value: proxy.size.width)
-                    })
-                    .frame(width: labelColumnWidth > 0 ? labelColumnWidth : nil, alignment: .leading)
+                rowLabel(Strings.subscriptionLabel)
 
                 UsageLimitBar(
                     percent: clampedPct,
@@ -608,7 +757,13 @@ struct UsageLimitsView: View {
                     .font(.system(.caption2, design: .default))
                     .monospacedDigit()
                     .foregroundStyle(view.expired ? AnyShapeStyle(Color.red) : AnyShapeStyle(.tertiary))
-                    .frame(width: Self.relativeResetColumnWidth, alignment: .trailing)
+                    .lineLimit(1)
+                    // Same never-wrap rule as the limit rows' reset column.
+                    .fixedSize(horizontal: true, vertical: false)
+                    .background(GeometryReader { proxy in
+                        Color.clear.preference(key: LimitResetWidthKey.self, value: proxy.size.width)
+                    })
+                    .frame(width: resetColumnWidth > 0 ? effectiveResetColumnWidth : nil, alignment: .trailing)
             }
             .accessibilityElement(children: .ignore)
             .accessibilityLabel(a11y)
@@ -639,15 +794,7 @@ struct UsageLimitsView: View {
 
     private func resetRow(_ row: CodexResetRowSpec) -> some View {
         HStack(spacing: Self.rowColumnSpacing) {
-            Text(row.label)
-                .font(.system(.caption, design: .default))
-                .foregroundStyle(.secondary)
-                .lineLimit(1)
-                .fixedSize(horizontal: true, vertical: false)
-                .background(GeometryReader { proxy in
-                    Color.clear.preference(key: LimitLabelWidthKey.self, value: proxy.size.width)
-                })
-                .frame(width: labelColumnWidth > 0 ? labelColumnWidth : nil, alignment: .leading)
+            rowLabel(row.label)
 
             UsageLimitBar(
                 percent: row.lifetimeRemainingPercent,
@@ -662,7 +809,7 @@ struct UsageLimitsView: View {
                 .foregroundStyle(.tertiary)
                 .lineLimit(1)
                 .minimumScaleFactor(0.8)
-                .frame(width: Self.resetExpiryColumnWidth, alignment: .trailing)
+                .frame(width: resetExpiryColumnWidth, alignment: .trailing)
         }
         .help(row.detail ?? "")
         .accessibilityElement(children: .ignore)
@@ -729,7 +876,7 @@ struct UsageLimitsView: View {
     @ViewBuilder
     private func brandIcon(_ name: String) -> some View {
         switch name {
-        case "CursorLogo", "KimiLogo", "KiroLogo", "GrokLogo", "CopilotLogo", "ZcodeLogo", "OpenCodeLogo", "CommandCodeLogo", "QoderLogo", "QoderCnLogo", "VolcanoArkLogo":
+        case "CursorLogo", "KimiLogo", "KiroLogo", "GrokLogo", "CopilotLogo", "ZcodeLogo", "OpenCodeLogo", "CommandCodeLogo", "QoderLogo", "QoderCnLogo", "VolcanoArkLogo", "DevinLogo":
             let filename: String = {
                 switch name {
                 case "CursorLogo": return "cursor.svg"
@@ -742,6 +889,7 @@ struct UsageLimitsView: View {
                 case "QoderLogo": return "qoder.svg"
                 case "QoderCnLogo": return "qoder-cn.svg"
                 case "VolcanoArkLogo": return "volcano-ark.svg"
+                case "DevinLogo": return "devin.svg"
                 default: return "copilot.svg"
                 }
             }()
@@ -898,6 +1046,15 @@ private struct LimitLabelWidthKey: PreferenceKey {
     }
 }
 
+/// Reports the widest trailing reset label ("5d", "已过期", …) so every row's
+/// reset column can match it and bars share the same right edge.
+private struct LimitResetWidthKey: PreferenceKey {
+    static var defaultValue: CGFloat = 0
+    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) {
+        value = max(value, nextValue())
+    }
+}
+
 private struct CodexResetRowSpec: Identifiable {
     var id: String { label }
     let label: String
@@ -968,6 +1125,8 @@ private struct LimitWindowSpec: Identifiable {
     let windowSeconds: Double?
     let resetDate: Date?
     let resetText: String?
+    /// True when `pct` is a share of another window, not a quota of its own.
+    var share: Bool = false
 }
 
 /// Side popover with this provider's live per-window numbers (used %, even-pace %,
@@ -1044,11 +1203,19 @@ private struct LimitsExplainContent: View {
     }
 
     private var hasPaceMarker: Bool {
-        specs.contains { spec in
-            spec.pct >= 5
-                && (spec.windowSeconds ?? 0) > 0
-                && spec.resetDate != nil
+        specs.contains { pace(for: $0).pacePercent != nil }
+    }
+
+    private func pace(for spec: LimitWindowSpec) -> LimitPace.Result {
+        guard let windowSeconds = spec.windowSeconds, let resetDate = spec.resetDate else {
+            return LimitPace.Result()
         }
+        return LimitPace.compute(
+            usedFraction: min(max(spec.pct, 0), 100) / 100.0,
+            windowSeconds: windowSeconds,
+            secondsUntilReset: resetDate.timeIntervalSinceNow,
+            remainingMode: remainingMode
+        )
     }
 
     /// Live pace numbers + current-rate projection for one window, via the shared
@@ -1056,18 +1223,10 @@ private struct LimitsExplainContent: View {
     private func line(for spec: LimitWindowSpec) -> String {
         let usedFraction = min(max(spec.pct, 0), 100) / 100.0
         let used = Int((usedFraction * 100).rounded())
-        var pace = LimitPace.Result()
-        if let windowSeconds = spec.windowSeconds, windowSeconds > 0, let resetDate = spec.resetDate {
-            pace = LimitPace.compute(
-                usedFraction: usedFraction,
-                windowSeconds: windowSeconds,
-                secondsUntilReset: max(0, resetDate.timeIntervalSinceNow),
-                remainingMode: remainingMode
-            )
-        }
+        let pace = pace(for: spec)
         var text = Strings.limitWindowExplainLine(
             label: spec.label, used: used, expected: pace.expectedPercent, over: pace.paceOver,
-            runsOutEta: pace.runsOutEta, projectedEnd: pace.projectedEnd, remainingMode: remainingMode
+            runsOutEta: pace.runsOutEta, projectedEnd: pace.projectedEnd, remainingMode: remainingMode && !spec.share
         )
         // Exact local reset instant (#248) — the row itself only shows a compact
         // relative countdown, so the popover carries the precise time.

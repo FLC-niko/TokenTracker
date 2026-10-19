@@ -1,4 +1,4 @@
-import React, { useCallback, useState } from "react";
+import React, { useCallback } from "react";
 import { motion } from "motion/react";
 import {
   DndContext,
@@ -20,9 +20,6 @@ import { UsageOverview } from "../components/UsageOverview.jsx";
 import { TrendMonitor } from "../components/TrendMonitor.jsx";
 import { SortableCard } from "../components/SortableCard.jsx";
 import { FadeIn } from "../../foundation/FadeIn.jsx";
-import { MacAppBanner } from "../components/MacAppBanner.jsx";
-import { WidgetOnboardingCard } from "../components/WidgetOnboardingCard.jsx";
-import { IslandOnboardingCard } from "../components/IslandOnboardingCard.jsx";
 import { QualityPerDollarCard } from "../components/QualityPerDollarCard.jsx";
 import { SessionInsightsCard } from "../components/SessionInsightsCard.jsx";
 import { LoginCard } from "../../../components/LoginCard.jsx";
@@ -39,10 +36,6 @@ const GATE_LOGOS = AGENT_LOGOS.slice(0, 10);
 const STEP = 0.06;
 const D_LEFT_BASE = 0.11;
 const D_RIGHT_BASE = 0.05;
-// islandOnboarding must NOT be prunable: it renders null until the native
-// bridge pushes settings (async), and a pruned card is unmounted for good —
-// it would never get the chance to appear once settings arrive.
-const EMPTY_PRUNABLE_CARD_IDS = new Set(["macAppBanner", "widgetOnboarding"]);
 
 function FullPageGateLayout({ title, subtitle, desc, loginCard, copy }) {
   return (
@@ -207,26 +200,9 @@ export function DashboardView(props) {
   const header = null;
   const footer = null;
 
-  // Cards that are permanently hidden after mount (dismissed native banners,
-  // widget onboarding) get dropped from sortable `items` entirely. Async cards
-  // such as QualityPerDollarCard must stay mounted while their data loads.
-  const [emptyCardIds, setEmptyCardIds] = useState(() => new Set());
-  const handleCardEmptyChange = useCallback((id, isEmpty) => {
-    if (!EMPTY_PRUNABLE_CARD_IDS.has(id)) return;
-    setEmptyCardIds((prev) => {
-      if (prev.has(id) === isEmpty) return prev;
-      const next = new Set(prev);
-      if (isEmpty) next.add(id);
-      else next.delete(id);
-      return next;
-    });
-  }, []);
-
+  // Ignore removed promotional cards in older saved layouts before registering sortable items.
   const leftVisible = {
-    macAppBanner: isLocalMode,
     statsPanel: true,
-    islandOnboarding: isLocalMode,
-    widgetOnboarding: isLocalMode,
     installCopy: shouldShowInstall,
     activityHeatmap: Boolean(activityHeatmapBlock),
     deviceUsage: Boolean(deviceUsageBlock),
@@ -235,7 +211,7 @@ export function DashboardView(props) {
     sessionInsights: isLocalMode && !screenshotMode,
   };
   const visibleLeftOrder = (leftCardOrder || []).filter(
-    (id) => leftVisible[id] && !emptyCardIds.has(id),
+    (id) => leftVisible[id],
   );
 
   const rightVisible = {
@@ -243,20 +219,11 @@ export function DashboardView(props) {
     dataDetails: !screenshotMode,
   };
   const visibleRightOrder = (rightCardOrder || []).filter(
-    (id) => rightVisible[id] && !emptyCardIds.has(id),
+    (id) => rightVisible[id],
   );
 
   function renderLeftCard(id, delay) {
     switch (id) {
-      case "macAppBanner": {
-        return (
-          <MacAppBanner
-            todayTokens={summaryTotalTokensRaw}
-            isSyncing={usageLoadingState}
-            enterDelay={delay}
-          />
-        );
-      }
       case "statsPanel": {
         return (
           <FadeIn delay={delay}>
@@ -273,12 +240,6 @@ export function DashboardView(props) {
             />
           </FadeIn>
         );
-      }
-      case "islandOnboarding": {
-        return <IslandOnboardingCard enterDelay={delay} />;
-      }
-      case "widgetOnboarding": {
-        return <WidgetOnboardingCard enterDelay={delay} />;
       }
       case "installCopy": {
         return (
@@ -460,7 +421,7 @@ export function DashboardView(props) {
       <DndContext sensors={sensors} onDragEnd={onDragEnd}>
         <SortableContext items={order} strategy={verticalListSortingStrategy}>
           {order.map((id, i) => (
-            <SortableCard key={id} id={id} onEmptyChange={handleCardEmptyChange}>
+            <SortableCard key={id} id={id}>
               {renderCard(id, baseDelay + STEP * i)}
             </SortableCard>
           ))}

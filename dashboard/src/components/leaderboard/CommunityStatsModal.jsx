@@ -43,6 +43,7 @@ const PROVIDER_BAR_COLORS = {
   WORKBUDDY: "var(--community-workbuddy)",
   MINIMAX: "var(--community-minimax)",
   DROID: "var(--community-droid)",
+  DUMATE: "var(--community-dumate)",
 };
 
 function providerBarColor(provider) {

@@ -28,6 +28,7 @@
 
 const fs = require("node:fs");
 const path = require("node:path");
+const { expandHome } = require("./scan-roots");
 
 /**
  * @typedef {Object} PassiveProvider
@@ -89,7 +90,7 @@ function classifyWritableFailure(filePath) {
  *   every_code, opencode, openclaw, codebuddy, workbuddy, grok }
  * @returns {PassiveProvider[]}
  */
-function detectPassiveProviders({ home, hookStatus }) {
+function detectPassiveProviders({ home, hookStatus, env = process.env }) {
   const out = [];
 
   // Claude Code — logs at ~/.claude/projects/<name>/*.jsonl
@@ -128,6 +129,18 @@ function detectPassiveProviders({ home, hookStatus }) {
     settingsPath: path.join(home, ".codex", "config.toml"),
   }));
 
+  const acodeHome = env.TOKENTRACKER_ACODE_HOME || path.join(home, ".acode");
+  out.push(buildEntry({
+    name: "acode",
+    hookExpected: true,
+    hookInstalled: Boolean(hookStatus?.acode_notify ?? hookStatus?.acode),
+    logsDir: acodeHome,
+    logsPredicate: (_full, name, isDir) =>
+      (isDir && (name === "sessions" || name === "archived_sessions")) ||
+      (!isDir && name.endsWith(".jsonl")),
+    settingsPath: path.join(acodeHome, "config.toml"),
+  }));
+
   // Every Code — same shape as Codex, different home
   out.push(buildEntry({
     name: "every_code",
@@ -157,6 +170,17 @@ function detectPassiveProviders({ home, hookStatus }) {
     logsDir: path.join(home, ".workbuddy"),
     logsPredicate: (_full, name) => name === "projects" || name.endsWith(".jsonl"),
     settingsPath: path.join(home, ".workbuddy", "settings.json"),
+  }));
+
+  // WorkBuddy AI — international build; data + hooks in ~/.workbuddy-ai
+  const workbuddyAiHome = expandHome(env.WORKBUDDY_AI_HOME, home) || path.join(home, ".workbuddy-ai");
+  out.push(buildEntry({
+    name: "workbuddy-ai",
+    hookExpected: true,
+    hookInstalled: Boolean(hookStatus?.["workbuddy-ai"]),
+    logsDir: workbuddyAiHome,
+    logsPredicate: (_full, name) => name === "projects" || name.endsWith(".jsonl"),
+    settingsPath: path.join(workbuddyAiHome, "settings.json"),
   }));
 
   return out;

@@ -2,26 +2,30 @@ import React from "react";
 import { cn } from "../../lib/cn";
 import { Card } from "../../ui/components";
 
-export function ToggleSwitch({ checked, onChange, disabled, ariaLabel }) {
+export function ToggleSwitch({ checked, onChange, disabled, ariaLabel, id }) {
   return (
     <button
       type="button"
+      id={id}
       role="switch"
       aria-checked={checked}
       aria-label={ariaLabel}
       onClick={onChange}
       disabled={disabled}
-      className={cn(
-        "relative inline-flex h-5 w-9 shrink-0 items-center rounded-full transition-colors focus:outline-none focus-visible:ring-2 focus-visible:ring-oai-brand-500 disabled:opacity-50 disabled:cursor-not-allowed",
-        checked ? "bg-oai-brand-500" : "bg-oai-gray-300 dark:bg-oai-gray-700",
-      )}
+      className="relative inline-flex h-11 w-11 min-h-11 min-w-11 shrink-0 items-center justify-center rounded-full bg-transparent p-0 focus:outline-none focus-visible:ring-2 focus-visible:ring-oai-brand-500 disabled:cursor-not-allowed disabled:opacity-50"
     >
       <span
+        aria-hidden="true"
         className={cn(
-          "inline-block h-3.5 w-3.5 rounded-full bg-white transition-transform",
-          checked ? "translate-x-[18px]" : "translate-x-[3px]",
+          "tt-toggle-track relative inline-flex h-5 w-9 shrink-0 items-center rounded-full transition-colors",
+          checked ? "bg-oai-brand-500" : "bg-oai-gray-300 dark:bg-oai-gray-700",
         )}
-      />
+      >
+        <span className={cn(
+          "tt-toggle-thumb inline-block h-3.5 w-3.5 rounded-full bg-white transition-transform",
+          checked ? "translate-x-[18px]" : "translate-x-[3px]",
+        )} />
+      </span>
     </button>
   );
 }
@@ -43,7 +47,7 @@ export function SettingsRow({ label, hint, control }) {
 export function SectionCard({ title, subtitle, action, children }) {
   return (
     <Card className="rounded-lg">
-      <div className="mb-3 flex items-start justify-between gap-4">
+      <div className={cn("flex justify-between gap-4", subtitle ? "mb-3 items-start" : "mb-2 items-center")}>
         <div className="min-w-0 flex-1">
           <h2 className="text-sm font-medium text-oai-gray-500 dark:text-oai-gray-300 uppercase tracking-wide">
             {title}
@@ -63,6 +67,9 @@ export function SectionCard({ title, subtitle, action, children }) {
   );
 }
 
+export const SETTINGS_INPUT_CLASS =
+  "w-full rounded-md border border-oai-gray-300 bg-transparent px-2.5 py-1.5 text-sm text-oai-black outline-none transition-colors focus:border-oai-brand-500 focus:ring-1 focus:ring-inset focus:ring-oai-brand-500 dark:border-oai-gray-700 dark:text-white";
+
 export function SegmentedControl({ options, value, onChange, disabled = false }) {
   return (
     <div className="inline-flex items-center rounded-lg border border-oai-gray-200 bg-oai-gray-50 p-0.5 dark:border-oai-gray-800 dark:bg-oai-gray-900">
@@ -76,7 +83,7 @@ export function SegmentedControl({ options, value, onChange, disabled = false })
             aria-pressed={active}
             disabled={disabled}
             className={cn(
-              "inline-flex items-center gap-1.5 rounded-md px-3 py-1.5 text-xs font-medium transition-colors disabled:cursor-not-allowed disabled:opacity-50",
+              "inline-flex items-center gap-1.5 rounded-md px-3 py-1.5 text-xs font-medium transition-colors focus:outline-none focus-visible:ring-2 focus-visible:ring-oai-brand-500 disabled:cursor-not-allowed disabled:opacity-50",
               active
                 ? "bg-white text-oai-black shadow-sm dark:bg-oai-gray-800 dark:text-white"
                 : "text-oai-gray-500 hover:text-oai-black dark:text-oai-gray-400 dark:hover:text-white",

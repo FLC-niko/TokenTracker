@@ -26,6 +26,11 @@ final class DashboardWindowController: NSObject, NSWindowDelegate, WKNavigationD
     private var webView: WKWebView?
     private var loadingOverlay: NSView?
     private var loadingHostingController: NSHostingController<AnyView>?
+    /// Non-nil while the window is parked on the "couldn't load" state, which is
+    /// also how a reopen tells that the window needs a fresh load rather than a
+    /// plain order-front.
+    private var loadFailureOverlay: NSView?
+    private var loadFailureHostingController: NSHostingController<AnyView>?
     /// A newly launched app may overlap the previous version briefly while the
     /// updater relaunches it. Keep every WKWebView request queued until
     /// ServerManager has replaced the listener on the fixed dashboard port.
@@ -43,6 +48,7 @@ final class DashboardWindowController: NSObject, NSWindowDelegate, WKNavigationD
 
     /// Shared process pool — ensures cookies are consistent across webView recreations
     private static let sharedProcessPool = WKProcessPool()
+    private static let qaDataStore = WKWebsiteDataStore.nonPersistent()
 
     private override init() {
         super.init()
@@ -74,6 +80,12 @@ final class DashboardWindowController: NSObject, NSWindowDelegate, WKNavigationD
         if let window {
             window.makeKeyAndOrderFront(nil)
             NSApp.activate(ignoringOtherApps: true)
+            // Reopening a window that never loaded must start a new attempt,
+            // otherwise the user keeps landing on the same dead overlay.
+            if loadFailureOverlay != nil {
+                reload()
+                return
+            }
             syncChromeAppearanceFromWebView()
             injectMainCardCornerRadius()
             return
@@ -81,11 +93,16 @@ final class DashboardWindowController: NSObject, NSWindowDelegate, WKNavigationD
 
         // Create WKWebView with persistent data store and shared process pool
         let contentController = WKUserContentController()
+        if let profile = NativeQAProfile.current {
+            guard let script = try? profile.transportScript() else { fatalError("Native QA transport unavailable") }
+            contentController.addUserScript(WKUserScript(source: script, injectionTime: .atDocumentStart, forMainFrameOnly: true))
+        }
         contentController.add(self, name: "nativeOAuth")
         contentController.add(self, name: "nativeBridge")
         // Earliest paint: transparent root so NSVisualEffectView is visible (index.html also sets native-app via nativeBridge).
         let transparencyBootstrap = """
         (function(){
+          window.__TOKENTRACKER_CLOUD_EXPORT__ = true;
           document.documentElement.classList.add('native-app');
           var s=document.createElement('style');
           s.textContent='html,html.dark{background:transparent!important}body{background:transparent!important}';
@@ -101,7 +118,7 @@ final class DashboardWindowController: NSObject, NSWindowDelegate, WKNavigationD
         let webConfig = WKWebViewConfiguration()
         webConfig.userContentController = contentController
         webConfig.processPool = Self.sharedProcessPool
-        webConfig.websiteDataStore = WKWebsiteDataStore.default()
+        webConfig.websiteDataStore = NativeQAProfile.current == nil ? WKWebsiteDataStore.default() : Self.qaDataStore
         let webView = WKWebView(frame: .zero, configuration: webConfig)
         webView.navigationDelegate = self
         webView.uiDelegate = self
@@ -132,10 +149,7 @@ final class DashboardWindowController: NSObject, NSWindowDelegate, WKNavigationD
         container.addSubview(dragBar)
 
         // Loading overlay with spinner
-        let overlay = makeLoadingOverlay()
-        overlay.translatesAutoresizingMaskIntoConstraints = false
-        container.addSubview(overlay)
-        self.loadingOverlay = overlay
+        installLoadingOverlay(in: container)
 
         NSLayoutConstraint.activate([
             webView.topAnchor.constraint(equalTo: container.topAnchor),
@@ -148,10 +162,6 @@ final class DashboardWindowController: NSObject, NSWindowDelegate, WKNavigationD
             // Must match dashboard `AppLayout` top `h-7` (28pt) drag strip. A taller bar covers the
             // sidebar Sign in button, causing mouseDown to be consumed by performDrag.
             dragBar.heightAnchor.constraint(equalToConstant: 28),
-            overlay.topAnchor.constraint(equalTo: container.topAnchor),
-            overlay.bottomAnchor.constraint(equalTo: container.bottomAnchor),
-            overlay.leadingAnchor.constraint(equalTo: container.leadingAnchor),
-            overlay.trailingAnchor.constraint(equalTo: container.trailingAnchor),
         ])
 
         // Create window
@@ -162,7 +172,7 @@ final class DashboardWindowController: NSObject, NSWindowDelegate, WKNavigationD
             defer: false
         )
         window.minSize = NSSize(width: 800, height: 600)
-        window.title = "TokenTracker"
+        window.title = NativeQAProfile.current == nil ? "TokenTracker" : "TokenTracker QA"
         window.titleVisibility = .hidden
         window.titlebarAppearsTransparent = true
         let toolbar = NSToolbar(identifier: "DashboardToolbar")
@@ -182,7 +192,7 @@ final class DashboardWindowController: NSObject, NSWindowDelegate, WKNavigationD
         self.window = window
 
         // Wire bridge so SettingsPage can read/write menu-bar prefs
-        NativeBridge.shared.webView = webView
+        if NativeQAProfile.current == nil { NativeBridge.shared.webView = webView }
 
         // Always observe NSApp.effectiveAppearance so the frontend module-level cache stays current,
         // avoiding an async round trip to know the current system light/dark value when switching light -> system.
@@ -199,9 +209,20 @@ final class DashboardWindowController: NSObject, NSWindowDelegate, WKNavigationD
         NSApp.activate(ignoringOtherApps: true)
     }
 
+    /// Restart the dashboard load from a clean state: clears the failure view,
+    /// resets the retry budget and puts the loading overlay back up. Shared by
+    /// the in-window Retry button, the menu-bar Retry button and a reopen of a
+    /// window parked on the failure state. A no-op when no window is open.
     func reload() {
+        guard let container = window?.contentView else { return }
+        dismissLoadFailureOverlay()
         retryCount = 0
-        webView?.reload()
+        installLoadingOverlay(in: container)
+        if let current = webView?.url, isLocalDashboardURL(current) {
+            loadDashboard(current)
+        } else if let url = URL(string: Constants.serverBaseURL + "?app=1") {
+            loadDashboard(url)
+        }
     }
 
     private func loadDashboard(_ url: URL) {
@@ -210,7 +231,11 @@ final class DashboardWindowController: NSObject, NSWindowDelegate, WKNavigationD
             return
         }
         pendingDashboardURL = nil
-        webView?.load(URLRequest(url: url))
+        var request = URLRequest(url: url)
+        if let profile = NativeQAProfile.current {
+            request.setValue(profile.serverChallenge, forHTTPHeaderField: "X-TokenTracker-QA-Challenge")
+        }
+        webView?.load(request)
     }
 
     /// Match dashboard light/dark so native glass / `NSVisualEffectView` + window chrome follow the web theme.
@@ -341,6 +366,20 @@ final class DashboardWindowController: NSObject, NSWindowDelegate, WKNavigationD
         return overlay
     }
 
+    private func installLoadingOverlay(in container: NSView) {
+        guard loadingOverlay == nil else { return }
+        let overlay = makeLoadingOverlay()
+        overlay.translatesAutoresizingMaskIntoConstraints = false
+        container.addSubview(overlay)
+        NSLayoutConstraint.activate([
+            overlay.topAnchor.constraint(equalTo: container.topAnchor),
+            overlay.bottomAnchor.constraint(equalTo: container.bottomAnchor),
+            overlay.leadingAnchor.constraint(equalTo: container.leadingAnchor),
+            overlay.trailingAnchor.constraint(equalTo: container.trailingAnchor),
+        ])
+        loadingOverlay = overlay
+    }
+
     private func dismissLoadingOverlay() {
         guard let overlay = loadingOverlay else { return }
         // Keep drawsBackground false so native glass / vibrancy shows through non-painted areas (sidebar + window chrome).
@@ -351,6 +390,61 @@ final class DashboardWindowController: NSObject, NSWindowDelegate, WKNavigationD
             overlay.removeFromSuperview()
             self?.loadingOverlay = nil
             self?.loadingHostingController = nil
+        }
+    }
+
+    // MARK: - Load Failure
+
+    /// Replaces the loading overlay with an actionable error once the retry
+    /// budget is spent. The previous silent `return` left the mascot spinning
+    /// forever with no way back inside the app (issue #557).
+    private func presentLoadFailure(reason: String) {
+        guard let container = window?.contentView else { return }
+        dismissLoadingOverlay()
+        dismissLoadFailureOverlay()
+
+        let hosting = NSHostingController(
+            rootView: AnyView(
+                DashboardLoadFailureView(reason: reason) { [weak self] in
+                    self?.reload()
+                }
+            )
+        )
+        let overlay = hosting.view
+        overlay.wantsLayer = true
+        overlay.layer?.backgroundColor = NSColor.windowBackgroundColor.cgColor
+        overlay.translatesAutoresizingMaskIntoConstraints = false
+        container.addSubview(overlay)
+        NSLayoutConstraint.activate([
+            overlay.topAnchor.constraint(equalTo: container.topAnchor),
+            overlay.bottomAnchor.constraint(equalTo: container.bottomAnchor),
+            overlay.leadingAnchor.constraint(equalTo: container.leadingAnchor),
+            overlay.trailingAnchor.constraint(equalTo: container.trailingAnchor),
+        ])
+        loadFailureOverlay = overlay
+        loadFailureHostingController = hosting
+    }
+
+    private func dismissLoadFailureOverlay() {
+        loadFailureOverlay?.removeFromSuperview()
+        loadFailureOverlay = nil
+        loadFailureHostingController = nil
+    }
+
+    /// Single failure path for both provisional and committed navigation errors.
+    private func handleNavigationFailure(_ error: Error) {
+        // `stopLoading()` and ordinary navigation replacement report a cancel;
+        // neither means the dashboard is unreachable.
+        if (error as NSError).code == NSURLErrorCancelled { return }
+        retryCount += 1
+        guard retryCount <= maxRetries else {
+            presentLoadFailure(reason: error.localizedDescription)
+            return
+        }
+        let delay = min(Double(retryCount) * 2, 10)
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
+            guard let self, let url = URL(string: Constants.serverBaseURL + "?app=1") else { return }
+            self.loadDashboard(url)
         }
     }
 
@@ -400,11 +494,13 @@ final class DashboardWindowController: NSObject, NSWindowDelegate, WKNavigationD
             webView.configuration.userContentController.removeScriptMessageHandler(forName: "nativeBridge")
             webView.removeFromSuperview()
         }
-        NativeBridge.shared.webView = nil
+        if NativeQAProfile.current == nil { NativeBridge.shared.webView = nil }
         closingWindow.delegate = nil
         closingWindow.contentView = nil
         loadingOverlay = nil
         loadingHostingController = nil
+        loadFailureOverlay = nil
+        loadFailureHostingController = nil
         pendingDashboardURL = nil
         self.webView = nil
         self.window = nil
@@ -449,12 +545,39 @@ final class DashboardWindowController: NSObject, NSWindowDelegate, WKNavigationD
     ) {
         let name = message.name
         let body = message.body
+        let sourceURL = message.frameInfo.request.url
+        let mainFrame = message.frameInfo.isMainFrame
+        let sender = message.webView
         Task { @MainActor [weak self] in
-            self?.handleScriptMessage(name: name, body: body)
+            self?.handleScriptMessage(name: name, body: body, sourceURL: sourceURL, mainFrame: mainFrame, sender: sender)
         }
     }
 
-    private func handleScriptMessage(name: String, body: Any) {
+    private func handleScriptMessage(name: String, body: Any, sourceURL: URL?, mainFrame: Bool, sender: WKWebView?) {
+        if name == "nativeBridge", let message = body as? [String: Any],
+           message["type"] as? String == "saveCloudUsageExport", let sender {
+            let expected = NativeQAProfile.current?.baseURL ?? URL(string: Constants.serverBaseURL)!
+            let permitted = CloudUsageExport.permitsSource(sourceURL, current: webView?.url, expected: expected,
+                                                          mainFrame: mainFrame, ownWebView: sender === webView)
+            NativeBridge.shared.saveCloudUsageExport(message: message, source: sender, permitted: permitted)
+            return
+        }
+        if let profile = NativeQAProfile.current {
+            guard name == "nativeBridge", mainFrame, let sourceURL, isLocalDashboardURL(sourceURL),
+                  let message = body as? [String: Any], profile.permitsNativeMessage(message) else {
+                let rejected = body as? [String: Any]
+                let rawType = rejected?["type"] as? String ?? ""
+                let rawKey = rejected?["key"] as? String ?? ""
+                let safeType = ["getSettings", "getSystemAppearance", "getPetSettings", "getNotificationStatus", "setChromeAppearance", "setSetting", "action"].contains(rawType) ? rawType : "unknown"
+                let safeKey = ["locale", "currency", "currencySymbol", "exchangeRate", "tokenUnitSystem"].contains(rawKey) ? rawKey : "unknown"
+                NSLog("Native QA guard rejected channelOK=%d mainFrame=%d sourcePresent=%d localOrigin=%d type=%@ key=%@", name == "nativeBridge", mainFrame, sourceURL != nil,
+                      sourceURL.map { isLocalDashboardURL($0) } ?? false, safeType, safeKey)
+                fatalError("Native QA script message rejected")
+            }
+            NativeBridge.shared.webView = webView
+            NativeBridge.shared.handle(message: message)
+            return
+        }
         if name == "nativeBridge" {
             if let message = body as? [String: Any],
                let messageType = message["type"] as? String,
@@ -502,6 +625,30 @@ final class DashboardWindowController: NSObject, NSWindowDelegate, WKNavigationD
         }
     }
 
+    func handleNativeQABillingReturn(order: String) {
+        guard let profile = NativeQAProfile.current, profile.ownedOrderIDs.contains(order) else {
+            fatalError("Native QA billing return rejected")
+        }
+        handleBillingReturn(order: order)
+    }
+
+    func handleBillingReturn(order: String) {
+        guard NativeBillingReturn.canonicalOrderID(order) == order else { return }
+        DashboardPresentationCoordinator.shared.showDashboard()
+        var components = URLComponents(string: Constants.serverBaseURL + "/billing/checkout")!
+        components.queryItems = [URLQueryItem(name: "order", value: order), URLQueryItem(name: "app", value: "1")]
+        loadDashboard(components.url!)
+    }
+
+    private func openExternalURL(_ url: URL) {
+        if let profile = NativeQAProfile.current {
+            Task { @MainActor in
+                guard await profile.approveExternalURL(url) else { fatalError("Native QA external URL rejected") }
+                NSWorkspace.shared.open(url)
+            }
+        } else { NSWorkspace.shared.open(url) }
+    }
+
     // MARK: - WKUIDelegate
 
     func webView(
@@ -511,7 +658,7 @@ final class DashboardWindowController: NSObject, NSWindowDelegate, WKNavigationD
         windowFeatures: WKWindowFeatures
     ) -> WKWebView? {
         if let url = navigationAction.request.url {
-            NSWorkspace.shared.open(url)
+            openExternalURL(url)
         }
         return nil
     }
@@ -524,6 +671,7 @@ final class DashboardWindowController: NSObject, NSWindowDelegate, WKNavigationD
         initiatedByFrame frame: WKFrameInfo,
         completionHandler: @escaping ([URL]?) -> Void
     ) {
+        guard NativeQAProfile.current == nil else { completionHandler(nil); return }
         let panel = NSOpenPanel()
         panel.canChooseFiles = true
         panel.canChooseDirectories = parameters.allowsDirectories
@@ -541,7 +689,11 @@ final class DashboardWindowController: NSObject, NSWindowDelegate, WKNavigationD
     // MARK: - WKNavigationDelegate
 
     private func isLocalDashboardURL(_ url: URL) -> Bool {
-        url.host == "localhost" || url.host == "127.0.0.1"
+        if let profile = NativeQAProfile.current {
+            return url.scheme == "http" && url.host == "127.0.0.1" && url.port == profile.baseURL.port &&
+                url.user == nil && url.password == nil
+        }
+        return url.host == "localhost" || url.host == "127.0.0.1"
     }
 
     func webView(
@@ -558,6 +710,13 @@ final class DashboardWindowController: NSObject, NSWindowDelegate, WKNavigationD
             decisionHandler(.allow)
             return
         }
+        if let profile = NativeQAProfile.current {
+            if url.absoluteString == "about:blank" { decisionHandler(.allow); return }
+            guard profile.permitsExternalURL(url) else { fatalError("Native QA navigation rejected") }
+            openExternalURL(url)
+            decisionHandler(.cancel)
+            return
+        }
 
         let isMainFrameNavigation = navigationAction.targetFrame?.isMainFrame ?? true
         // Only promote top-level user clicks to the system browser. Subframe
@@ -566,7 +725,7 @@ final class DashboardWindowController: NSObject, NSWindowDelegate, WKNavigationD
         if (url.scheme == "http" || url.scheme == "https"),
            navigationAction.navigationType == .linkActivated,
            isMainFrameNavigation {
-            NSWorkspace.shared.open(url)
+            openExternalURL(url)
             decisionHandler(.cancel)
             return
         }
@@ -575,6 +734,7 @@ final class DashboardWindowController: NSObject, NSWindowDelegate, WKNavigationD
 
     func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
         retryCount = 0
+        dismissLoadFailureOverlay()
         let completedNativeOAuth = webView.url?.path == "/dashboard" || webView.url?.path == "/"
         if oauthInFlight && completedNativeOAuth {
             completeNativeOAuth()
@@ -612,13 +772,17 @@ final class DashboardWindowController: NSObject, NSWindowDelegate, WKNavigationD
         didFailProvisionalNavigation navigation: WKNavigation!,
         withError error: Error
     ) {
-        retryCount += 1
-        guard retryCount <= maxRetries else { return }
-        let delay = min(Double(retryCount) * 2, 10)
-        DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
-            guard let self, let url = URL(string: Constants.serverBaseURL + "?app=1") else { return }
-            self.loadDashboard(url)
-        }
+        handleNavigationFailure(error)
+    }
+
+    /// A main document that started loading and then failed leaves the loading
+    /// overlay up just as a provisional failure does, so it takes the same path.
+    func webView(
+        _ webView: WKWebView,
+        didFail navigation: WKNavigation!,
+        withError error: Error
+    ) {
+        handleNavigationFailure(error)
     }
 }
 

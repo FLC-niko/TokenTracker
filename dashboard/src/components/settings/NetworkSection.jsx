@@ -1,8 +1,10 @@
 import React, { useEffect, useMemo, useState } from "react";
 import { AnimatePresence, motion } from "motion/react";
+import { Loader2 } from "lucide-react";
 import { copy } from "../../lib/copy";
 import { Select } from "../../ui/components";
-import { SectionCard, SegmentedControl, SettingsRow } from "./Controls.jsx";
+import { Button } from "../../ui/components/Button.jsx";
+import { SectionCard, SegmentedControl, SettingsRow, SETTINGS_INPUT_CLASS } from "./Controls.jsx";
 
 const MODE_OPTIONS = () => [
   { value: "system", label: copy("settings.network.mode.system") },
@@ -15,9 +17,6 @@ const PROTOCOL_OPTIONS = () => [
   { value: "https", label: copy("settings.network.protocol.https") },
   { value: "socks5", label: copy("settings.network.protocol.socks5") },
 ];
-
-const INPUT_CLASS =
-  "w-full rounded-md border border-oai-gray-300 bg-transparent px-2.5 py-1.5 text-sm text-oai-black outline-none focus:border-oai-brand-500 focus:ring-1 focus:ring-inset focus:ring-oai-brand-500 dark:border-oai-gray-700 dark:text-white";
 
 function validateManualDraft(draft) {
   const errors = {};
@@ -64,6 +63,18 @@ export function NetworkSection({ proxySettings }) {
     if (config.effective === "blocked") return copy("settings.network.effective.blocked");
     return copy("settings.network.effective.none");
   }, [config.effective]);
+
+  const isDirty = useMemo(() => {
+    if (draft.mode !== config.mode) return true;
+    if (draft.mode === "manual") {
+      return (
+        (draft.protocol || "http") !== (config.protocol || "http") ||
+        (draft.host || "") !== (config.host || "") ||
+        String(draft.port ?? "") !== String(config.port ?? "")
+      );
+    }
+    return false;
+  }, [draft, config]);
 
   const updateDraft = (patch) => {
     setDraft((prev) => ({ ...prev, ...patch }));
@@ -170,7 +181,7 @@ export function NetworkSection({ proxySettings }) {
                   spellCheck={false}
                   aria-invalid={errors.host ? true : undefined}
                   aria-label={copy("settings.network.host.label")}
-                  className={INPUT_CLASS}
+                  className={SETTINGS_INPUT_CLASS}
                 />
               }
             />
@@ -188,27 +199,43 @@ export function NetworkSection({ proxySettings }) {
                   spellCheck={false}
                   aria-invalid={errors.port ? true : undefined}
                   aria-label={copy("settings.network.port.label")}
-                  className={INPUT_CLASS}
+                  className={SETTINGS_INPUT_CLASS}
                 />
               }
             />
             <div className="flex flex-wrap items-center justify-end gap-2 py-3">
-              <button
-                type="button"
+              <Button
+                variant="secondary"
+                size="sm"
                 onClick={handleTest}
                 disabled={testing || saving}
-                className="rounded-md border border-oai-gray-200 px-3 py-1.5 text-xs font-medium text-oai-gray-700 transition-colors hover:bg-oai-gray-100 disabled:opacity-50 dark:border-oai-gray-800 dark:text-oai-gray-300 dark:hover:bg-oai-gray-800"
+                className="gap-1.5"
               >
-                {testing ? copy("settings.network.test.testing") : copy("settings.network.test")}
-              </button>
-              <button
-                type="button"
+                {testing ? (
+                  <>
+                    <Loader2 className="h-3.5 w-3.5 animate-spin" aria-hidden />
+                    <span>{copy("settings.network.test.testing")}</span>
+                  </>
+                ) : (
+                  copy("settings.network.test")
+                )}
+              </Button>
+              <Button
+                variant="primary"
+                size="sm"
                 onClick={handleSave}
                 disabled={saving || testing}
-                className="rounded-md bg-oai-brand-500 px-3 py-1.5 text-xs font-medium text-white transition-colors hover:bg-oai-brand-600 disabled:opacity-50"
+                className="gap-1.5"
               >
-                {saving ? copy("settings.network.saving") : copy("settings.network.save")}
-              </button>
+                {saving ? (
+                  <>
+                    <Loader2 className="h-3.5 w-3.5 animate-spin" aria-hidden />
+                    <span>{copy("settings.network.saving")}</span>
+                  </>
+                ) : (
+                  copy("settings.network.save")
+                )}
+              </Button>
             </div>
             {testState ? (
               <p className="py-2 text-xs text-oai-gray-500 dark:text-oai-gray-400">
@@ -218,21 +245,30 @@ export function NetworkSection({ proxySettings }) {
               </p>
             ) : null}
           </motion.div>
-        ) : (
-          <div key="non-manual-save" className="flex justify-end py-3">
-            <button
-              type="button"
-              onClick={handleSave}
-              disabled={saving}
-              className="rounded-md bg-oai-brand-500 px-3 py-1.5 text-xs font-medium text-white transition-colors hover:bg-oai-brand-600 disabled:opacity-50"
-            >
-              {saving ? copy("settings.network.saving") : copy("settings.network.save")}
-            </button>
-          </div>
-        )}
+        ) : null}
       </AnimatePresence>
+      {draft.mode !== "manual" && (isDirty || saving) ? (
+        <div key="non-manual-save" className="flex justify-end py-3">
+          <Button
+            variant="primary"
+            size="sm"
+            onClick={handleSave}
+            disabled={saving}
+            className="gap-1.5"
+          >
+            {saving ? (
+              <>
+                <Loader2 className="h-3.5 w-3.5 animate-spin" aria-hidden />
+                <span>{copy("settings.network.saving")}</span>
+              </>
+            ) : (
+              copy("settings.network.save")
+            )}
+          </Button>
+        </div>
+      ) : null}
       {saveState === "saved" ? (
-        <p className="py-2 text-xs text-oai-gray-500 dark:text-oai-gray-400">
+        <p className="py-2 text-xs text-emerald-600 dark:text-emerald-400">
           {copy("settings.network.saved")}
         </p>
       ) : null}

@@ -1,8 +1,10 @@
 import React from "react";
-import { FlaskConical, Gauge, Globe, Monitor, Palette, Settings, UserRound } from "lucide-react";
+import { Cloud, FlaskConical, Gauge, Globe, Monitor, Palette, Settings, UserRound } from "lucide-react";
 import { useNavigate, useSearchParams } from "react-router-dom";
 import { LimitsSettingsPanel } from "../components/LimitsSettingsPanel.jsx";
 import { AccountSection } from "../components/settings/AccountSection.jsx";
+import { CloudSection } from "../components/settings/CloudSection.jsx";
+import { useAccountProfileSettings } from "../components/settings/useAccountProfileSettings.js";
 import { AppearanceSection } from "../components/settings/AppearanceSection.jsx";
 import { LabsSection } from "../components/settings/LabsSection.jsx";
 import {
@@ -19,12 +21,14 @@ import { useProxySettings } from "../hooks/use-proxy-settings.js";
 import { cn } from "../lib/cn";
 import { copy } from "../lib/copy";
 import { isNativeWindowsApp } from "../lib/native-bridge.js";
+import { Button } from "../ui/components/Button.jsx";
 
 const SETTINGS_SECTION_IDS = {
   APPEARANCE: "appearance",
   NATIVE_APP: "native-app",
   NETWORK: "network",
   ACCOUNT: "account",
+  CLOUD: "cloud",
   LIMITS: "limits",
   LABS: "labs",
 };
@@ -49,6 +53,7 @@ function LimitsDisplayModeControl({ prefs }) {
 }
 
 export function SettingsPage() {
+  const accountSettings = useAccountProfileSettings();
   const limitsPrefs = useLimitsDisplayPrefs();
   const {
     available: nativeSettingsAvailable,
@@ -117,7 +122,15 @@ export function SettingsPage() {
       description: copy("settings.section.account.description"),
       group: SETTINGS_GROUP_IDS.PERSONAL,
       Icon: UserRound,
-      content: <AccountSection />,
+      content: <AccountSection settings={accountSettings} />,
+    },
+    {
+      id: SETTINGS_SECTION_IDS.CLOUD,
+      label: copy("settings.section.cloud"),
+      description: copy("settings.section.cloud.description"),
+      group: SETTINGS_GROUP_IDS.PERSONAL,
+      Icon: Cloud,
+      content: <CloudSection settings={accountSettings} active={activeSection === SETTINGS_SECTION_IDS.CLOUD} />,
     },
     {
       id: SETTINGS_SECTION_IDS.LIMITS,
@@ -165,15 +178,16 @@ export function SettingsPage() {
               hint={copy("settings.limits.showSubscriptionsHint")}
               control={
                 <div className="flex items-center gap-3">
-                  <button
-                    type="button"
+                  <Button
+                    variant="secondary"
+                    size="sm"
                     onClick={() => navigate("/limits?openSubscriptions=1")}
                     aria-label={copy("limits.page.openSubscriptions")}
                     title={copy("limits.page.openSubscriptions")}
-                    className="inline-flex h-7 w-7 items-center justify-center rounded-md border border-oai-gray-200 dark:border-oai-gray-700 bg-white dark:bg-oai-gray-900 text-oai-gray-500 dark:text-oai-gray-400 hover:bg-oai-gray-100 dark:hover:bg-oai-gray-800 hover:text-oai-black dark:hover:text-white transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-oai-brand-500"
+                    className="!h-7 !w-7 !p-0 text-oai-gray-500 hover:text-oai-black dark:text-oai-gray-400 dark:hover:text-white"
                   >
                     <Settings size={14} aria-hidden />
-                  </button>
+                  </Button>
                   <ToggleSwitch
                     checked={limitsPrefs.showSubscriptions !== false}
                     onChange={() => limitsPrefs.setShowSubscriptions(!limitsPrefs.showSubscriptions)}
@@ -217,18 +231,14 @@ export function SettingsPage() {
       ...group,
       sections: sections.filter((section) => section.group === group.id),
     }))
-    .filter((group) => group.sections.length > 0);
+    .filter((group) => {
+      return group.sections.length > 0;
+    });
 
-  let activeSectionMeta = sections[0];
-  for (const section of sections) {
-    if (section.id === activeSection) {
-      activeSectionMeta = section;
-      break;
-    }
-  }
+
 
   return (
-    <div className="flex flex-1 flex-col font-oai text-oai-black antialiased dark:text-oai-white">
+    <div className={cn("flex flex-1 flex-col font-oai text-oai-black antialiased dark:text-oai-white", activeSection === SETTINGS_SECTION_IDS.CLOUD && "tt-cloud-settings")}>
       <main className="flex-1 pb-12 pt-8 sm:pb-16 sm:pt-10">
         <div className="mx-auto w-full max-w-5xl px-4 sm:px-6">
           <div className="mb-7 max-w-2xl">
@@ -240,7 +250,7 @@ export function SettingsPage() {
             </p>
           </div>
 
-          <div className="grid min-w-0 gap-6 md:grid-cols-[14rem_minmax(0,1fr)] md:gap-8 lg:grid-cols-[15rem_minmax(0,1fr)]">
+          <div className="tt-settings-sections grid min-w-0 gap-6 md:grid-cols-[11rem_minmax(0,1fr)] md:gap-8">
             <aside className="min-w-0 rounded-xl border border-oai-gray-200 bg-oai-gray-50/70 p-2 dark:border-oai-gray-800 dark:bg-oai-gray-900/60 md:border-0 md:bg-transparent md:p-0 md:dark:bg-transparent">
               <nav
                 aria-label={copy("settings.page.title")}
@@ -263,22 +273,16 @@ export function SettingsPage() {
                             aria-controls={`settings-panel-${id}`}
                             onClick={() => selectSection(id)}
                             className={cn(
-                              "relative inline-flex min-h-10 min-w-max shrink-0 items-center gap-2 rounded-lg px-3 py-2 text-left text-sm font-medium transition-all focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-oai-brand-500 md:w-full md:min-w-0",
+                              "inline-flex min-h-10 min-w-max shrink-0 items-center gap-1.5 rounded-md px-2 py-2 text-left text-sm font-medium transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-oai-brand-500 md:w-full md:min-w-0 md:gap-2 md:px-3",
                               active
-                                ? "bg-white text-oai-black shadow-sm ring-1 ring-oai-gray-200 dark:bg-oai-gray-800 dark:text-white dark:ring-oai-gray-700"
-                                : "text-oai-gray-500 hover:bg-white/80 hover:text-oai-gray-900 dark:text-oai-gray-400 dark:hover:bg-oai-gray-800/70 dark:hover:text-oai-gray-200",
+                                ? "bg-oai-gray-100 text-oai-black dark:bg-oai-gray-800 dark:text-white"
+                                : "text-oai-gray-500 hover:bg-oai-gray-50 hover:text-oai-gray-900 dark:text-oai-gray-400 dark:hover:bg-oai-gray-900 dark:hover:text-oai-gray-200",
                             )}
                           >
-                            {active ? (
-                              <span
-                                className="absolute inset-y-2 left-0 w-0.5 rounded-full bg-oai-brand-500"
-                                aria-hidden
-                              />
-                            ) : null}
                             <Icon
                               className={cn(
                                 "h-4 w-4 shrink-0",
-                                active ? "text-oai-brand-600 dark:text-oai-brand-400" : "text-oai-gray-400 dark:text-oai-gray-500",
+                                active ? "text-oai-black dark:text-white" : "text-oai-gray-400 dark:text-oai-gray-500",
                               )}
                               aria-hidden
                             />
@@ -293,14 +297,6 @@ export function SettingsPage() {
             </aside>
 
             <div className="min-w-0">
-              <div className="mb-4 border-b border-oai-gray-200 pb-4 dark:border-oai-gray-800">
-                <h2 className="text-xl font-semibold tracking-tight text-oai-black dark:text-white">
-                  {activeSectionMeta.label}
-                </h2>
-                <p className="mt-1 text-sm leading-5 text-oai-gray-500 dark:text-oai-gray-400">
-                  {activeSectionMeta.description}
-                </p>
-              </div>
               {sections.map(({ id, label, content }) => (
                 <section
                   key={id}

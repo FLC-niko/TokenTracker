@@ -152,3 +152,120 @@ fn appimage_desktop_entry_rejects_control_characters() {
         None
     );
 }
+
+/// The AppImage writes `mimeapps.list` through `xdg-mime`, but a portal or app
+/// chooser resolves the callback scheme by enumerating registered handlers from
+/// the desktop database. Registration must therefore also refresh that database
+/// (`update-desktop-database`), or browser sign-in cannot hand the code back.
+mod appimage_registration {
+    use std::ffi::OsString;
+    use std::fs;
+    use std::os::unix::fs::PermissionsExt;
+    use std::path::{Path, PathBuf};
+    use std::sync::Mutex;
+
+    use tokentracker_linux::oauth::ensure_appimage_protocol_registration;
+
+    // This test repoints `APPIMAGE`, `HOME`, `XDG_DATA_HOME` and `PATH` for the
+    // whole process, and cargo runs the tests in this binary in parallel, so it
+    // must not overlap itself. Poisoning is recovered from rather than
+    // propagated, matching tests/server.rs.
+    static ENV_GUARD: Mutex<()> = Mutex::new(());
+
+    struct Scratch(PathBuf);
+
+    impl Scratch {
+        fn new(label: &str) -> Self {
+            let path = std::env::temp_dir()
+                .join(format!("tokentracker-oauth-{label}-{}", std::process::id()));
+            let _ = fs::remove_dir_all(&path);
+            fs::create_dir_all(&path).expect("scratch dir should be creatable");
+            Self(path)
+        }
+
+        fn path(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn write_stub(path: &Path, body: &str) {
+        fs::write(path, body).expect("stub should be writable");
+        let mut permissions = fs::metadata(path).expect("stub metadata").permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(path, permissions).expect("stub should be executable");
+    }
+
+    #[test]
+    fn registers_the_scheme_and_refreshes_the_desktop_database() {
+        let _serial = ENV_GUARD.lock().unwrap_or_else(|error| error.into_inner());
+
+        let scratch = Scratch::new("registration");
+        let data_dir = scratch.path().join("data");
+        let applications_dir = data_dir.join("applications");
+        let bin_dir = scratch.path().join("bin");
+        fs::create_dir_all(&applications_dir).expect("applications dir");
+        fs::create_dir_all(&bin_dir).expect("stub dir");
+        let appimage = scratch.path().join("TokenTracker.AppImage");
+        fs::write(&appimage, b"stub").expect("appimage placeholder");
+
+        let default_marker = scratch.path().join("xdg-mime-default");
+        let refresh_marker = scratch.path().join("update-desktop-database-dir");
+        write_stub(
+            &bin_dir.join("xdg-mime"),
+            &format!(
+                "#!/bin/sh\ncase \"$1\" in\n  default) printf '%s\\n' \"$2\" > \"{marker}\" ;;\n  query) cat \"{marker}\" ;;\nesac\nexit 0\n",
+                marker = default_marker.display()
+            ),
+        );
+        write_stub(
+            &bin_dir.join("update-desktop-database"),
+            &format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$1\" > \"{marker}\"\nexit 0\n",
+                marker = refresh_marker.display()
+            ),
+        );
+
+        let keys = ["APPIMAGE", "HOME", "XDG_DATA_HOME", "PATH"];
+        let previous: Vec<Option<OsString>> = keys.iter().map(std::env::var_os).collect();
+        // Prepend the stub directory: our fakes win the lookup, while the real
+        // PATH stays reachable for the shell builtins the stubs rely on.
+        let stub_path = std::env::join_paths(std::iter::once(bin_dir.clone()).chain(
+            std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default()),
+        ))
+        .expect("PATH entries should join");
+        std::env::set_var("APPIMAGE", &appimage);
+        std::env::set_var("HOME", scratch.path());
+        std::env::set_var("XDG_DATA_HOME", &data_dir);
+        std::env::set_var("PATH", stub_path);
+
+        let result = ensure_appimage_protocol_registration();
+
+        let refreshed = fs::read_to_string(&refresh_marker).ok();
+        let desktop =
+            fs::read_to_string(applications_dir.join("tokentracker-appimage.desktop")).ok();
+
+        for (key, value) in keys.iter().zip(previous) {
+            match value {
+                Some(value) => std::env::set_var(key, value),
+                None => std::env::remove_var(key),
+            }
+        }
+
+        assert_eq!(result, Ok(true), "registration should succeed");
+        assert!(
+            desktop.is_some_and(|entry| entry.contains("x-scheme-handler/tokentracker")),
+            "the .desktop handler should be written"
+        );
+        assert_eq!(
+            refreshed.as_deref().map(str::trim),
+            Some(applications_dir.to_str().expect("utf-8 scratch path")),
+            "update-desktop-database must run against the applications dir"
+        );
+    }
+}

@@ -1,6 +1,6 @@
 -- Optional disjoint input with unknown cache split. Existing rows remain complete.
--- Apply before deploying the edge patches. No historical unknown split is inferred.
-BEGIN;
+-- Requires current main Cloud/archive migrations. Deploy before accounting-v3 edges and clients.
+-- No historical unknown split is inferred; archive rows without the column mean zero.
 ALTER TABLE public.tokentracker_hourly
   ADD COLUMN unclassified_input_tokens bigint NOT NULL DEFAULT 0 CHECK (unclassified_input_tokens >= 0),
   ALTER COLUMN total_cost_usd DROP NOT NULL;
@@ -64,6 +64,7 @@ DECLARE
   v_target_name_customized boolean;
   v_target_default_name text;
 BEGIN
+  PERFORM public.cloud_usage_maintenance_lock(p_user_id);
   SELECT d.device_name, d.name_customized, d.default_device_name
     INTO v_current_name, v_name_customized, v_current_default_name
   FROM public.tokentracker_devices AS d
@@ -167,6 +168,8 @@ BEGIN
       created_at = EXCLUDED.created_at,
       updated_at = EXCLUDED.updated_at,
       total_cost_usd = EXCLUDED.total_cost_usd;
+
+    PERFORM public.cloud_merge_usage_archive(p_user_id, v_legacy_id, p_device_id);
 
     DELETE FROM public.tokentracker_hourly
     WHERE user_id = p_user_id
@@ -316,10 +319,10 @@ AS $func$
       h.total_tokens::bigint                AS total_tokens,
       h.input_tokens::bigint                AS input_tokens,
       h.output_tokens::bigint               AS output_tokens,
-      h.unclassified_input_tokens::bigint         AS unclassified_input_tokens,      h.cached_input_tokens::bigint         AS cached_input_tokens,
+      COALESCE(h.unclassified_input_tokens,0)::bigint         AS unclassified_input_tokens,      h.cached_input_tokens::bigint         AS cached_input_tokens,
       h.cache_creation_input_tokens::bigint AS cache_creation_input_tokens,
       h.reasoning_output_tokens::bigint     AS reasoning_output_tokens
-    FROM tokentracker_hourly h
+    FROM public.cloud_usage_hourly(NULL,NULL,p_from,p_to) h
     CROSS JOIN cfg
     JOIN tokentracker_devices d
       ON d.id = h.device_id AND d.revoked_at IS NULL
@@ -353,10 +356,10 @@ AS $func$
       h.total_tokens::bigint                AS total_tokens,
       h.input_tokens::bigint                AS input_tokens,
       h.output_tokens::bigint               AS output_tokens,
-      h.unclassified_input_tokens::bigint         AS unclassified_input_tokens,      h.cached_input_tokens::bigint         AS cached_input_tokens,
+      COALESCE(h.unclassified_input_tokens,0)::bigint         AS unclassified_input_tokens,      h.cached_input_tokens::bigint         AS cached_input_tokens,
       h.cache_creation_input_tokens::bigint AS cache_creation_input_tokens,
       h.reasoning_output_tokens::bigint     AS reasoning_output_tokens
-    FROM tokentracker_hourly h
+    FROM public.cloud_usage_hourly(NULL,NULL,p_from,p_to) h
     WHERE h.hour_start >= p_from AND h.hour_start < p_to
       AND h.source = 'cursor'
     ORDER BY h.user_id, h.source, h.model, h.hour_start, h.total_tokens DESC, h.updated_at DESC
@@ -410,10 +413,10 @@ AS $func$
       h.user_id, COALESCE(dm.machine_cluster_id, h.device_id::text) AS machine_cluster_id,
       h.source, h.model, h.hour_start, h.total_tokens::bigint AS total_tokens,
       h.input_tokens::bigint AS input_tokens, h.output_tokens::bigint AS output_tokens,
-      h.unclassified_input_tokens::bigint AS unclassified_input_tokens,      h.cached_input_tokens::bigint AS cached_input_tokens,
+      COALESCE(h.unclassified_input_tokens,0)::bigint AS unclassified_input_tokens,      h.cached_input_tokens::bigint AS cached_input_tokens,
       h.cache_creation_input_tokens::bigint AS cache_creation_input_tokens,
       h.reasoning_output_tokens::bigint AS reasoning_output_tokens
-    FROM public.tokentracker_hourly h
+    FROM public.cloud_usage_hourly(NULL,NULL,p_from,p_to) h
     CROSS JOIN cfg
     JOIN public.tokentracker_devices d ON d.id = h.device_id AND d.revoked_at IS NULL
     LEFT JOIN public.tokentracker_device_machine dm ON dm.device_id = h.device_id
@@ -435,10 +438,10 @@ AS $func$
       h.user_id, h.source, h.model, h.hour_start,
       h.total_tokens::bigint AS total_tokens, h.input_tokens::bigint AS input_tokens,
       h.output_tokens::bigint AS output_tokens,
-      h.unclassified_input_tokens::bigint AS unclassified_input_tokens,      h.cached_input_tokens::bigint AS cached_input_tokens,
+      COALESCE(h.unclassified_input_tokens,0)::bigint AS unclassified_input_tokens,      h.cached_input_tokens::bigint AS cached_input_tokens,
       h.cache_creation_input_tokens::bigint AS cache_creation_input_tokens,
       h.reasoning_output_tokens::bigint AS reasoning_output_tokens
-    FROM public.tokentracker_hourly h
+    FROM public.cloud_usage_hourly(NULL,NULL,p_from,p_to) h
     WHERE h.hour_start >= p_from AND h.hour_start < p_to AND h.source = 'cursor'
     ORDER BY h.user_id, h.source, h.model, h.hour_start, h.total_tokens DESC, h.updated_at DESC
   ) acct
@@ -701,12 +704,12 @@ AS $func$
       h.total_tokens::bigint AS total_tokens,
       h.input_tokens::bigint AS input_tokens,
       h.output_tokens::bigint AS output_tokens,
-      h.unclassified_input_tokens::bigint AS unclassified_input_tokens,      h.cached_input_tokens::bigint AS cached_input_tokens,
+      COALESCE(h.unclassified_input_tokens,0)::bigint AS unclassified_input_tokens,      h.cached_input_tokens::bigint AS cached_input_tokens,
       h.cache_creation_input_tokens::bigint AS cache_creation_input_tokens,
       h.reasoning_output_tokens::bigint AS reasoning_output_tokens,
       h.conversations::bigint AS conversations,
       h.updated_at
-    FROM public.tokentracker_hourly h
+    FROM public.cloud_usage_hourly(p_user_id,NULL,p_from,p_to) h
     WHERE h.user_id = p_user_id
       AND h.hour_start >= p_from AND h.hour_start < p_to
       AND (
@@ -776,20 +779,7 @@ AS $func$
         ELSE ''
       END AS bucket,
       source, model,
-      CASE
-        WHEN lower(model) LIKE '%deepseek-v4-flash%'
-          OR lower(model) LIKE '%deepseek-v4-pro%'
-        THEN CASE
-          WHEN (
-            extract(hour FROM hour_start AT TIME ZONE 'UTC') >= 1
-            AND extract(hour FROM hour_start AT TIME ZONE 'UTC') < 4
-          ) OR (
-            extract(hour FROM hour_start AT TIME ZONE 'UTC') >= 6
-            AND extract(hour FROM hour_start AT TIME ZONE 'UTC') < 10
-          ) THEN 'peak' ELSE 'off_peak'
-        END
-        ELSE 'peak'
-      END AS pricing_tier,
+      public.leaderboard_pricing_tier(model, hour_start) AS pricing_tier,
       total_tokens, input_tokens, output_tokens, unclassified_input_tokens, cached_input_tokens,
       cache_creation_input_tokens, reasoning_output_tokens, conversations
     FROM hourly CROSS JOIN tzr
@@ -839,6 +829,8 @@ DECLARE
   v_cache_key text;
   v_result jsonb;
 BEGIN
+  -- Preserve current main's reset/read serialization, including cache fills.
+  PERFORM pg_advisory_xact_lock_shared(hashtextextended(p_user_id::text||':cloud-device',0));
   v_cache_key := concat_ws(
     chr(31), 'v3-unclassified-input', p_user_id::text,
     COALESCE(p_device_id::text, ''),
@@ -912,7 +904,7 @@ AS $func$
         h.user_id, h.source, h.model, h.hour_start,
         h.total_tokens, h.input_tokens, h.output_tokens, h.unclassified_input_tokens, h.cached_input_tokens,
         h.cache_creation_input_tokens, h.reasoning_output_tokens
-      FROM public.tokentracker_hourly h
+      FROM public.cloud_usage_hourly(NULL,NULL,p_from,p_to) h
       JOIN public.tokentracker_devices d ON d.id = h.device_id AND d.revoked_at IS NULL
       LEFT JOIN public.tokentracker_device_machine dm ON dm.device_id = h.device_id
       WHERE h.hour_start >= p_from AND h.hour_start < p_to
@@ -933,7 +925,7 @@ AS $func$
         h.user_id, h.source, h.model, h.hour_start, h.total_tokens,
         h.input_tokens, h.output_tokens, h.unclassified_input_tokens, h.cached_input_tokens,
         h.cache_creation_input_tokens, h.reasoning_output_tokens
-      FROM public.tokentracker_hourly h
+      FROM public.cloud_usage_hourly(NULL,NULL,p_from,p_to) h
       WHERE h.hour_start >= p_from AND h.hour_start < p_to
         AND h.source = 'cursor'
         AND (lower(h.model) LIKE '%deepseek-v4-flash%' OR lower(h.model) LIKE '%deepseek-v4-pro%')
@@ -953,11 +945,7 @@ AS $func$
     GROUP BY s.user_id, s.source, s.model, s.bucket_start
   ), grouped AS (
     SELECT user_id, source, model,
-      CASE WHEN (extract(hour FROM hour_start AT TIME ZONE 'UTC') >= 1
-                      AND extract(hour FROM hour_start AT TIME ZONE 'UTC') < 4)
-                  OR (extract(hour FROM hour_start AT TIME ZONE 'UTC') >= 6
-                      AND extract(hour FROM hour_start AT TIME ZONE 'UTC') < 10)
-        THEN 'peak' ELSE 'off_peak' END AS pricing_tier,
+      public.leaderboard_pricing_tier(model, hour_start) AS pricing_tier,
       SUM(total_tokens)::bigint AS total_tokens, SUM(input_tokens)::bigint AS input_tokens,
       SUM(output_tokens)::bigint AS output_tokens,
       SUM(unclassified_input_tokens)::bigint AS unclassified_input_tokens,      SUM(cached_input_tokens)::bigint AS cached_input_tokens,
@@ -1213,4 +1201,98 @@ $func$;
 
 -- Cached JSON from the previous schema must not conceal partial input.
 DELETE FROM public.tokentracker_account_usage_cache;
-COMMIT;
+
+-- Extend current-main compact/wire contracts in place. Append slots only:
+-- deployed v2 readers keep their original indexes. Preserve function OIDs,
+-- ACLs, membership gates, archive revision checks and upload-window locks.
+-- Every replacement is scoped to an inspected function and aborts on drift.
+DO $integration$
+DECLARE patch record; definition text; occurrences integer;
+BEGIN
+  FOR patch IN SELECT * FROM (VALUES
+    ('cloud_rebuild_device_usage_derived(uuid,date[])',
+      'input_tokens,output_tokens,cached_input_tokens,',
+      'input_tokens,output_tokens,unclassified_input_tokens,cached_input_tokens,'),
+    ('cloud_rebuild_device_usage_derived(uuid,date[])',
+      'sum(d.output_tokens),sum(d.cached_input_tokens),',
+      'sum(d.output_tokens),sum(d.unclassified_input_tokens),sum(d.cached_input_tokens),'),
+    ('cloud_rebuild_device_usage_derived(uuid,date[])',
+      'public.leaderboard_hourly_dedup_v2(v_from,v_to)',
+      'public.leaderboard_hourly_dedup_v2_unclassified(v_from,v_to)'),
+    ('cloud_rebuild_device_usage_derived(uuid,date[])',
+      'output_tokens=excluded.output_tokens,',
+      'output_tokens=excluded.output_tokens,unclassified_input_tokens=excluded.unclassified_input_tokens,'),
+    ('leaderboard_usage_pack(jsonb)',
+      '''rows'', COALESCE((',
+      '''unclassified_inputs'', COALESCE((SELECT jsonb_agg(COALESCE(e->''unclassified_input_tokens'', ''0''::jsonb) ORDER BY ord) FROM raw), ''[]''::jsonb), ''rows'', COALESCE(('),
+    ('account_summary_compact(uuid,uuid,timestamptz,timestamptz,text,integer,text,text)',
+      'COALESCE((e->>''input_tokens'')::bigint, 0) AS input_tokens,',
+      'COALESCE((e->>''unclassified_input_tokens'')::bigint, 0) AS unclassified_input_tokens, COALESCE((e->>''input_tokens'')::bigint, 0) AS input_tokens,'),
+    ('account_summary_compact(uuid,uuid,timestamptz,timestamptz,text,integer,text,text)',
+      '''active_days'', COUNT(DISTINCT bucket)',
+      '''active_days'', COUNT(DISTINCT bucket), ''unclassified_input_tokens'', COALESCE(SUM(unclassified_input_tokens), 0)'),
+    ('account_daily_compact(uuid,uuid,timestamptz,timestamptz,text,integer,text,text)',
+      'COALESCE((e->>''input_tokens'')::bigint, 0) AS input_tokens,',
+      'COALESCE((e->>''unclassified_input_tokens'')::bigint, 0) AS unclassified_input_tokens, COALESCE((e->>''input_tokens'')::bigint, 0) AS input_tokens,'),
+    ('account_daily_compact(uuid,uuid,timestamptz,timestamptz,text,integer,text,text)',
+      'SUM(reasoning_output_tokens) AS rs, SUM(conversations) AS cv',
+      'SUM(reasoning_output_tokens) AS rs, SUM(conversations) AS cv, SUM(unclassified_input_tokens) AS u'),
+    ('account_daily_compact(uuid,uuid,timestamptz,timestamptz,text,integer,text,text)',
+      'd.rs, d.cv, m.mm)', 'd.rs, d.cv, m.mm, d.u)'),
+    ('account_model_breakdown_compact(uuid,uuid,timestamptz,timestamptz,text,integer,text,text)',
+      'COALESCE((e->>''input_tokens'')::bigint, 0) AS input_tokens,',
+      'COALESCE((e->>''unclassified_input_tokens'')::bigint, 0) AS unclassified_input_tokens, COALESCE((e->>''input_tokens'')::bigint, 0) AS input_tokens,'),
+    ('account_model_breakdown_compact(uuid,uuid,timestamptz,timestamptz,text,integer,text,text)',
+      'SUM(reasoning_output_tokens) AS rs', 'SUM(reasoning_output_tokens) AS rs, SUM(unclassified_input_tokens) AS u'),
+    ('account_model_breakdown_compact(uuid,uuid,timestamptz,timestamptz,text,integer,text,text)',
+      'tt, i, o, cr, cw, rs)', 'tt, i, o, cr, cw, rs, u)'),
+    ('account_summary_wire(uuid,uuid,timestamptz,timestamptz,text,integer,text,text)',
+      'raw.j->''range_totals''->''active_days'')',
+      'raw.j->''range_totals''->''active_days'', raw.j->''range_totals''->''unclassified_input_tokens'')'),
+    ('account_daily_wire(uuid,uuid,timestamptz,timestamptz,text,integer,text,text)',
+      E'), ''[]''::jsonb) END\n    ) AS row FROM days',
+      E'), ''[]''::jsonb) END, row->9\n    ) AS row FROM days'),
+    ('account_model_breakdown_wire(uuid,uuid,timestamptz,timestamptz,text,integer,text,text)',
+      'row->6, row->7, row->8) AS row', 'row->6, row->7, row->8, row->9) AS row'),
+    ('cloud_ingest_usage(text,text,jsonb,jsonb,text)',
+      'source,model,input_tokens,', 'source,model,input_tokens,unclassified_input_tokens,'),
+    ('cloud_ingest_usage(text,text,jsonb,jsonb,text)',
+      'x.source,x.model,x.input_tokens,', 'x.source,x.model,x.input_tokens,COALESCE(x.unclassified_input_tokens,0),'),
+    ('cloud_ingest_usage(text,text,jsonb,jsonb,text)',
+      'model text,input_tokens bigint,cached_input_tokens bigint,',
+      'model text,input_tokens bigint,unclassified_input_tokens bigint,cached_input_tokens bigint,'),
+    ('cloud_ingest_usage(text,text,jsonb,jsonb,text)',
+      'input_tokens=excluded.input_tokens,cached_input_tokens=excluded.cached_input_tokens,',
+      'input_tokens=excluded.input_tokens,unclassified_input_tokens=excluded.unclassified_input_tokens,cached_input_tokens=excluded.cached_input_tokens,'),
+    ('cloud_restore_usage_archive(uuid,uuid,uuid,date)',
+      'SET input_tokens=c.input_tokens,cached_input_tokens=c.cached_input_tokens,',
+      'SET input_tokens=c.input_tokens,unclassified_input_tokens=COALESCE(c.unclassified_input_tokens,0),cached_input_tokens=c.cached_input_tokens,'),
+    ('cloud_restore_usage_archive(uuid,uuid,uuid,date)',
+      'source,model,hour_start,input_tokens,', 'source,model,hour_start,input_tokens,unclassified_input_tokens,'),
+    ('cloud_restore_usage_archive(uuid,uuid,uuid,date)',
+      'c.model,c.hour_start,c.input_tokens,c.cached_input_tokens,',
+      'c.model,c.hour_start,c.input_tokens,COALESCE(c.unclassified_input_tokens,0),c.cached_input_tokens,')
+  ) AS patches(signature, old_text, new_text)
+  LOOP
+    IF to_regprocedure('public.' || patch.signature) IS NULL THEN
+      RAISE EXCEPTION 'Accounting v3 requires current main function %', patch.signature;
+    END IF;
+    SELECT pg_get_functiondef(to_regprocedure('public.' || patch.signature)) INTO definition;
+    occurrences := (length(definition) - length(replace(definition, patch.old_text, ''))) / length(patch.old_text);
+    IF occurrences <> 1 THEN
+      RAISE EXCEPTION 'Accounting v3 SQL shape drift in % (matches: %)', patch.signature, occurrences;
+    END IF;
+    EXECUTE replace(definition, patch.old_text, patch.new_text);
+  END LOOP;
+END
+$integration$;
+
+-- Advertise v3 only once all transactional ingest, compact and cold restore
+-- paths above are installed. The edge fails closed against older databases.
+CREATE OR REPLACE FUNCTION public.tokentracker_accounting_capabilities()
+RETURNS jsonb LANGUAGE sql IMMUTABLE SET search_path TO public, pg_temp
+AS $capabilities$
+  SELECT jsonb_build_object('accounting_version', 3, 'unclassified_input_tokens', true)
+$capabilities$;
+REVOKE ALL ON FUNCTION public.tokentracker_accounting_capabilities() FROM PUBLIC, anon, authenticated;
+GRANT EXECUTE ON FUNCTION public.tokentracker_accounting_capabilities() TO project_admin;

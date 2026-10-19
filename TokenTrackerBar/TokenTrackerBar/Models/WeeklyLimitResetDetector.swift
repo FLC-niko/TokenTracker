@@ -39,6 +39,7 @@ enum LimitResetProviderIconCatalog {
         case "qoder": return "qoder.svg"
         case "codingPlan": return "volcano-ark.svg"
         case "agentPlan": return "volcano-ark.svg"
+        case "devin": return "devin.svg"
         default: return nil
         }
     }
@@ -233,7 +234,11 @@ extension UsageLimitsResponse {
         if let kimi { addGeneric("kimi", kimi.configured, kimi.error, [("primary", Strings.kimiWeeklyLabel, kimi.primaryWindow), ("secondary", Strings.kimiFiveHourLabel, kimi.secondaryWindow), ("tertiary", Strings.kimiTotalLabel, kimi.tertiaryWindow)]) }
         if let grok { addGeneric("grok", grok.configured, grok.error, [("primary", Strings.grokPrimaryLabel(periodType: grok.periodType), grok.primaryWindow), ("secondary", Strings.grokOndemandLabel, grok.secondaryWindow)]) }
         if let copilot { addGeneric("copilot", copilot.configured, copilot.error, [("primary", "Premium", copilot.primaryWindow), ("secondary", "Chat", copilot.secondaryWindow)]) }
-        if let zcode {
+        if let zcode, zcode.planKind != "coding-plan", let buckets = zcode.labeledBuckets {
+            // Start plans: one reading per server-labelled bucket, keyed by entitlement so
+            // promotional grants and daily allowances stay distinct across polls.
+            addGeneric("zcode", zcode.configured, zcode.error, buckets.map { ("bucket.\($0.key)", $0.label, $0.window) })
+        } else if let zcode {
             let labels = zcode.planKind == "coding-plan"
                 ? [("primary", "5h", zcode.primaryWindow), ("secondary", "Weekly", zcode.secondaryWindow), ("tertiary", "Tools", zcode.tertiaryWindow)]
                 : [("primary", "GLM-5.2", zcode.primaryWindow), ("secondary", "GLM-5-Turbo", zcode.secondaryWindow), ("tertiary", "Tools", zcode.tertiaryWindow)]
@@ -276,6 +281,12 @@ extension UsageLimitsResponse {
                 ("primary", "5h", agentPlan.primaryWindow),
                 ("secondary", "Weekly", agentPlan.secondaryWindow),
                 ("tertiary", "Monthly", agentPlan.tertiaryWindow),
+            ])
+        }
+        if let devin {
+            addGeneric("devin", devin.configured, devin.error, [
+                ("primary", "Daily", devin.primaryWindow),
+                ("secondary", "Weekly", devin.secondaryWindow),
             ])
         }
 

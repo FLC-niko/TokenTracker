@@ -1,4 +1,5 @@
 import { fireEvent, render, screen, within } from "@testing-library/react";
+import { createElement } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { copy, setCopyLocale } from "../../../lib/copy";
 import { DE_LOCALE, EN_LOCALE, JA_LOCALE, KO_LOCALE, ZH_CN_LOCALE, ZH_TW_LOCALE } from "../../../lib/locale";
@@ -43,6 +44,89 @@ afterEach(() => {
 describe("UsageLimitsPanel", () => {
   afterEach(() => {
     setCopyLocale(EN_LOCALE);
+  });
+
+  it("keeps Start grants collapsed inside the Pro row and expands them independently", () => {
+    render(
+      <UsageLimitsPanel
+        order={["zcode"]}
+        displayMode="remaining"
+        zcode={{
+          configured: true, plan_label: "Pro", plan_kind: "coding-plan",
+          primary_window: { used_percent: 2 },
+          secondary_window: { used_percent: 30 },
+          tertiary_window: { used_percent: 15 },
+          start_plan: {
+            configured: true, plan_label: "Start",
+            buckets: [{
+              label: "GLM-5.3-Flash · ZCode Trust Build", plan_name: "ZCode Trust Build", period: "one_time",
+              remaining_units: 100000000, total_units: 100000000,
+              window: { used_percent: 0, reset_at: "2030-10-07T16:00:00.000Z" },
+            }],
+          },
+        }}
+      />,
+    );
+    const main = screen.getByRole("button", { name: /^ZCode Pro/ });
+    const grants = screen.getByRole("button", { name: "ZCode Trust Build" });
+    expect(grants).toHaveAttribute("aria-expanded", "false");
+    expect(screen.queryByText("GLM-5.3-Flash · ZCode Trust Build")).not.toBeInTheDocument();
+    expect(screen.getByText("98%")).toBeInTheDocument();
+
+    fireEvent.click(grants);
+    expect(grants).toHaveAttribute("aria-expanded", "true");
+    expect(main).toHaveAttribute("aria-expanded", "false");
+    expect(screen.getByText("GLM-5.3-Flash · ZCode Trust Build")).toBeInTheDocument();
+    expect(screen.getByText("100%")).toBeInTheDocument();
+    expect(screen.getByText(copy("limits.zcode.grant_amount", { remaining: "100,000,000", total: "100,000,000" }))).toBeInTheDocument();
+    expect(main.parentElement).toHaveTextContent(copy("limits.hover.expires_at", { time: formatExpiry("2030-10-07T16:00:00.000Z") }));
+    fireEvent.click(screen.getByText("GLM-5.3-Flash · ZCode Trust Build"));
+    expect(main).toHaveAttribute("aria-expanded", "false");
+    fireEvent.keyDown(grants, { key: "Enter" });
+    expect(main).toHaveAttribute("aria-expanded", "false");
+
+    fireEvent.click(main);
+    expect(main).toHaveAttribute("aria-expanded", "true");
+    expect(grants).toHaveAttribute("aria-expanded", "true");
+    fireEvent.click(grants);
+    expect(main).toHaveAttribute("aria-expanded", "true");
+    expect(screen.queryByText("GLM-5.3-Flash · ZCode Trust Build")).not.toBeInTheDocument();
+    expect(screen.getByText("98%")).toBeInTheDocument();
+  });
+
+  it("shows separate usable 5h and weekly reset counts with their earliest expiries", () => {
+    render(<UsageLimitsPanel order={["zcode"]} zcode={{
+      configured: true, plan_label: "Pro", plan_kind: "coding-plan",
+      primary_window: { used_percent: 2 },
+      reset_credits: {
+        five_hour: [
+          { expires_at: "2030-10-19T10:00:00Z" }, { expires_at: "2030-10-18T10:00:00Z" },
+          { expires_at: "2000-01-01T00:00:00Z" },
+        ],
+        weekly: [{ expires_at: "2030-10-20T09:00:00Z" }],
+      },
+    }} />);
+    expect(screen.getByText(copy("limits.zcode.reset_bank.title"))).toBeInTheDocument();
+    expect(screen.getByText(copy("limits.zcode.reset_bank.count", { count: 2 }))).toBeInTheDocument();
+    expect(screen.getByText(copy("limits.zcode.reset_bank.count", { count: 1 }))).toBeInTheDocument();
+    expect(screen.getByText(copy("limits.zcode.reset_bank.earliest", {
+      time: formatExpiry("2030-10-18T10:00:00Z"),
+    }))).toBeInTheDocument();
+    expect(screen.getByText(copy("limits.zcode.reset_bank.earliest", {
+      time: formatExpiry("2030-10-20T09:00:00Z"),
+    }))).toBeInTheDocument();
+    expect(screen.getByText("2%")).toBeInTheDocument();
+  });
+
+  it("keeps reset inventory failures separate from normal Pro quota bars", () => {
+    render(<UsageLimitsPanel order={["zcode"]} zcode={{
+      configured: true, plan_label: "Pro", plan_kind: "coding-plan",
+      primary_window: { used_percent: 2 },
+      reset_credits: { error: "Reset status unavailable" },
+    }} />);
+    expect(screen.getByText("2%")).toBeInTheDocument();
+    expect(screen.getByText(/Reset status unavailable/)).toBeInTheDocument();
+    expect(screen.queryByText(copy("limits.zcode.reset_bank.count", { count: 0 }))).not.toBeInTheDocument();
   });
 
   it("shows provider status rows instead of hiding configured providers with errors", () => {
@@ -361,6 +445,37 @@ describe("UsageLimitsPanel", () => {
     expect(within(group).getByText(copy("limits.explain.body"))).toBeInTheDocument();
   });
 
+  it("shows Grok's weekly pace marker below 5% usage in remaining mode", () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-09-25T00:00:00.000Z"));
+    const grok = {
+      configured: true,
+      error: null,
+      period_type: "weekly",
+      primary_window: { used_percent: 3, reset_at: "2026-10-01T00:00:00.000Z" },
+    };
+    const { rerender } = render(createElement(UsageLimitsPanel, {
+      grok,
+      order: ["grok"],
+      displayMode: "remaining",
+    }));
+
+    const group = screen.getByText("Grok Build").closest("[role='button']");
+    expect(within(group).getByText("97%")).toBeInTheDocument();
+    const markers = group.querySelectorAll("div.absolute.top-0.h-full");
+    expect(markers).toHaveLength(2);
+    expect(markers[1].style.left).toContain("85.714");
+    fireEvent.click(group);
+    expect(within(group).getByText(copy("limits.explain.body_remaining"))).toBeInTheDocument();
+
+    rerender(createElement(UsageLimitsPanel, {
+      grok: { ...grok, primary_window: { ...grok.primary_window, used_percent: 0 } },
+      order: ["grok"],
+      displayMode: "remaining",
+    }));
+    expect(group.querySelectorAll("div.absolute.top-0.h-full")).toHaveLength(0);
+  });
+
   it("surfaces a configured OpenCode Go error instead of rendering bars", () => {
     render(
       <UsageLimitsPanel
@@ -513,6 +628,26 @@ describe("UsageLimitsPanel", () => {
     expect(screen.getByText("Cached limits. Run Qoder to refresh.")).toBeInTheDocument();
   });
 
+  it("renders Qoder CN plan, add-on credits and Ultimate calls as separate buckets", () => {
+    const data = {
+      configured: true,
+      primary_window: { used_percent: 25, used_credits: 25, limit_credits: 100, remaining_credits: 75 },
+      secondary_window: { used_percent: 40, used_credits: 80, limit_credits: 200, remaining_credits: 120, unit: "calls" },
+      tertiary_window: { used_percent: 7, used_credits: 35, limit_credits: 500, remaining_credits: 465, unit: "credits" },
+    };
+    const { rerender } = render(<UsageLimitsPanel qoderCn={data} order={["qoderCn"]} />);
+    expect(screen.getByText(copy("limits.label.qoder_cn_credits"))).toBeInTheDocument();
+    expect(screen.getByText(copy("limits.label.qoder_cn_addon_credits"))).toBeInTheDocument();
+    expect(screen.getByText(copy("limits.label.qoder_cn_ultimate"))).toBeInTheDocument();
+    expect(screen.getByText("7%")).toBeInTheDocument();
+    const details = screen.getAllByRole("tooltip").map((tip) => tip.textContent);
+    expect(details.some((text) => /25[\s\S]*100[\s\S]*75/.test(text))).toBe(true);
+    expect(details.some((text) => /35[\s\S]*500[\s\S]*465/.test(text))).toBe(true);
+    expect(details.some((text) => /80[\s\S]*200[\s\S]*120/.test(text))).toBe(true);
+    rerender(<UsageLimitsPanel qoderCn={{ ...data, tertiary_window: undefined }} order={["qoderCn"]} />);
+    expect(screen.queryByText(copy("limits.label.qoder_cn_addon_credits"))).not.toBeInTheDocument();
+  });
+
   it("appends plan_label to the provider title when present", () => {
     render(
       <UsageLimitsPanel
@@ -584,6 +719,28 @@ describe("UsageLimitsPanel", () => {
     expect(within(group).getByText(/cached\s*·/i)).toBeInTheDocument();
     expect(group.querySelector("span.bg-amber-500")).not.toBeNull();
     expect(within(group).queryByText(/^Stale/i)).not.toBeInTheDocument();
+  });
+
+  it("flags Antigravity reauth ahead of the cached badge", () => {
+    render(
+      <UsageLimitsPanel
+        antigravity={{
+          configured: true,
+          error: null,
+          cached: true,
+          cached_at: "2026-07-17T12:00:00.000Z",
+          auth_action_required: "reauth",
+          primary_window: { used_percent: 24, reset_at: "2026-07-24T12:00:00.000Z" },
+        }}
+        order={["antigravity"]}
+      />,
+    );
+
+    const group = screen.getByText("Antigravity").closest("[role='button']");
+    expect(group).not.toBeNull();
+    expect(within(group).getByText(new RegExp(copy("limits.reauth.badge")))).toBeInTheDocument();
+    expect(within(group).getByText(/run `agy`/)).toBeInTheDocument();
+    expect(within(group).queryByText(/cached/i)).not.toBeInTheDocument();
   });
 
   it("flags an expired Claude sign-in on cached bars instead of the generic stale badge", () => {
@@ -856,5 +1013,89 @@ describe("UsageLimitsPanel", () => {
     expect(screen.getByText("Cursor")).toBeInTheDocument();
     expect(screen.queryByText("Auto-renew")).not.toBeInTheDocument();
     expect(screen.queryByText("Subscription")).not.toBeInTheDocument();
+  });
+
+  it("renders Devin Daily / Weekly windows with the plan label", () => {
+    render(
+      <UsageLimitsPanel
+        devin={{
+          configured: true,
+          error: null,
+          plan_label: "Pro",
+          primary_window: {
+            used_percent: 40,
+            reset_at: "2026-09-13T08:00:00.000Z",
+            limit_window_seconds: 86400,
+          },
+          secondary_window: {
+            used_percent: 90,
+            reset_at: "2026-09-20T08:00:00.000Z",
+            limit_window_seconds: 604800,
+          },
+        }}
+        order={["devin"]}
+      />,
+    );
+
+    expect(screen.getByText("Devin Pro")).toBeInTheDocument();
+    expect(screen.getByText("Daily")).toBeInTheDocument();
+    expect(screen.getByText("Weekly")).toBeInTheDocument();
+    expect(screen.getByText("40%")).toBeInTheDocument();
+    expect(screen.getByText("90%")).toBeInTheDocument();
+  });
+
+  it("flips Devin percentages to remaining in remaining display mode", () => {
+    render(
+      <UsageLimitsPanel
+        devin={{
+          configured: true,
+          error: null,
+          primary_window: {
+            used_percent: 40,
+            reset_at: "2026-09-13T08:00:00.000Z",
+            limit_window_seconds: 86400,
+          },
+        }}
+        order={["devin"]}
+        displayMode="remaining"
+      />,
+    );
+
+    expect(screen.getByText("60%")).toBeInTheDocument();
+    expect(screen.queryByText("40%")).not.toBeInTheDocument();
+  });
+
+  it("renders no bogus Daily bar when Devin reports only the weekly window", () => {
+    render(
+      <UsageLimitsPanel
+        devin={{
+          configured: true,
+          error: null,
+          primary_window: null,
+          secondary_window: {
+            used_percent: 25,
+            reset_at: "2026-09-20T08:00:00.000Z",
+            limit_window_seconds: 604800,
+          },
+        }}
+        order={["devin"]}
+      />,
+    );
+
+    expect(screen.getByText("Devin")).toBeInTheDocument();
+    expect(screen.getByText("Weekly")).toBeInTheDocument();
+    expect(screen.getByText("25%")).toBeInTheDocument();
+    expect(screen.queryByText("Daily")).not.toBeInTheDocument();
+  });
+
+  it("shows the Devin CLI setup hint when not connected", () => {
+    render(
+      <UsageLimitsPanel devin={{ configured: false }} order={["devin"]} />,
+    );
+
+    expect(screen.getByText("Devin")).toBeInTheDocument();
+    expect(screen.getByText("Not connected")).toBeInTheDocument();
+    expect(screen.getByText("Connect Devin")).toBeInTheDocument();
+    expect(screen.getByText("devin auth login")).toBeInTheDocument();
   });
 });

@@ -13,6 +13,25 @@ const { test } = require("node:test");
 const matcher = require("../src/lib/pricing/matcher");
 const fetcher = require("../src/lib/pricing/litellm-fetcher");
 const pricing = require("../src/lib/pricing");
+const curatedPricing = require("../src/lib/pricing/curated-overrides.json");
+
+test("Claude 5.5 SKUs use official rates and Claude thinking is already billed in output (#762)", () => {
+  pricing.resetPricingForTests();
+  for (const [model, expected] of [
+    ["claude-opus-5-5", 29.2], ["claude-opus-5.5", 29.2],
+    ["claude-sonnet-5", 14.7], ["claude-sonnet-5-5", 14.6],
+  ]) {
+    const row = { source: "claude", model, input_tokens: 1e6, output_tokens: 5e5,
+      cached_input_tokens: 1e6, cache_creation_input_tokens: 1e6, reasoning_output_tokens: 5e5 };
+    assert.ok(Math.abs(pricing.computeRowCost(row) - expected) < 1e-9, model);
+    assert.equal(pricing.computeRowCost(row), pricing.computeRowCost({ ...row, output_tokens: 1e6, reasoning_output_tokens: 0 }));
+  }
+  const litellm = { "claude-opus-5-5": { input: 4, output: 20 } };
+  const result = matcher.lookupPricing("claude-opus-5-5", { curated: { exact: { "claude-opus-5": { input: 5, output: 25 } } }, litellm });
+  assert.equal(result.source, "litellm:exact");
+  assert.equal(matcher.lookupPricing("anthropic/claude-opus-5-5", { curated: { exact: { "claude-opus-5": { input: 5, output: 25 } } }, litellm: {} }).hit, false);
+  assert.deepEqual(pricing.getModelPricing("k3-256k"), pricing.getModelPricing("k3"));
+});
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Helpers
@@ -444,6 +463,18 @@ test("matcher: Cursor normalization preserves Grok Fast and canonicalizes Claude
     "cursor-grok-4.5",
   );
   assert.equal(
+    matcher.normalizeCursorModel("grok-4.7-high-fast"),
+    "cursor-grok-4.7-fast",
+  );
+  assert.equal(
+    matcher.normalizeCursorModel("grok-4.6-medium"),
+    "cursor-grok-4.6",
+  );
+  assert.equal(
+    matcher.normalizeCursorModel("gemini-4-argon-high"),
+    "gemini-4-argon",
+  );
+  assert.equal(
     matcher.normalizeCursorModel("claude-4.6-opus-medium-thinking"),
     "claude-opus-4-6",
   );
@@ -629,6 +660,105 @@ test("index: getModelPricing resolves GLM-5.2 from CURATED for ZCode rows", asyn
     reasoning_output_tokens: 0,
   });
   assert.equal(cost, 1.4);
+});
+
+test("index: iFlytek MaaS 使用附件中的完整来源级价格表", () => {
+  pricing.resetPricingForTests();
+  const iFlytekMaasPricing = curatedPricing.source_exact.acode;
+  assert.equal(Object.keys(iFlytekMaasPricing).length, 64);
+  assert.equal(curatedPricing.source_alias?.acode, undefined);
+  for (const [model, value] of Object.entries(iFlytekMaasPricing)) {
+    for (const field of ["input", "output", "cache_read", "cache_write"]) {
+      assert.ok(Number.isFinite(value[field]) && value[field] >= 0, `${model}.${field} 价格无效`);
+      assert.equal(value[field], Math.round(value[field] * 100) / 100, `${model}.${field} 超过两位小数`);
+    }
+  }
+
+  const cases = [
+    ["xopglm53", { input: 1.11, output: 3.89, cache_read: 0.28, cache_write: 1.11 }],
+    ["xopglm52", { input: 1.11, output: 3.89, cache_read: 0.28, cache_write: 1.11 }],
+    ["xminimaxm25", { input: 0.29, output: 1.17, cache_read: 0.29, cache_write: 0.29 }],
+    ["xopkimik26", { input: 0.9, output: 3.75, cache_read: 0.18, cache_write: 0.9 }],
+    ["xopdeepseekv4pro", { input: 1.67, output: 3.33, cache_read: 0.14, cache_write: 1.67 }],
+    ["xopdeepseekv4flash0731", { input: 0.14, output: 0.28, cache_read: 0.03, cache_write: 0.14 }],
+    ["xopqwen36v35b", { input: 0.15, output: 0.9, cache_read: 0.15, cache_write: 0.15 }],
+    ["Spark Mini", { input: 0.28, output: 1.11, cache_read: 0.28, cache_write: 0.28 }],
+    ["spark-x2.5", { input: 0.13, output: 0.5, cache_read: 0.02, cache_write: 0.13 }],
+    ["Spark-X2.5", { input: 0.13, output: 0.5, cache_read: 0.02, cache_write: 0.13 }],
+    ["spark-x2.5-4b", { input: 0, output: 0, cache_read: 0, cache_write: 0 }],
+  ];
+  for (const [model, expected] of cases) {
+    assert.deepEqual(pricing.getModelPricing(model, { source: "acode" }), expected);
+  }
+
+  assert.deepEqual(pricing.getModelPricing("xsparkx2agent", { source: "acode" }), iFlytekMaasPricing.xsparkx2);
+  assert.ok(!curatedPricing.source_exclusive?.includes("acode"));
+  assert.deepEqual(
+    pricing.getModelPricing("gpt-5.4", { source: "acode" }),
+    pricing.getModelPricing("gpt-5.4"),
+  );
+  assert.deepEqual(
+    pricing.getModelPricing("user-custom-model-never-listed", { source: "acode" }),
+    pricing.ZERO_PRICING,
+  );
+
+  // AStudio source-specific prices must not override public prices for same-named
+  // models from other sources.
+  assert.deepEqual(pricing.getModelPricing("GLM-5.2"), { input: 1.4, output: 4.4, cache_read: 0.26 });
+});
+
+test("index: unresolved AStudio routers stay unpriced without affecting other sources", () => {
+  pricing.resetPricingForTests();
+  for (const model of [
+    "auto", "something-auto", "astronclaw-auto", "future-auto",
+    "glm-5.3-auto", " AUTO ", " Something-AUTO ",
+  ]) {
+    const row = {
+      source: "acode",
+      model,
+      input_tokens: 1_000_000,
+      output_tokens: 1_000_000,
+      cached_input_tokens: 1_000_000,
+      cache_creation_input_tokens: 1_000_000,
+      reasoning_output_tokens: 1_000_000,
+    };
+    const lookup = matcher.lookupPricing(model, {
+      source: "ACODE",
+      curated: curatedPricing,
+      litellm: { [model.trim()]: { input: 99, output: 99 } },
+    });
+    assert.equal(lookup.hit, false, model);
+    assert.deepEqual(pricing.getModelPricing(model, { source: "acode" }), pricing.ZERO_PRICING, model);
+    assert.equal(pricing.computeRowCost(row), 0, model);
+    assert.equal(row.model, model);
+  }
+  assert.equal(pricing.getModelPricing("auto", { source: "cursor" }).input, 1.25);
+  assert.deepEqual(
+    pricing.getModelPricing("auto", { source: "workbuddy" }),
+    pricing.getModelPricing("hy3-preview-agent"),
+  );
+});
+
+test("index: iFlytek MaaS reasoning 已计入输出且不继承 DeepSeek 分时折扣", () => {
+  pricing.resetPricingForTests();
+  const base = {
+    source: "acode",
+    model: "xopglm52",
+    input_tokens: 0,
+    cached_input_tokens: 0,
+    cache_creation_input_tokens: 0,
+    output_tokens: 1_000_000,
+    reasoning_output_tokens: 1_000_000,
+  };
+  assert.equal(pricing.computeRowCost(base), 3.89);
+
+  const offPeak = pricing.getRowPricing({
+    source: "acode",
+    model: "xopdeepseekv4pro",
+    hour_start: "2026-08-31T04:00:00.000Z",
+  });
+  assert.equal(offPeak.input, 1.67);
+  assert.equal(offPeak.output, 3.33);
 });
 
 test("index: getModelPricing resolves glm-5.3-flash at the LiteLLM flash rate, not glm-5", async () => {
@@ -864,6 +994,39 @@ test("index: DeepSeek V4 pricing follows official UTC peak and off-peak windows 
   );
 });
 
+test("index: 旧 Provider 的展示型 DeepSeek 名称不触发分时折扣", () => {
+  pricing.resetPricingForTests();
+  const basePricing = {
+    input: 1.32,
+    output: 3.96,
+    cache_read: 0.044,
+    cache_write: 1.32,
+  };
+  const cases = [
+    ["antigravity", "DeepSeek V4 Pro (Thinking)"],
+    ["cursor", "DeepSeek V4 Pro (Thinking)"],
+    ["zed", "DeepSeek V4 Pro (Preview)"],
+  ];
+
+  for (const [source, model] of cases) {
+    assert.deepEqual(pricing.getModelPricing(model, { source }), basePricing);
+    assert.deepEqual(
+      pricing.getRowPricing({ source, model, pricing_tier: "off_peak" }),
+      basePricing,
+      `${source} 的展示型模型名不应继承 DeepSeek 分时折扣`,
+    );
+  }
+
+  assert.deepEqual(
+    pricing.getRowPricing({
+      source: "dsh",
+      model: "deepseek-v4-pro",
+      pricing_tier: "off_peak",
+    }),
+    { input: 0.66, output: 1.98, cache_read: 0.022, cache_write: 0.66 },
+  );
+});
+
 test("index: Cursor Fast SKUs keep their distinct curated pricing (#446)", () => {
   const rates = (model) => {
     const { input, output, cache_read, cache_write } = model;
@@ -1045,9 +1208,40 @@ test("index: computeRowCost prefers a provider-reported Grok cost", () => {
   assert.equal(cost, 0.130486);
 });
 
+test("index: Cline reported cost is authoritative and reasoning is a subset", () => {
+  const row = {
+    source: "cline",
+    model: "claude-sonnet-4-6",
+    input_tokens: 8_000,
+    cached_input_tokens: 2_000,
+    cache_creation_input_tokens: 0,
+    output_tokens: 1_000,
+    reasoning_output_tokens: 400,
+    total_cost_usd: 0.25,
+  };
+  assert.equal(pricing.computeRowCost(row), 0.25);
+  const estimated = pricing.computeRowCost({ ...row, total_cost_usd: 0 });
+  assert.equal(
+    estimated,
+    pricing.computeRowCost({ ...row, total_cost_usd: 0, reasoning_output_tokens: 0 }),
+  );
+});
+
+test("index: Cline free-suffixed models remain zero-cost", () => {
+  assert.equal(pricing.computeRowCost({
+    source: "cline",
+    model: "deepseek/deepseek-r1:free",
+    input_tokens: 1_000_000,
+    output_tokens: 1_000_000,
+    cached_input_tokens: 0,
+    cache_creation_input_tokens: 0,
+    reasoning_output_tokens: 0,
+  }), 0);
+});
+
 test("index: computeRowCost ignores reported costs from non-authoritative sources", () => {
   const row = {
-    source: "command-code",
+    source: "claude",
     model: "claude-sonnet-4-6",
     input_tokens: 1_000_000,
     cached_input_tokens: 0,
@@ -1062,6 +1256,22 @@ test("index: computeRowCost ignores reported costs from non-authoritative source
     estimatedCost,
   );
 });
+
+for (const [model, expected] of [
+  ["claude-sonnet-4-6", 0.0009675],
+  ["glm-4.7-flash", 0],
+  ["zzzz-fixture-unknown-123xyz", 0],
+]) {
+  test(`index: Command Code uses model-table pricing for ${model}, not its display estimate`, () => {
+    const row = {
+      source: "command-code", model, input_tokens: 100, output_tokens: 20,
+      cached_input_tokens: 600, cache_creation_input_tokens: 50, reasoning_output_tokens: 0,
+    };
+    for (const total_cost_usd of [999, 0, undefined]) {
+      assert.equal(pricing.computeRowCost({ ...row, total_cost_usd }), expected);
+    }
+  });
+}
 
 test("index: Pi GitHub Copilot rows keep token usage but have zero estimated API cost", () => {
   pricing.resetPricingForTests();
@@ -1146,4 +1356,49 @@ test("WorkBuddy: computeRowCost bills auto + hy3 rows at the hy3 rate", () => {
   });
   assert.equal(pricing.computeRowCost(row("auto")), 0.167);
   assert.equal(pricing.computeRowCost(row("hy3-preview-agent")), 0.167);
+});
+
+test("index: DeepSeek V4.1 Flash (deepseek-v4.1-flash / deepseek-flash) prices at the official rates with peak/off-peak tiers", () => {
+  pricing.resetPricingForTests();
+  const curated = require("../src/lib/pricing/curated-overrides.json");
+  const litellm = {};
+  // The official API id is deepseek-flash; OpenRouter, Command Code and
+  // WorkBuddy report deepseek-v4.1-flash, usually with a provider prefix.
+  // Before these entries existed every form fell through to zero: the
+  // v4-flash fuzzy needle does not match the ".1" string, and LiteLLM only
+  // keys the model under openrouter/ and together_ai/ prefixes.
+  const cases = [
+    ["deepseek-v4.1-flash", "curated:exact"],
+    ["deepseek-flash", "curated:exact"],
+    ["deepseek/deepseek-v4.1-flash", "curated:fuzzy"],
+    ["deepseek/deepseek-flash", "curated:fuzzy"],
+    ["deepseek-v4-1-flash", "curated:exact-dot"],
+  ];
+  for (const [model, source] of cases) {
+    const r = matcher.lookupPricing(model, { curated, litellm });
+    assert.equal(r.hit, true, `${model} should resolve`);
+    assert.equal(r.source, source, `${model} source`);
+    assert.deepEqual(
+      { input: r.value.input, output: r.value.output, cache_read: r.value.cache_read, cache_write: r.value.cache_write },
+      { input: 0.3, output: 1.2, cache_read: 0.006, cache_write: 0.3 },
+      `${model} rates`,
+    );
+  }
+  // V4 Flash must not be captured by the new needles (no substring relation).
+  assert.equal(matcher.lookupPricing("deepseek-v4-flash", { curated, litellm }).value.input, 0.44);
+
+  const row = (model, hour_start) => ({
+    source: "command-code",
+    model,
+    hour_start,
+    input_tokens: 1_000_000,
+    cached_input_tokens: 1_000_000,
+    cache_creation_input_tokens: 1_000_000,
+    output_tokens: 1_000_000,
+    reasoning_output_tokens: 0,
+  });
+  // 01:00Z is inside the 01-04 UTC peak window; 04:00Z is off-peak (half price).
+  assert.equal(pricing.computeRowCost(row("deepseek/deepseek-v4.1-flash", "2026-08-21T01:00:00Z")), 1.806);
+  assert.equal(pricing.computeRowCost(row("deepseek/deepseek-v4.1-flash", "2026-08-21T04:00:00Z")), 0.903);
+  assert.equal(pricing.computeRowCost(row("deepseek-flash", "2026-08-21T04:00:00Z")), 0.903);
 });

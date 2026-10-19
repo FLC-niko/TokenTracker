@@ -3,6 +3,7 @@ const path = require("node:path");
 const fs = require("node:fs/promises");
 
 const { readJson } = require("./fs");
+const { resolveEnvRoot, resolveScanRoots } = require("./scan-roots");
 const { readCursorStateSummary } = require("./cursor-store");
 const { readCodexNotify, readEveryCodeNotify } = require("./codex-config");
 const { areClaudeUsageHooksConfigured, buildClaudeHookCommand } = require("./claude-config");
@@ -18,6 +19,7 @@ const { probeOpenclawHookState } = require("./openclaw-hook");
 const { probeOpenclawSessionPluginState } = require("./openclaw-session-plugin");
 const { probeGrokHookState } = require("./grok-hook");
 const { resolveTrackerPaths } = require("./tracker-paths");
+const { resolveDeviceTokenPresence } = require("./cloud-device-token");
 const wsl = require("./wsl-probe");
 // TASK-011: Kiro paths inlined here to avoid pulling the ~4000-line
 // rollout module on every `tokentracker status` / `diagnostics` call.
@@ -66,7 +68,7 @@ function resolveKiroCliDbPathInline(env, home) {
 
 async function collectTrackerDiagnostics({
   home = os.homedir(),
-  codexHome = process.env.CODEX_HOME || path.join(home, ".codex"),
+  codexHome = resolveEnvRoot("codex", { env: process.env, home }) || path.join(home, ".codex"),
   codeHome = process.env.CODE_HOME || path.join(home, ".code"),
 } = {}) {
   const { trackerDir, binDir } = await resolveTrackerPaths({ home });
@@ -92,6 +94,20 @@ async function collectTrackerDiagnostics({
     path.join(home, ".grok");
 
   const config = await readJson(configPath);
+  // Extra scan roots (#657), resolved as sync does. Paths are home-redacted
+  // like every other entry in `paths`.
+  const scanRoots = resolveScanRoots({
+    home,
+    env: process.env,
+    config,
+    base: { codex: [codexHome], claude: [path.join(home, ".claude")] },
+  });
+  const describeScanRoots = (entries) => entries.map((entry) => ({
+    path: redactValue(entry.path, home),
+    origin: entry.origin,
+    exists: entry.exists,
+    error: entry.error || null,
+  }));
   const cursorSummary = await readCursorStateSummary({ trackerDir, cursorsPath });
   const cursors = cursorSummary.cursors;
   const queueState = (await readJson(queueStatePath)) || { offset: 0 };
@@ -213,13 +229,19 @@ async function collectTrackerDiagnostics({
         ? { wsl_mode: wsl.getWslMode(process.env), wsl_installs: kiroWslInstalls }
         : {}),
       cli_approximation:
-        "Kiro CLI does not persist explicit token counts (billing is credit-based on Bedrock). Tokens are approximated at 4 chars/token from user prompt chars and assistant response chars. Source rows that came through this path have model='kiro-cli-agent' when the underlying model is unknown (auto-routing); known Bedrock ARNs canonicalize to their short name (e.g. claude-sonnet-4).",
+        "When Kiro CLI does not report token counts, tokens are estimated at ~4 chars/token from new user messages, tool outputs and assistant text. The estimate does not measure re-sent history, system context or cache usage, and can substantially undercount tool-heavy requests. contextUsage percentages are not converted to tokens because their denominator and request correspondence are not established. Dollar amounts use model rates, not Kiro credit charges; recorded usage_summary credits remain separate. Source rows use model='kiro-cli-agent' when the underlying model is unknown; known Bedrock ARNs canonicalize to their short name (e.g. claude-sonnet-4).",
       merge_policy:
         "Kiro IDE and Kiro CLI both emit source='kiro' in queue.jsonl so token, cost, heatmap, and leaderboard aggregations merge transparently. Use this block to distinguish sub-path contributions.",
     },
+    scan_roots: {
+      codex: describeScanRoots(scanRoots.codex),
+      claude: describeScanRoots(scanRoots.claude),
+    },
     config: {
       base_url: typeof config?.baseUrl === "string" ? config.baseUrl : null,
-      device_token: config?.deviceToken ? "set" : "unset",
+      device_token: resolveDeviceTokenPresence({ trackerDir, config: config || {} }).set
+        ? "set"
+        : "unset",
       device_id: maskId(config?.deviceId),
       installed_at: typeof config?.installedAt === "string" ? config.installedAt : null,
     },

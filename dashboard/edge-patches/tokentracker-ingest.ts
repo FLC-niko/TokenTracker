@@ -3,6 +3,7 @@
  * 用 device token（SHA-256 hash）验证身份，用 service role key 写 DB。
  */
 import { createClient } from "npm:@insforge/sdk";
+import { cloudRpc, cloudFailure } from "./cloud/access.ts";
 
 const corsHeaders = {
   "Access-Control-Allow-Origin": "*",
@@ -24,25 +25,6 @@ function isLeaderboardBlockedUser(userId: string): boolean {
     .some((candidate) => candidate.trim() === userId);
 }
 
-async function isUsageBlocked(
-  client: ReturnType<typeof createClient>,
-  userId: string,
-): Promise<boolean> {
-  if (isLeaderboardBlockedUser(userId)) return true;
-  const { data, error } = await client.database
-    .from("tokentracker_leaderboard_anomaly_flags")
-    .select("user_id")
-    .eq("user_id", userId)
-    .eq("status", "auto_excluded")
-    .limit(1)
-    .maybeSingle();
-  if (error) {
-    console.error("[ingest] anomaly guard failed:", error.message);
-    return false;
-  }
-  return Boolean(data);
-}
-
 async function sha256Hex(input: string): Promise<string> {
   const encoder = new TextEncoder();
   const data = encoder.encode(input);
@@ -52,13 +34,34 @@ async function sha256Hex(input: string): Promise<string> {
     .join("");
 }
 
+function createIngestClient(req: Request) {
+  const baseUrl = Deno.env.get("INSFORGE_BASE_URL")!;
+  const serviceRoleKey = Deno.env.get("INSFORGE_SERVICE_ROLE_KEY");
+  const incomingApiKey = req.headers.get("apikey") ?? req.headers.get("Apikey") ?? req.headers.get("x-api-key") ?? undefined;
+  const anonKey = Deno.env.get("INSFORGE_ANON_KEY") ?? Deno.env.get("ANON_KEY") ?? incomingApiKey;
+  return serviceRoleKey ? createClient({ baseUrl, edgeFunctionToken: serviceRoleKey, anonKey,
+    ...(anonKey ? { headers: { apikey: anonKey } } : {}) }) : null;
+}
+
+async function accountingCapabilities(client: ReturnType<typeof createClient> | null) {
+  try {
+    if (client) {
+      const { data, error } = await client.database.rpc("tokentracker_accounting_capabilities", {});
+      if (!error && Number(data?.accounting_version) >= 3 && data?.unclassified_input_tokens === true) {
+        return { accounting_version: 3, unclassified_input_tokens: true };
+      }
+    }
+  } catch { /* An old/unavailable database must not silently drop new columns. */ }
+  return { accounting_version: 2, unclassified_input_tokens: false };
+}
+
 export default async function (req: Request): Promise<Response> {
   if (req.method === "OPTIONS")
     return new Response(null, { status: 204, headers: corsHeaders });
   const requestUrl = new URL(req.url);
   if (requestUrl.searchParams.get("capabilities") === "1") {
     if (req.method !== "GET") return json({ error: "Method not allowed" }, 405);
-    return json({ accounting_version: 3, unclassified_input_tokens: true });
+    return json(await accountingCapabilities(createIngestClient(req)));
   }
   if (req.method !== "POST") return json({ error: "Method not allowed" }, 405);
 
@@ -66,23 +69,16 @@ export default async function (req: Request): Promise<Response> {
   const deviceToken = authHeader?.replace(/^Bearer\s+/i, "");
   if (!deviceToken) return json({ error: "Missing bearer token" }, 401);
 
-  const body = (await req.json().catch(() => null)) as Record<string, unknown> | null;
+  // Bound bytes before parsing; clients retain their queue offset on rejection.
+  if (Number(req.headers.get("Content-Length") || 0) > 1_048_576) return json({ error: "Upload too large" }, 413);
+  const rawBody = await req.text();
+  if (new TextEncoder().encode(rawBody).byteLength > 1_048_576) return json({ error: "Upload too large" }, 413);
+  let body: Record<string, unknown> | null = null;
+  try { body = JSON.parse(rawBody); } catch { /* malformed request */ }
   if (!body) return json({ error: "Invalid JSON body" }, 400);
 
-  const baseUrl = Deno.env.get("INSFORGE_BASE_URL")!;
-  const serviceRoleKey = Deno.env.get("INSFORGE_SERVICE_ROLE_KEY");
-  const incomingApiKey =
-    req.headers.get("apikey") ?? req.headers.get("Apikey") ?? req.headers.get("x-api-key") ?? undefined;
-  const anonKey =
-    Deno.env.get("INSFORGE_ANON_KEY") ?? Deno.env.get("ANON_KEY") ?? incomingApiKey ?? undefined;
-  if (!serviceRoleKey) return json({ error: "server misconfigured" }, 500);
-
-  const client = createClient({
-    baseUrl,
-    edgeFunctionToken: serviceRoleKey,
-    anonKey,
-    ...(anonKey ? { headers: { apikey: anonKey } } : {}),
-  });
+  const client = createIngestClient(req);
+  if (!client) return json({ error: "server misconfigured" }, 500);
 
   const tokenHash = await sha256Hex(deviceToken);
 
@@ -101,7 +97,13 @@ export default async function (req: Request): Promise<Response> {
 
   // Revoking known tokens is not sufficient when another issuance request is
   // already in flight. The blocklist is the final write-path authorization.
-  if (await isUsageBlocked(client, userId)) {
+  // Only an explicit ban stops the write path. An `auto_excluded` anomaly flag
+  // deliberately does not: the detector is heuristic, and
+  // tokentracker-leaderboard-refresh already excludes flagged accounts from the
+  // public snapshot on its own. Blocking ingest as well meant a false positive
+  // could not upload the corrected numbers that would clear it -- the account
+  // was stuck until someone opened an issue (#639).
+  if (isLeaderboardBlockedUser(userId)) {
     return json({ error: "Account blocked" }, 403);
   }
 
@@ -229,28 +231,21 @@ export default async function (req: Request): Promise<Response> {
   }
   const rows = Array.from(dedupedMap.values());
 
-  const { error: upsertErr } = await client.database
-    .from("tokentracker_hourly")
-    .upsert(rows, {
-      onConflict: "user_id,device_id,hour_start,source,model",
-    });
-
-  if (upsertErr) return json({ error: upsertErr.message }, 500);
-
-  if (stateRows.length > 0) {
-    // Write AFTER the bucket rows of the same upload landed, so canonical
-    // session state never advances for an upload whose device-level rows
-    // failed. The rpc applies a STRICTLY-newer LWW guard
-    // (EXCLUDED.snapshot_verified_at > stored): replays are idempotent and
-    // a transport retry of an older observation can never displace a newer
-    // one. Equal-stamp conflicts keep the first-applied row (stable under
-    // retries).
-    const { error: stateErr } = await client.database.rpc(
-      "tokentracker_upsert_account_session_states",
-      { p_user_id: userId, p_states: stateRows },
-    );
-    if (stateErr) return json({ error: stateErr.message }, 500);
+  if ([...rows, ...stateRows].some(row => Number(row.unclassified_input_tokens) > 0)
+    && (await accountingCapabilities(client)).accounting_version < 3) {
+    return json({ error: "Cloud accounting migration is not ready; retain usage locally", code: "cloud_accounting_not_ready" }, 503);
   }
 
-  return json({ ok: true, inserted: rows.length, skipped: 0 });
+  try {
+    const result = await cloudRpc(client, "cloud_ingest_usage", {
+      p_token_hash: tokenHash, p_rows: rows, p_states: stateRows,
+      p_upload_id: typeof body.upload_id === "string" && /^[0-9a-f-]{36}$/i.test(body.upload_id)
+        ? body.upload_id : null,
+    });
+    if (!result.ok) return cloudFailure(result, corsHeaders);
+    return json(result);
+  } catch (error) {
+    console.error("cloud ingest transaction failed", (error as Error).message);
+    return json({ error: "Cloud access unavailable", code: "cloud_access_unavailable" }, 503);
+  }
 }

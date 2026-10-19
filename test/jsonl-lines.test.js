@@ -46,9 +46,156 @@ test("physicalJsonlRecords reports exact CRLF and unterminated byte spans", asyn
   }
 
   assert.deepEqual(records, [
-    { line: "first", utf8Valid: true, physicalBytes: 7, terminated: true },
-    { line: "last", utf8Valid: true, physicalBytes: 4, terminated: false },
+    { line: "first", utf8Valid: true, oversized: false, physicalBytes: 7, terminated: true },
+    { line: "last", utf8Valid: true, oversized: false, physicalBytes: 4, terminated: false },
   ]);
+});
+
+test("physicalJsonlRecords skips an oversized record and resumes at the next LF record", async () => {
+  const chunks = ["ab\n", "0123456789", "0123456789\n", "cd\n"].map((chunk) => Buffer.from(chunk));
+  const records = [];
+
+  for await (const record of physicalJsonlRecords(chunks, { maxRecordBytes: 8 })) {
+    records.push(record);
+  }
+
+  assert.deepEqual(records, [
+    { line: "ab", utf8Valid: true, oversized: false, physicalBytes: 3, terminated: true },
+    { line: null, utf8Valid: null, oversized: true, physicalBytes: 21, terminated: true },
+    { line: "cd", utf8Valid: true, oversized: false, physicalBytes: 3, terminated: true },
+  ]);
+});
+
+test("physicalJsonlRecords reports an oversized unterminated tail without losing its byte count", async () => {
+  const chunks = ["ok\n", "0123456789", "0123"].map((chunk) => Buffer.from(chunk));
+  const records = [];
+
+  for await (const record of physicalJsonlRecords(chunks, { maxRecordBytes: 8 })) {
+    records.push(record);
+  }
+
+  assert.deepEqual(records, [
+    { line: "ok", utf8Valid: true, oversized: false, physicalBytes: 3, terminated: true },
+    { line: null, utf8Valid: null, oversized: true, physicalBytes: 14, terminated: false },
+  ]);
+});
+
+test("physicalJsonlRecords decodes split records exactly at the content byte limit", async () => {
+  const chunks = ["123", "456", "78\n", "abc", "def", "gh"].map((chunk) => Buffer.from(chunk));
+  const records = [];
+
+  for await (const record of physicalJsonlRecords(chunks, { maxRecordBytes: 8 })) {
+    records.push(record);
+  }
+
+  assert.deepEqual(records, [
+    { line: "12345678", utf8Valid: true, oversized: false, physicalBytes: 9, terminated: true },
+    { line: "abcdefgh", utf8Valid: true, oversized: false, physicalBytes: 8, terminated: false },
+  ]);
+});
+
+test("physicalJsonlRecords includes CR but excludes LF from the content byte limit", async () => {
+  const chunks = ["1234567\r", "\n12345678\r", "\n"].map((chunk) => Buffer.from(chunk));
+  const records = [];
+
+  for await (const record of physicalJsonlRecords(chunks, { maxRecordBytes: 8 })) {
+    records.push(record);
+  }
+
+  assert.deepEqual(records, [
+    { line: "1234567", utf8Valid: true, oversized: false, physicalBytes: 9, terminated: true },
+    { line: null, utf8Valid: null, oversized: true, physicalBytes: 10, terminated: true },
+  ]);
+});
+
+test("physicalJsonlRecords preserves empty records with a zero content byte limit", async () => {
+  const chunks = ["\n", "x\n", "\n"].map((chunk) => Buffer.from(chunk));
+  const records = [];
+
+  for await (const record of physicalJsonlRecords(chunks, { maxRecordBytes: 0 })) {
+    records.push(record);
+  }
+
+  assert.deepEqual(records, [
+    { line: "", utf8Valid: true, oversized: false, physicalBytes: 1, terminated: true },
+    { line: null, utf8Valid: null, oversized: true, physicalBytes: 2, terminated: true },
+    { line: "", utf8Valid: true, oversized: false, physicalBytes: 1, terminated: true },
+  ]);
+});
+
+test("physicalJsonlRecords skips an oversized invalid UTF-8 record before decoding", async () => {
+  const input = Buffer.from([0x61, 0x62, 0x63, 0x64, 0x65, 0x66, 0x67, 0x68, 0xff, 0x0a]);
+  const records = [];
+
+  for await (const record of physicalJsonlRecords([input], { maxRecordBytes: 8 })) {
+    records.push(record);
+  }
+
+  assert.deepEqual(records, [
+    { line: null, utf8Valid: null, oversized: true, physicalBytes: 10, terminated: true },
+  ]);
+});
+
+test("physicalJsonlRecords checks the physical byte limit before yielding an oversized LF record", async () => {
+  const input = Buffer.from([0x61, 0x62, 0x63, 0x64, 0x65, 0x66, 0x67, 0x68, 0xff, 0x0a]);
+  const iterator = physicalJsonlRecords([input], {
+    maxRecordBytes: 8,
+    maxPhysicalBytes: 9,
+  });
+
+  await assert.rejects(
+    iterator.next(),
+    (error) => error?.code === "PHYSICAL_JSONL_LIMIT_EXCEEDED",
+  );
+});
+
+test("physicalJsonlRecords enforces the physical byte limit while discarding an oversized tail", async () => {
+  let pulled = 0;
+  let returned = false;
+  const chunks = ["123456789", "01", "unused"].map((chunk) => Buffer.from(chunk));
+  const input = {
+    [Symbol.asyncIterator]() {
+      return {
+        async next() {
+          const value = chunks[pulled];
+          pulled += 1;
+          return value === undefined ? { done: true } : { value, done: false };
+        },
+        async return() {
+          returned = true;
+          return { done: true };
+        },
+      };
+    },
+  };
+
+  const iterator = physicalJsonlRecords(input, {
+    maxRecordBytes: 8,
+    maxPhysicalBytes: 10,
+  });
+
+  await assert.rejects(
+    iterator.next(),
+    (error) => error?.code === "PHYSICAL_JSONL_LIMIT_EXCEEDED",
+  );
+  assert.equal(pulled, 2);
+  assert.equal(returned, true);
+});
+
+test("physicalJsonlRecords counts skipped records toward the cumulative physical byte limit", async () => {
+  const iterator = physicalJsonlRecords([Buffer.from("123456789\nok\n")], {
+    maxRecordBytes: 8,
+    maxPhysicalBytes: 12,
+  });
+
+  assert.deepEqual(await iterator.next(), {
+    done: false,
+    value: { line: null, utf8Valid: null, oversized: true, physicalBytes: 10, terminated: true },
+  });
+  await assert.rejects(
+    iterator.next(),
+    (error) => error?.code === "PHYSICAL_JSONL_LIMIT_EXCEEDED",
+  );
 });
 
 test("physicalJsonlRecords closes its input when the consumer stops early", async () => {
@@ -148,6 +295,7 @@ test("physicalJsonlRecords counts multibyte UTF-8 exactly", async () => {
   assert.deepEqual(records, [{
     line: '{"text":"中\u2028文"}',
     utf8Valid: true,
+    oversized: false,
     physicalBytes: content.length,
     terminated: true,
   }]);
@@ -173,9 +321,9 @@ test("physicalJsonlRecords preserves invalid UTF-8 record spans in record mode",
   }
 
   assert.deepEqual(records, [
-    { line: "first", utf8Valid: true, physicalBytes: 6, terminated: true },
-    { line: null, utf8Valid: false, physicalBytes: invalid.length + 1, terminated: true },
-    { line: "last", utf8Valid: true, physicalBytes: 5, terminated: true },
+    { line: "first", utf8Valid: true, oversized: false, physicalBytes: 6, terminated: true },
+    { line: null, utf8Valid: false, oversized: false, physicalBytes: invalid.length + 1, terminated: true },
+    { line: "last", utf8Valid: true, oversized: false, physicalBytes: 5, terminated: true },
   ]);
   assert.equal(records.reduce((sum, record) => sum + record.physicalBytes, 0), input.length);
 });
@@ -194,7 +342,7 @@ test("physicalJsonlRecords propagates errors thrown into a final record yield", 
   const iterator = physicalJsonlRecords([Buffer.from("last")], { invalidUtf8: "record" });
   assert.deepEqual(await iterator.next(), {
     done: false,
-    value: { line: "last", utf8Valid: true, physicalBytes: 4, terminated: false },
+    value: { line: "last", utf8Valid: true, oversized: false, physicalBytes: 4, terminated: false },
   });
   await assert.rejects(iterator.throw(new Error("consumer failed")), /consumer failed/);
 });

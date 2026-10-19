@@ -7,6 +7,7 @@ const { test } = require("node:test");
 const { cmdSync } = require("../src/commands/sync");
 const { cmdInit } = require("../src/commands/init");
 const { cmdDeviceLogin } = require("../src/commands/device-login");
+const { functionUrlFor } = require("../src/lib/function-url");
 const {
   resolveRuntimeConfig,
   isLegacyInsforgeBaseUrl,
@@ -23,10 +24,13 @@ async function withTempHome(fn) {
     HOME: process.env.HOME,
     USERPROFILE: process.env.USERPROFILE,
     CODEX_HOME: process.env.CODEX_HOME,
+    CLAUDE_CONFIG_DIR: process.env.CLAUDE_CONFIG_DIR,
     CODE_HOME: process.env.CODE_HOME,
     XDG_DATA_HOME: process.env.XDG_DATA_HOME,
     DSH_HOME: process.env.DSH_HOME,
     TOKENTRACKER_DSH_HOME: process.env.TOKENTRACKER_DSH_HOME,
+    TOKENTRACKER_TRAE_HOME: process.env.TOKENTRACKER_TRAE_HOME,
+    TOKENTRACKER_TRAE_DB: process.env.TOKENTRACKER_TRAE_DB,
     TOKENTRACKER_DEVICE_TOKEN: process.env.TOKENTRACKER_DEVICE_TOKEN,
     TOKENTRACKER_INSFORGE_BASE_URL: process.env.TOKENTRACKER_INSFORGE_BASE_URL,
     TOKENTRACKER_INSFORGE_ANON_KEY: process.env.TOKENTRACKER_INSFORGE_ANON_KEY,
@@ -36,13 +40,19 @@ async function withTempHome(fn) {
     process.env.HOME = home;
     process.env.USERPROFILE = home;
     process.env.CODEX_HOME = path.join(home, ".codex");
+    delete process.env.CLAUDE_CONFIG_DIR;
     process.env.CODE_HOME = path.join(home, ".code");
     process.env.XDG_DATA_HOME = path.join(home, ".local", "share");
+    process.env.TOKENTRACKER_TRAE_HOME = path.join(home, ".trae");
+    delete process.env.TOKENTRACKER_TRAE_DB;
     delete process.env.TOKENTRACKER_DEVICE_TOKEN;
     delete process.env.TOKENTRACKER_INSFORGE_BASE_URL;
     delete process.env.TOKENTRACKER_INSFORGE_ANON_KEY;
     delete process.env.DSH_HOME;
     delete process.env.TOKENTRACKER_DSH_HOME;
+    const trackerDir = path.join(home, ".tokentracker", "tracker");
+    await fs.mkdir(trackerDir, { recursive: true });
+    await fs.writeFile(path.join(trackerDir, "cloud-sync-pref.json"), JSON.stringify({ enabled: true }));
     return await fn(home);
   } finally {
     global.fetch = savedFetch;
@@ -86,7 +96,7 @@ async function readJsonFile(filePath) {
 
 function successfulFetch(onIngest) {
   return async (url, options = {}) => {
-    if (String(url).endsWith("/functions/tokentracker-ingest")) {
+    if (String(url).endsWith("/tokentracker-ingest")) {
       onIngest?.(String(url), options);
       return {
         ok: true,
@@ -221,7 +231,7 @@ test("sync preserves the legacy device token and replays the queue to the curren
     assert.equal(queueState.note, "reset_after_legacy_baseurl_migration_2026_07");
 
     assert.equal(ingestCalls.length, 1);
-    assert.equal(ingestCalls[0].url, `${DEFAULT_BASE_URL}/functions/tokentracker-ingest`);
+    assert.equal(ingestCalls[0].url, functionUrlFor(DEFAULT_BASE_URL, "tokentracker-ingest"));
     assert.equal(ingestCalls[0].options.headers.apikey, DEFAULT_ANON_KEY);
     assert.equal(ingestCalls[0].options.headers.Authorization, "Bearer legacy-token");
     assert.deepEqual(JSON.parse(ingestCalls[0].options.body).hourly, [JSON.parse(queue)]);
@@ -248,7 +258,16 @@ test("sync preserves the legacy device token and replays the queue to the curren
       }),
       "utf8",
     );
-    await cmdSync(["--auto"]);
+    await cmdSync(["--auto", "--publish-account"]);
+    const held = await readJsonFile(path.join(trackerDir, "queue.state.json"));
+    assert.equal(held.offset, Buffer.byteLength(queue), "a native automatic tick honors the new fifteen-minute interval");
+    assert.equal(ingestCalls.length, 1);
+    const throttlePath = path.join(trackerDir, "upload.throttle.json");
+    const deadline = await readJsonFile(throttlePath);
+    deadline.lastSuccessMs = Date.now() - 17 * 60_000;
+    deadline.nextAllowedAtMs = deadline.lastSuccessMs + 15 * 60_000;
+    await fs.writeFile(throttlePath, JSON.stringify(deadline), "utf8");
+    await cmdSync(["--auto", "--publish-account"]);
     const after = await readJsonFile(path.join(trackerDir, "queue.state.json"));
     assert.equal(after.offset, Buffer.byteLength(queue) + Buffer.byteLength(pendingLine));
     assert.equal(after.note, "manual");
@@ -278,7 +297,7 @@ test("sync preserves an anon key replaced while legacy migration is uploading", 
     });
 
     global.fetch = async (url) => {
-      if (String(url).endsWith("/functions/tokentracker-ingest")) {
+      if (String(url).endsWith("/tokentracker-ingest")) {
         await fs.writeFile(
           configPath,
           JSON.stringify({
@@ -334,7 +353,7 @@ test("sync removes an unchanged legacy anon key after a concurrent login updates
 
     const ingestCalls = [];
     global.fetch = async (url, options = {}) => {
-      if (String(url).endsWith("/functions/tokentracker-ingest")) {
+      if (String(url).endsWith("/tokentracker-ingest")) {
         ingestCalls.push(options);
         if (ingestCalls.length === 1) {
           await fs.writeFile(
@@ -379,8 +398,15 @@ test("sync removes an unchanged legacy anon key after a concurrent login updates
     };
     const pendingLine = `${JSON.stringify(pendingRow)}\n`;
     await fs.appendFile(path.join(trackerDir, "queue.jsonl"), pendingLine, "utf8");
-    await cmdSync(["--auto"]);
+    await cmdSync(["--auto", "--publish-account"]);
 
+    assert.equal(ingestCalls.length, 1, "new pending rows stay queued through the automatic cooldown");
+    const throttlePath = path.join(trackerDir, "upload.throttle.json");
+    const deadline = await readJsonFile(throttlePath);
+    deadline.lastSuccessMs = Date.now() - 17 * 60_000;
+    deadline.nextAllowedAtMs = deadline.lastSuccessMs + 15 * 60_000;
+    await fs.writeFile(throttlePath, JSON.stringify(deadline), "utf8");
+    await cmdSync(["--auto", "--publish-account"]);
     assert.equal(ingestCalls.length, 2);
     assert.equal(ingestCalls[1].headers.apikey, DEFAULT_ANON_KEY);
     assert.equal(ingestCalls[1].headers.Authorization, "Bearer current-login-token");
@@ -439,7 +465,7 @@ test("sync falls back to the preserved device token before committing a rejected
 
     const attemptedTokens = [];
     global.fetch = async (url, options = {}) => {
-      if (String(url).endsWith("/functions/tokentracker-ingest")) {
+      if (String(url).endsWith("/tokentracker-ingest")) {
         const token = String(options.headers?.Authorization || "").replace(/^Bearer\s+/, "");
         attemptedTokens.push(token);
         const ok = token === "known-valid-legacy-token";
@@ -495,7 +521,7 @@ test("sync keeps the legacy marker when neither token is accepted", async () => 
 
     const attemptedTokens = [];
     global.fetch = async (url, options = {}) => {
-      if (String(url).endsWith("/functions/tokentracker-ingest")) {
+      if (String(url).endsWith("/tokentracker-ingest")) {
         attemptedTokens.push(
           String(options.headers?.Authorization || "").replace(/^Bearer\s+/, ""),
         );
@@ -587,7 +613,7 @@ test("a partial non-auth upload failure resumes after the committed offset", asy
 
     let firstRunIngestCalls = 0;
     global.fetch = async (url) => {
-      if (String(url).endsWith("/functions/tokentracker-ingest")) {
+      if (String(url).endsWith("/tokentracker-ingest")) {
         firstRunIngestCalls += 1;
         if (firstRunIngestCalls === 1) {
           return {
@@ -648,7 +674,9 @@ test("a partial non-auth upload failure resumes after the committed offset", asy
 test("sync does not persist an unverified replacement when the replay queue is empty", async () => {
   await withTempHome(async (home) => {
     const trackerDir = await writeTrackerState(home, {});
-    await cmdSync(["--auto"]);
+    // Restrict parsing to the isolated Codex root; other Windows providers may
+    // discover real history under AppData even when the fixture home is empty.
+    await cmdSync(["--auto", "--from-notify", "--source", "codex"]);
 
     await writeTrackerState(home, {
       config: {
@@ -664,7 +692,7 @@ test("sync does not persist an unverified replacement when the replay queue is e
     global.fetch = successfulFetch(() => {
       ingestCalls += 1;
     });
-    await cmdSync(["--auto"]);
+    await cmdSync(["--auto", "--from-notify", "--source", "codex"]);
 
     const config = await readJsonFile(path.join(trackerDir, "config.json"));
     assert.equal(config.baseUrl, LEGACY_BASE_URL);
@@ -693,7 +721,7 @@ test("sync migration does not overwrite a concurrent successful device login", a
     });
 
     global.fetch = async (url) => {
-      if (String(url).endsWith("/functions/tokentracker-ingest")) {
+      if (String(url).endsWith("/tokentracker-ingest")) {
         await fs.writeFile(
           configPath,
           JSON.stringify({
@@ -759,7 +787,7 @@ test("device-login ignores a retired persisted backend before the first sync", a
 
     assert.equal(
       calls[0],
-      `${DEFAULT_BASE_URL}/functions/tokentracker-device-flow-authorize`,
+      functionUrlFor(DEFAULT_BASE_URL, "tokentracker-device-flow-authorize"),
     );
   });
 });
@@ -871,6 +899,6 @@ test("init leaves the migration marker for sync, which preserves credentials and
     assert.equal(afterSync.deviceId, "legacy-device");
     assert.equal(afterSync.machineId, "machine-1");
     assert.equal(ingestCalls.length, 1);
-    assert.equal(ingestCalls[0].url, `${DEFAULT_BASE_URL}/functions/tokentracker-ingest`);
+    assert.equal(ingestCalls[0].url, functionUrlFor(DEFAULT_BASE_URL, "tokentracker-ingest"));
   });
 });

@@ -2,26 +2,28 @@ import React from "react";
 import { Pencil } from "lucide-react";
 import { useLoginModal } from "../../contexts/LoginModalContext.jsx";
 import { copy } from "../../lib/copy";
-import { SectionCard, ToggleSwitch } from "./Controls.jsx";
+import { SectionCard, SETTINGS_INPUT_CLASS, ToggleSwitch } from "./Controls.jsx";
+import { Button } from "../../ui/components/Button.jsx";
 
 function InlineEditorActions({ disabled, onCancel, onSave, saveLabel = copy("settings.account.save") }) {
   return (
     <>
-      <button
-        type="button"
+      <Button
+        variant="primary"
+        size="sm"
         onClick={onSave}
         disabled={disabled}
-        className="rounded-md bg-oai-brand-500 px-3 py-1.5 text-xs font-medium text-white transition-colors hover:bg-oai-brand-600 disabled:opacity-50"
       >
         {saveLabel}
-      </button>
-      <button
-        type="button"
+      </Button>
+      <Button
+        variant="ghost"
+        size="sm"
         onClick={onCancel}
-        className="rounded-md px-2 py-1.5 text-xs text-oai-gray-500 transition-colors hover:text-oai-gray-700 dark:hover:text-oai-gray-300"
+        className="text-oai-gray-500 hover:text-oai-gray-700 dark:hover:text-oai-gray-300"
       >
         {copy("settings.account.cancel")}
-      </button>
+      </Button>
     </>
   );
 }
@@ -39,7 +41,7 @@ function EditNameControls({ nameInput, setEditingName, setNameInput, profileSavi
         }}
         maxLength={50}
         autoFocus
-        className="flex-1 rounded-md border border-oai-gray-300 bg-transparent px-2.5 py-1.5 text-sm text-oai-black outline-none focus:border-oai-brand-500 focus:ring-1 focus:ring-inset focus:ring-oai-brand-500 dark:border-oai-gray-700 dark:text-white"
+        className={`flex-1 ${SETTINGS_INPUT_CLASS}`}
         placeholder={copy("settings.account.displayName")}
       />
       <InlineEditorActions
@@ -80,7 +82,7 @@ function EditGithubControls({
           }}
           maxLength={100}
           autoFocus
-          className="flex-1 rounded-md border border-oai-gray-300 bg-transparent px-2.5 py-1.5 text-sm text-oai-black outline-none focus:border-oai-brand-500 focus:ring-1 focus:ring-inset focus:ring-oai-brand-500 dark:border-oai-gray-700 dark:text-white"
+          className={`flex-1 ${SETTINGS_INPUT_CLASS}`}
           placeholder={copy("settings.account.githubUrlPlaceholder")}
         />
         <InlineEditorActions
@@ -102,16 +104,17 @@ function EditGithubControls({
 
 function EditButton({ disabled = false, label, onClick, title }) {
   return (
-    <button
-      type="button"
+    <Button
+      variant="secondary"
+      size="sm"
       onClick={onClick}
       disabled={disabled}
       title={title}
-      className="inline-flex h-8 shrink-0 items-center gap-1.5 rounded-md border border-oai-gray-200 px-3 text-xs font-medium text-oai-gray-700 transition-colors hover:bg-oai-gray-100 disabled:cursor-not-allowed disabled:opacity-40 dark:border-oai-gray-800 dark:text-oai-gray-300 dark:hover:bg-oai-gray-800"
+      className="gap-1.5"
     >
       <Pencil className="h-3.5 w-3.5" aria-hidden />
-      {label}
-    </button>
+      <span>{label}</span>
+    </Button>
   );
 }
 
@@ -249,17 +252,17 @@ export function SignedOutAccountSection() {
   const { openLoginModal } = useLoginModal();
   return (
     <SectionCard title={copy("settings.section.account")}>
-      <div className="flex items-center justify-between gap-4 py-3">
+      <div className="flex flex-col gap-3 py-3 sm:flex-row sm:items-center sm:justify-between sm:gap-4">
         <p className="text-sm text-oai-gray-500 dark:text-oai-gray-400">
           {copy("settings.account.signedOutHint")}
         </p>
-        <button
-          type="button"
+        <Button
+          variant="primary"
+          size="sm"
           onClick={openLoginModal}
-          className="inline-flex h-8 shrink-0 items-center justify-center rounded-md bg-oai-gray-900 px-4 text-xs font-medium text-white transition-colors hover:bg-oai-gray-800 dark:bg-white dark:text-oai-gray-900 dark:hover:bg-oai-gray-100"
         >
           {copy("settings.account.signIn")}
-        </button>
+        </Button>
       </div>
     </SectionCard>
   );

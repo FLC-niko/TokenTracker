@@ -1,6 +1,6 @@
 import React, { useState, useEffect, useMemo, useRef } from "react";
 import { motion, useReducedMotion } from "motion/react";
-import { Info, Loader2, RefreshCw, SquareArrowOutUpRight } from "lucide-react";
+import { ChevronDown, Info, Loader2, RefreshCw, SquareArrowOutUpRight } from "lucide-react";
 
 // Solid (fill-based) monochrome all-tools mark — matches the fill-based
 // mono provider icons, unlike lucide's stroke-only Layers3. Drawn bold and
@@ -33,7 +33,7 @@ import { formatProviderDisplayName } from "../../../lib/provider-display";
 import { DateRangePopover, formatDateShort, getDateFnsLocale } from "./DateRangePopover.jsx";
 import { ProviderIcon } from "./ProviderIcon.jsx";
 import { formatUsdCurrency } from "../../../lib/format";
-import { buildAllModels } from "../../../lib/model-breakdown";
+import { buildAllModels, hasModelTokenSplits } from "../../../lib/model-breakdown";
 import { ContextBreakdownPanel } from "./ContextBreakdownPanel.jsx";
 
 const ALL_PROVIDERS_KEY = "__all__";
@@ -73,6 +73,7 @@ function parseAnimatedCounterValue(displayValue) {
 
 // Provider color mapping for visual distinction
 const PROVIDER_COLORS = {
+  ACODE: "var(--brand-primary-light)",
   CODEX: "#3b82f6",     // blue-500
   DSH: "var(--community-deepseek)", // DeepSeek Harness brand blue
   CLAUDE: "#d97757",    // Anthropic Japonica orange-red
@@ -237,14 +238,15 @@ export function UsageOverview({
   // Weeks run Monday–Sunday, so a week selected near a month boundary can
   // hold more usage than the month-to-date it overlaps. Spell out the covered
   // dates and flag the straddle so the week/month totals read as different
-  // windows, not as a miscount.
+  // windows, not as a miscount. Day is a single calendar date, so a
+  // "Oct 13 — Oct 13" range under the summary is redundant — hide it.
   const showCrossMonthHint =
     period === "week" &&
     typeof from === "string" &&
     typeof to === "string" &&
     from.slice(0, 7) !== to.slice(0, 7);
   const periodRangeLabel =
-    from && to
+    period !== "day" && from && to
       ? `${formatDateShort(from, dateLocale)} — ${formatDateShort(to, dateLocale)}`
       : null;
   // The digit-by-digit Counter renders at a fixed 72px and would clip on
@@ -331,6 +333,25 @@ export function UsageOverview({
 
   // FleetData is already grouped by provider.
   const providers = fleetData.filter((f) => f.models?.length > 0);
+  // Devin contributes real token counts but its models (swe-2, swe-2-high,
+  // compactor) ship without pricing data, so the dollar figure silently
+  // under-reports whenever Devin is in view — surface the notice on both the
+  // provider drill-down and the combined "All" ranking.
+  const devinContributes = providers.some(
+    (provider) =>
+      String(provider?.source || provider?.label || "").trim().toLowerCase() === "devin",
+  );
+  const kiroContributes = providers.some(
+    (provider) =>
+      String(provider?.source || provider?.label || "").trim().toLowerCase() === "kiro",
+  );
+  // TRAE cost leaves out input without a cache split (docs/trae.md). Keep the
+  // caveat visible with the combined totals, including cloud data, which has
+  // no per-bucket marker.
+  const traeContributes = providers.some(
+    (provider) =>
+      String(provider?.source || provider?.label || "").trim().toLowerCase() === "trae",
+  );
   const allModels = useMemo(() => buildAllModels(fleetData), [fleetData]);
   const allUsage = allModels.reduce((sum, model) => sum + (Number(model.usage) || 0), 0);
   const allCost = providers.reduce((sum, provider) => sum + (Number(provider.usd) || 0), 0);
@@ -490,6 +511,12 @@ export function UsageOverview({
               )}
             </div>
           )}
+          {traeContributes && (
+            <p className="mx-auto mt-3 max-w-xl text-[11px] leading-snug text-oai-gray-500 dark:text-oai-gray-400">
+              <span className="font-medium">{copy("usage.overview.trae_notice_title")}.</span>{" "}
+              {copy("usage.overview.trae_notice_body")}
+            </p>
+          )}
           {periodRangeLabel ? (
             <div className="mt-3 flex flex-col items-center gap-1 text-[11px] leading-snug text-oai-gray-400 dark:text-oai-gray-500">
               <span className="tabular-nums">{periodRangeLabel}</span>
@@ -625,6 +652,8 @@ export function UsageOverview({
                 aria-label={copy("usage.overview.all_models")}
                 className="mt-2"
               >
+                {devinContributes && <DevinPricingNotice />}
+                {kiroContributes && <KiroEstimateNotice />}
                 <AllModelsSection models={allModels} />
               </div>
             )}
@@ -672,12 +701,103 @@ export function UsageOverview({
   );
 }
 
-// Renders a single expanded provider section. Hosts loading state for the
-// inline Context Breakdown so the spinner can sit next to the heading instead
-// of taking its own row.
+// Token-type labels for the expandable per-model detail. Reuses the
+// project-composition copy family so no new i18n keys are needed.
+const MODEL_SPLIT_DEFS = [
+  { key: "input", labelKey: "dashboard.projects.detail.comp_input" },
+  { key: "unclassified", labelKey: "usage.metric.unclassified_input" },
+  { key: "cached", labelKey: "dashboard.projects.detail.comp_cached" },
+  { key: "cacheCreate", labelKey: "dashboard.projects.detail.comp_cache_write" },
+  { key: "output", labelKey: "dashboard.projects.detail.comp_output" },
+  { key: "reasoning", labelKey: "dashboard.projects.detail.comp_reasoning" },
+];
+
+// Narrow containers drop the fixed value-column minimums so the row wraps
+// instead of overflowing; sm+ restores the aligned columns. The share column
+// only needs room for the percent plus a chevron affordance.
+const MODEL_ROW_GRID =
+  "grid grid-cols-[minmax(0,1fr)_auto_auto_auto] items-baseline gap-x-3 mb-1.5 sm:grid-cols-[minmax(0,1fr)_minmax(8rem,max-content)_minmax(5.5rem,max-content)_minmax(4.5rem,max-content)]";
+
+/**
+ * Renders the five token-type split values (input / cached / cache write /
+ * output / reasoning) under an expanded model row.
+ */
+function ModelTokenSplits({ tokens }) {
+  const { formatTokens, formatTokensTooltip } = useTokenFormat();
+  return (
+    <div className="mb-1.5 flex flex-wrap gap-x-4 gap-y-1">
+      {MODEL_SPLIT_DEFS.map((def) => {
+        const value = Math.max(0, Number(tokens?.[def.key]) || 0);
+        if (def.key === "unclassified" && value === 0) return null;
+        return (
+          <span key={def.key} className="inline-flex items-baseline gap-1 text-[11px] tabular-nums">
+            <span className="text-oai-gray-400 dark:text-oai-gray-500">{copy(def.labelKey)}</span>
+            <span
+              title={formatTokensTooltip(value)}
+              className="text-oai-gray-600 dark:text-oai-gray-300"
+            >
+              {formatTokens(value)}
+            </span>
+          </span>
+        );
+      })}
+    </div>
+  );
+}
+
+/**
+ * Grid cells of one model row: name, token total, cost and share. The share
+ * cell carries a rotating chevron when the row has token splits.
+ */
+function ModelRowHeader({ model, tokensLabel, costLabel, expandable, isExpanded }) {
+  const { formatTokensTooltip } = useTokenFormat();
+  return (
+    <>
+      <span
+        className="col-start-1 row-start-1 min-w-0 text-sm text-oai-gray-700 dark:text-oai-gray-300 truncate"
+        title={model.name}
+      >
+        {model.name}
+      </span>
+      <span
+        title={formatTokensTooltip(model.usage)}
+        className="col-start-2 row-start-1 text-right whitespace-nowrap text-sm text-oai-gray-500 dark:text-oai-gray-400 tabular-nums"
+      >
+        {tokensLabel}
+      </span>
+      <span className="col-start-3 row-start-1 text-right whitespace-nowrap text-sm text-oai-gray-500 dark:text-oai-gray-400 tabular-nums">
+        {costLabel}
+      </span>
+      <span className="col-start-4 row-start-1 flex w-full items-center justify-end gap-1 whitespace-nowrap text-sm text-oai-black dark:text-oai-white tabular-nums">
+        {model.share}%
+        {expandable && (
+          <>
+            <span className="sr-only">
+              {copy(isExpanded ? "usage.overview.collapse" : "usage.overview.expand")}
+            </span>
+            <ChevronDown
+              size={14}
+              aria-hidden
+              className={`shrink-0 text-oai-gray-400 transition-transform duration-200 ease-out motion-reduce:transition-none dark:text-oai-gray-500 ${
+                isExpanded ? "rotate-180" : ""
+              }`}
+            />
+          </>
+        )}
+      </span>
+    </>
+  );
+}
+
+/**
+ * Renders the per-model usage rows for one provider (or the all-models list).
+ * Rows whose backend entry carries token-type splits become expandable; the
+ * expanded state shows the five split values under the row.
+ */
 function ModelUsageRows({ models, color }) {
   const { currency, rate } = useCurrency();
-  const { formatTokens, formatTokensTooltip } = useTokenFormat();
+  const { formatTokens } = useTokenFormat();
+  const [expandedModel, setExpandedModel] = useState(null);
 
   return (
     <div className="space-y-3">
@@ -685,28 +805,32 @@ function ModelUsageRows({ models, color }) {
         const tokensLabel = formatPositiveTokens(formatTokens, model.usage);
         const costLabel = model.costPartial ? copy("usage.cost.partial") : formatCost(model.cost, currency, rate);
         const clampedShare = Math.max(0, Math.min(100, Number(model.share) || 0));
+        const rowKey = model.id || model.name;
+        // A row expands only when the backend supplied token-type splits;
+        // rows without them keep the exact legacy non-interactive markup.
+        // Split math lives in the .ts helper so this file stays free of
+        // inline comparisons that the ui-hardcode scanner would flag.
+        const expandable = hasModelTokenSplits(model);
+        const isExpanded = expandable && expandedModel === rowKey;
+        const gridClassName = MODEL_ROW_GRID;
+        const headerProps = { model, tokensLabel, costLabel, expandable, isExpanded };
         return (
-          <div key={model.id || model.name} data-model-rank-row>
-            <div className="grid grid-cols-[minmax(0,1fr)_minmax(8rem,max-content)_minmax(5.5rem,max-content)_4rem] items-baseline gap-x-3 mb-1.5">
-              <span
-                className="col-start-1 row-start-1 min-w-0 text-sm text-oai-gray-700 dark:text-oai-gray-300 truncate"
-                title={model.name}
+          <div key={rowKey} data-model-rank-row>
+            {expandable ? (
+              <button
+                type="button"
+                onClick={() => setExpandedModel(isExpanded ? null : rowKey)}
+                aria-expanded={isExpanded}
+                className={`${gridClassName} w-full cursor-pointer text-left`}
               >
-                {model.name}
-              </span>
-              <span
-                title={formatTokensTooltip(model.usage)}
-                className="col-start-2 row-start-1 text-right whitespace-nowrap text-sm text-oai-gray-500 dark:text-oai-gray-400 tabular-nums"
-              >
-                {tokensLabel}
-              </span>
-              <span className="col-start-3 row-start-1 text-right whitespace-nowrap text-sm text-oai-gray-500 dark:text-oai-gray-400 tabular-nums">
-                {costLabel}
-              </span>
-              <span className="col-start-4 row-start-1 text-right whitespace-nowrap text-sm text-oai-black dark:text-oai-white tabular-nums">
-                {model.share}%
-              </span>
-            </div>
+                <ModelRowHeader {...headerProps} />
+              </button>
+            ) : (
+              <div className={gridClassName}>
+                <ModelRowHeader {...headerProps} />
+              </div>
+            )}
+            {isExpanded && <ModelTokenSplits tokens={model.tokens} />}
             <div
               className="h-[3px] bg-oai-gray-100 dark:bg-oai-gray-800 rounded-full overflow-hidden"
               role="progressbar"
@@ -747,11 +871,40 @@ function AllModelsSection({ models }) {
   );
 }
 
+function DevinPricingNotice() {
+  return (
+    <p className="mb-3 text-[10px] leading-snug text-oai-gray-400 dark:text-oai-gray-500">
+      <span className="font-medium text-oai-gray-500 dark:text-oai-gray-400">
+        {copy("usage.overview.devin_notice_title")}.
+      </span>{" "}
+      {copy("usage.overview.devin_notice_body")}
+    </p>
+  );
+}
+
+function KiroEstimateNotice() {
+  return (
+    <p className="mb-3 text-[10px] leading-snug text-oai-gray-400 dark:text-oai-gray-500">
+      <span className="font-medium text-oai-gray-500 dark:text-oai-gray-400">
+        {copy("usage.overview.kiro_notice_title")}.
+      </span>{" "}
+      {copy("usage.overview.kiro_notice_body")}
+    </p>
+  );
+}
+
+// Renders a single expanded provider section. Hosts loading state for the
+// inline Context Breakdown so the spinner can sit next to the heading instead
+// of taking its own row.
 function ProviderExpandedSection({ provider, color, providerHeading, contextSource, from, to, sortedModels }) {
   const { formatTokens } = useTokenFormat();
   const [breakdownLoading, setBreakdownLoading] = useState(false);
   const isAntigravity =
     String(provider?.source || provider?.label || "").trim().toLowerCase() === "antigravity";
+  const isDevin =
+    String(provider?.source || provider?.label || "").trim().toLowerCase() === "devin";
+  const isKiro =
+    String(provider?.source || provider?.label || "").trim().toLowerCase() === "kiro";
 
   return (
                       <div>
@@ -788,10 +941,9 @@ function ProviderExpandedSection({ provider, color, providerHeading, contextSour
                           </p>
                         )}
 
-                        {/* Antigravity transcripts carry no usage field — every token
-                            here is a 4-char/token estimate that ignores Gemini prompt
-                            caching. Inline footnote, same muted style as the Context
-                            Breakdown footnote. */}
+                        {/* Antigravity parses exact tokens and prompt-cache hits from
+                            SQLite generation metadata when available, falling back to
+                            a ~4-char/token estimate for raw transcripts. */}
                         {isAntigravity && (
                           <p className="mb-3 text-[10px] leading-snug text-oai-gray-400 dark:text-oai-gray-500">
                             <span className="font-medium text-oai-gray-500 dark:text-oai-gray-400">
@@ -800,6 +952,13 @@ function ProviderExpandedSection({ provider, color, providerHeading, contextSour
                             {copy("usage.overview.antigravity_notice_body")}
                           </p>
                         )}
+
+                        {/* Devin token counts are real (read from the CLI's local
+                            history), but swe-2/swe-2-high/compactor carry no
+                            verified pricing, so the dollar figure excludes them —
+                            a $0 estimate is not evidence of free usage. */}
+                        {isDevin && <DevinPricingNotice />}
+                        {isKiro && <KiroEstimateNotice />}
 
                         {/* Context Breakdown drill-down.
                             Claude: category-based (approx /context).

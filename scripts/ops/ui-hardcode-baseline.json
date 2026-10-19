@@ -1,5 +1,5 @@
 {
-  "generatedAt": "2026-08-28T18:10:04.552Z",
+  "generatedAt": "2026-10-15T06:35:11.647Z",
   "root": "dashboard/src",
   "rules": {
     "colors": "hex/rgb(a) literals",
@@ -7,7 +7,7 @@
   },
   "totals": {
     "colors": 404,
-    "rawText": 161
+    "rawText": 163
   },
   "files": {
     "dashboard/src/components/InsforgeUserHeaderControls.jsx": {
@@ -434,12 +434,13 @@
     },
     "dashboard/src/ui/dashboard/components/UsageLimitsPanel.test.jsx": {
       "colors": 0,
-      "rawText": 4,
+      "rawText": 5,
       "rawTextTokens": [
         ", ); // Brand + tier, without repeating \"Coding Plan\" (title: \"Ark Coding Plan Lite\"). expect(screen.getByText(\"Ark Coding Plan Lite\")).toBeInTheDocument(); expect(screen.getByText(\"5h\")).toBeInTheDocument(); expect(screen.getByText(\"Weekly\")).toBeInTheDocument(); expect(screen.getByText(\"Monthly\")).toBeInTheDocument(); expect(screen.getByText(\"33%\")).toBeInTheDocument(); expect(screen.getByText(\"16%\")).toBeInTheDocument(); expect(screen.getByText(\"9%\")).toBeInTheDocument(); // Not-configured fallback shows the Ark CLI setup guide. rerender(",
         ", ); // Brand name only — no plan_label suffix to avoid \"OpenCode Go Go\". expect(screen.getByText(\"OpenCode Go\")).toBeInTheDocument(); expect(screen.getByText(\"5h\")).toBeInTheDocument(); expect(screen.getByText(\"Weekly\")).toBeInTheDocument(); expect(screen.getByText(\"Monthly\")).toBeInTheDocument(); expect(screen.getByText(\"12%\")).toBeInTheDocument(); expect(screen.getByText(\"30%\")).toBeInTheDocument(); expect(screen.getByText(\"60%\")).toBeInTheDocument(); // Not-configured fallback. rerender(",
         ", ); expect(screen.getByText(\"Codex\")).toBeInTheDocument(); const row = screen.getByText(\"Credits\").closest(\"div\"); expect(within(row).getByText(\"",
-        ", ); expect(screen.getByText(\"Cursor\")).toBeInTheDocument(); rerender("
+        ", ); expect(screen.getByText(\"Cursor\")).toBeInTheDocument(); rerender(",
+        "/80[\\s\\S]*200[\\s\\S]*120/.test(text))).toBe(true); rerender("
       ]
     },
     "dashboard/src/ui/dashboard/components/UsageOverview.jsx": {
@@ -503,6 +504,13 @@
         "en",
         "zh",
         "zh-tw"
+      ]
+    },
+    "dashboard/src/ui/foundation/__tests__/TokenFormatProvider.test.jsx": {
+      "colors": 0,
+      "rawText": 1,
+      "rawTextTokens": [
+        "grouping"
       ]
     },
     "dashboard/src/ui/marketing/MarketingLanding.jsx": {

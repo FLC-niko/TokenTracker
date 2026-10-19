@@ -1,12 +1,14 @@
 import { copy } from "./copy";
 
 const SPECIAL_PROVIDER_NAMES = {
+  acode: "AStudio",
   anythingllm: "AnythingLLM",
   claudescience: "Claude Science",
   pianthropic: "Pi · Anthropic",
   pigithubcopilot: "Pi · GitHub Copilot",
   picopilot: "Pi · Copilot",
   dots: "Dots",
+  muse: "Muse Code",
   pidots: "Pi · Dots",
   lmstudio: "LM Studio",
   unsloth: "Unsloth Studio",
@@ -16,6 +18,10 @@ const SPECIAL_PROVIDER_COPY_KEYS = {
   deepseek: "provider.display.deepseek_harness",
   dsh: "provider.display.deepseek_harness",
   omp: "provider.display.omp",
+  omo: "provider.display.omo",
+  minimaxcode: "provider.display.minimax_code",
+  commandcode: "provider.display.command_code",
+  trae: "provider.display.trae",
   traecn: "provider.display.trae_work_cn",
   traeworkcn: "provider.display.trae_work_cn",
 };

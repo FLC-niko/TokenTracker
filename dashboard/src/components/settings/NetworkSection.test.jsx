@@ -94,8 +94,7 @@ describe("NetworkSection", () => {
     expect(screen.getByRole("alert")).toHaveTextContent("settings.network.apply_error");
   });
 
-  it("shows saved feedback for system mode (outside the manual-only branch)", async () => {
-    const user = userEvent.setup();
+  it("does not render save button by default when mode has not changed", () => {
     hookMock.config = {
       mode: "system",
       protocol: "http",
@@ -104,18 +103,11 @@ describe("NetworkSection", () => {
       effective: "system",
       applyError: null,
     };
-    hookMock.save.mockResolvedValue({});
     render(<NetworkSection proxySettings={hookMock} />);
-
-    await act(async () => {
-      await user.click(screen.getByRole("button", { name: "settings.network.save" }));
-    });
-
-    expect(hookMock.save).toHaveBeenCalled();
-    expect(screen.getByText("settings.network.saved")).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "settings.network.save" })).toBeNull();
   });
 
-  it("shows saved feedback for off mode", async () => {
+  it("shows saved feedback for system mode (outside the manual-only branch)", async () => {
     const user = userEvent.setup();
     hookMock.config = {
       mode: "off",
@@ -129,9 +121,37 @@ describe("NetworkSection", () => {
     render(<NetworkSection proxySettings={hookMock} />);
 
     await act(async () => {
+      await user.click(screen.getByRole("button", { name: "settings.network.mode.system" }));
+    });
+    await act(async () => {
       await user.click(screen.getByRole("button", { name: "settings.network.save" }));
     });
 
+    expect(hookMock.save).toHaveBeenCalled();
+    expect(screen.getByText("settings.network.saved")).toBeInTheDocument();
+  });
+
+  it("shows saved feedback for off mode", async () => {
+    const user = userEvent.setup();
+    hookMock.config = {
+      mode: "system",
+      protocol: "http",
+      host: "",
+      port: "",
+      effective: "system",
+      applyError: null,
+    };
+    hookMock.save.mockResolvedValue({});
+    render(<NetworkSection proxySettings={hookMock} />);
+
+    await act(async () => {
+      await user.click(screen.getByRole("button", { name: "settings.network.mode.off" }));
+    });
+    await act(async () => {
+      await user.click(screen.getByRole("button", { name: "settings.network.save" }));
+    });
+
+    expect(hookMock.save).toHaveBeenCalled();
     expect(screen.getByText("settings.network.saved")).toBeInTheDocument();
   });
 

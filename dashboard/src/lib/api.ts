@@ -13,8 +13,11 @@ import {
   isMockEnabled,
 } from "./mock-data";
 import { getInsforgeRemoteUrl, getInsforgeAnonKey } from "./insforge-config";
-import { isValidJwtShape } from "./auth-token";
+import { isValidJwtShape, resolveAuthAccessToken, type AuthTokenProvider } from "./auth-token";
 import { getLocalApiAuthHeaders } from "./local-api-auth";
+import { expandHeatmapCompact } from "./heatmap-compact";
+import { functionUrlFor, fetchFunctionResponse } from "./function-url";
+import { clearCloudPromptFailure, recordCloudPromptFailure } from "./cloud-prompt-policy.js";
 
 type AnyRecord = Record<string, any>;
 
@@ -23,11 +26,38 @@ type AnyRecord = Record<string, any>;
 // overlap (no result TTL), so manual refreshes still fetch fresh data.
 const inFlightJsonGets = new Map<string, Promise<any>>();
 const accountResponseCache = new Map<string, { fetchedAt: number; value: any }>();
-const ACCOUNT_RESPONSE_TTL_MS = 30_000;
+const ACCOUNT_SUMMARY_RESPONSE_TTL_MS = 120_000;
+const ACCOUNT_RESPONSE_TTL_MS = 300_000;
 const ACCOUNT_RESPONSE_STALE_IF_ERROR_MS = 5 * 60_000;
 const sessionInsightsResponseCache = new Map<string, { fetchedAt: number; value: any }>();
 const SESSION_INSIGHTS_RESPONSE_TTL_MS = 5 * 60_000;
 const SESSION_INSIGHTS_RESPONSE_STALE_IF_ERROR_MS = 15 * 60_000;
+const verifiedAccountTokens = new Set<string>();
+let accountCacheGeneration = 0;
+function assertBackendInstance(baseUrl: string, anonKey: string) {
+  if (baseUrl === getInsforgeRemoteUrl() && anonKey === getInsforgeAnonKey()) return;
+  throw Object.assign(new Error("instance_changed"), { code: "instance_changed", status: 409 });
+}
+
+function accountIdentity(accessToken: string) {
+  try {
+    const payload = JSON.parse(atob(accessToken.split(".")[1].replace(/-/g, "+").replace(/_/g, "/")));
+    if (typeof payload.exp === "number" && payload.exp * 1000 <= Date.now()) {
+      const error: any = new Error("Account session expired");
+      error.status = 401;
+      throw error;
+    }
+    if (typeof payload.sub === "string" && payload.sub) return payload.sub;
+  } catch (error) {
+    if ((error as any)?.status === 401) {
+      invalidateAccountResponseCache();
+      throw error;
+    }
+  }
+  // A legacy opaque token can still be sent to the server, but cannot share
+  // another token's cache entry without an account identity.
+  return accessToken;
+}
 
 function coalesceJsonGet(key: string, request: () => Promise<any>) {
   const existing = inFlightJsonGets.get(key);
@@ -42,17 +72,35 @@ function coalesceJsonGet(key: string, request: () => Promise<any>) {
   return pending;
 }
 
-function cachedAccountJsonGet(key: string, request: () => Promise<any>) {
+function cachedAccountJsonGet(url: URL, accessToken: string, request: () => Promise<any>) {
+  const params = new URLSearchParams(url.searchParams);
+  params.sort();
+  const anonEpoch = getInsforgeAnonKey();
+  const instanceBase = getInsforgeRemoteUrl();
+  const key = `${url.origin}${url.pathname}?${params}\0${accountIdentity(accessToken)}\0${anonEpoch}`;
+  const generation = accountCacheGeneration;
   const now = Date.now();
   const cached = accountResponseCache.get(key);
-  if (cached && now - cached.fetchedAt < ACCOUNT_RESPONSE_TTL_MS) {
-    return Promise.resolve(cached.value);
+  const ttl = url.pathname.endsWith("tokentracker-account-summary")
+    ? ACCOUNT_SUMMARY_RESPONSE_TTL_MS : ACCOUNT_RESPONSE_TTL_MS;
+  const tokenKey = `${url.origin}\0${accessToken}\0${anonEpoch}`;
+  const authenticated = verifiedAccountTokens.has(tokenKey);
+  if (authenticated && cached && now - cached.fetchedAt < ttl) {
+    return Promise.resolve(structuredClone(cached.value)).then((value) => {
+      assertBackendInstance(instanceBase, anonEpoch);
+      return value;
+    });
   }
 
-  return coalesceJsonGet(key, async () => {
+  // An unseen JWT must reach the server before it can reuse data for its sub.
+  return coalesceJsonGet(`${key}\0${generation}\0${authenticated ? "verified" : accessToken}`, async () => {
     try {
       const value = await request();
-      accountResponseCache.set(key, { fetchedAt: Date.now(), value });
+      assertBackendInstance(instanceBase, anonEpoch);
+      if (generation !== accountCacheGeneration) return value;
+      verifiedAccountTokens.add(tokenKey);
+      if (verifiedAccountTokens.size > 128) verifiedAccountTokens.delete(verifiedAccountTokens.values().next().value!);
+      accountResponseCache.set(key, { fetchedAt: Date.now(), value: structuredClone(value) });
       // A dashboard normally uses fewer than 20 keys. Keep a hard ceiling so
       // long-running desktop WebViews cannot retain old ranges indefinitely.
       if (accountResponseCache.size > 64) {
@@ -61,14 +109,19 @@ function cachedAccountJsonGet(key: string, request: () => Promise<any>) {
       }
       return value;
     } catch (error) {
+      assertBackendInstance(instanceBase, anonEpoch);
       const status = Number((error as any)?.status) || 0;
+      if (status === 401 || status === 403) {
+        invalidateAccountResponseCache();
+        throw error;
+      }
       const stale = accountResponseCache.get(key);
       if (
-        stale &&
+        authenticated && generation === accountCacheGeneration && stale &&
         Date.now() - stale.fetchedAt < ACCOUNT_RESPONSE_STALE_IF_ERROR_MS &&
         (status === 0 || status >= 500)
       ) {
-        return stale.value;
+        return structuredClone(stale.value);
       }
       throw error;
     }
@@ -76,7 +129,9 @@ function cachedAccountJsonGet(key: string, request: () => Promise<any>) {
 }
 
 export function invalidateAccountResponseCache() {
+  accountCacheGeneration += 1;
   accountResponseCache.clear();
+  verifiedAccountTokens.clear();
 }
 
 export function invalidateSessionInsightsCache() {
@@ -117,7 +172,7 @@ const USAGE_TO_ACCOUNT_SLUG: Record<string, string> = {
   "tokentracker-usage-model-breakdown": "tokentracker-account-model-breakdown",
 };
 
-function isLocalhostHost() {
+export function isLocalhostHost() {
   return (
     typeof window !== "undefined" &&
     (window.location.hostname === "localhost" || window.location.hostname === "127.0.0.1")
@@ -135,27 +190,35 @@ async function fetchLocalJson(slug: string, params?: AnyRecord, options?: AnyRec
   // (localhost) keeps the original same-origin usage-* path.
   if (!isLocalhostHost() && accessToken && accountSlug) {
     const base = getInsforgeRemoteUrl().replace(/\/$/, "");
-    const url = new URL(`${base}/functions/${accountSlug}`);
+    const url = new URL(functionUrlFor(base, accountSlug));
     if (params) {
       for (const [key, value] of Object.entries(params)) {
         if (value != null && value !== "") url.searchParams.set(key, String(value));
       }
     }
+    if (accountSlug === "tokentracker-account-heatmap") url.searchParams.set("format", "compact");
     const headers: Record<string, string> = { Accept: "application/json" };
     const anonKey = getInsforgeAnonKey();
     if (anonKey) headers.apikey = anonKey;
     if (isValidJwtShape(accessToken)) headers.Authorization = `Bearer ${accessToken}`;
-    return cachedAccountJsonGet(`${url.toString()}\0${accessToken}`, async () => {
-      const response = await fetch(url.toString(), { headers, cache: "no-store" });
+    return cachedAccountJsonGet(url, accessToken, async () => {
+      const response = await fetchFunctionResponse(url.toString(), { headers, cache: "no-store" });
       if (!response.ok) {
         const err: any = new Error(`Request failed with HTTP ${response.status}`);
         err.status = response.status;
         throw err;
       }
-      return response.json();
+      const data = await response.json();
+      return accountSlug === "tokentracker-account-heatmap" ? expandHeatmapCompact(data) : data;
     });
   }
 
+  if (!isLocalhostHost()) {
+    const error: any = new Error("Local API is unavailable on this host");
+    error.status = 404;
+    error.code = "LOCAL_API_UNAVAILABLE";
+    throw error;
+  }
   const url = new URL(`/functions/${slug}`, window.location.origin);
   if (params) {
     for (const [key, value] of Object.entries(params)) {
@@ -279,7 +342,7 @@ async function fetchInsforgeFunction(slug: string, options: {
   const baseUrl = getInsforgeRemoteUrl();
   if (!baseUrl) throw new Error("InsForge base URL not configured");
   const root = baseUrl.replace(/\/$/, "");
-  const url = new URL(`${root}/functions/${slug}`);
+  const url = new URL(functionUrlFor(root, slug));
   if (options.params) {
     for (const [key, value] of Object.entries(options.params)) {
       if (value != null && value !== "") url.searchParams.set(key, String(value));
@@ -300,18 +363,21 @@ async function fetchInsforgeFunction(slug: string, options: {
     headers.Authorization = `Bearer ${options.accessToken}`;
   }
 
-  const res = await fetch(url.toString(), {
+  const res = await fetchFunctionResponse(url.toString(), {
     method: options.method || "GET",
     headers,
     cache: options.cache,
     ...(options.body != null ? { body: JSON.stringify(options.body) } : {}),
   });
+  assertBackendInstance(baseUrl, anonKey);
   if (!res.ok) {
     const err: any = new Error(`Request failed with HTTP ${res.status}`);
     err.status = res.status;
     throw err;
   }
-  return res.json();
+  const data = await res.json();
+  assertBackendInstance(baseUrl, anonKey);
+  return data;
 }
 
 export async function getLeaderboard({
@@ -721,9 +787,21 @@ export async function getUsageMonthly({
   }, { accessToken });
 }
 
-export async function getUsageLimits(opts: { refresh?: boolean } = {}) {
-  const params = opts?.refresh ? { refresh: "1" } : undefined;
-  return fetchLocalJson(PATHS.usageLimits, params);
+export async function getUsageLimits(opts: { refresh?: boolean; devinEnabled?: boolean } = {}) {
+  const params: AnyRecord = opts?.refresh ? { refresh: "1" } : {};
+  const options: AnyRecord = {};
+  // Devin quota is opt-in: devin=1 is honored by the local API only together
+  // with the loopback auth header, so the flag alone can never trigger a
+  // credential read. Away from the local backend (e.g. the hosted site) there
+  // is nothing to opt in to, so the flag is not sent at all.
+  if (opts?.devinEnabled === true && isLocalhostHost()) {
+    params.devin = "1";
+    options.headers = {
+      Accept: "application/json",
+      ...(await getLocalApiAuthHeaders()),
+    };
+  }
+  return fetchLocalJson(PATHS.usageLimits, params, options);
 }
 
 export async function getUsageHeatmap({
@@ -775,45 +853,67 @@ const ACCOUNT_PATHS = {
 async function fetchAccountFunction(
   slug: string,
   params: AnyRecord | undefined,
-  accessToken: string,
+  auth: AuthTokenProvider,
 ) {
+  const baseUrl = getInsforgeRemoteUrl();
+  const anonKey = getInsforgeAnonKey();
+  const assertInstance = () => {
+    assertBackendInstance(baseUrl, anonKey);
+  };
+  const accessToken = typeof auth === "string" ? auth.trim() : await resolveAuthAccessToken(auth);
+  assertInstance();
   if (!accessToken || !isValidJwtShape(accessToken)) {
     const err: any = new Error("Account view requires a signed-in user");
     err.status = 401;
     throw err;
   }
-  const baseUrl = getInsforgeRemoteUrl();
   if (!baseUrl) {
     const err: any = new Error("InsForge base URL not configured");
     err.status = 0;
     throw err;
   }
   const root = baseUrl.replace(/\/$/, "");
-  const url = new URL(`${root}/functions/${slug}`);
+  const url = new URL(functionUrlFor(root, slug));
   if (params) {
     for (const [key, value] of Object.entries(params)) {
       if (value != null && value !== "") url.searchParams.set(key, String(value));
     }
   }
+  if (slug === ACCOUNT_PATHS.heatmap) url.searchParams.set("format", "compact");
   const headers: Record<string, string> = {
     Accept: "application/json",
     Authorization: `Bearer ${accessToken}`,
   };
-  const anonKey = getInsforgeAnonKey();
   if (anonKey) headers.apikey = anonKey;
-  return cachedAccountJsonGet(`${url.toString()}\0${accessToken}`, async () => {
-    const response = await fetch(url.toString(), {
+  const result = await cachedAccountJsonGet(url, accessToken, async () => {
+    assertInstance();
+    const response = await fetchFunctionResponse(url.toString(), {
       method: "GET",
       headers,
       cache: "no-store",
     });
+    assertInstance();
     if (!response.ok) {
       const err: any = new Error(`Request failed with HTTP ${response.status}`);
       err.status = response.status;
+      const denied = await response.json().catch(() => null);
+      assertInstance();
+      if (typeof denied?.code === "string") {
+        err.code = denied.code;
+        if (baseUrl === getInsforgeRemoteUrl())
+          recordCloudPromptFailure(accountIdentity(accessToken), denied.code, denied.membership, slug, {
+            machineCount: Number.isFinite(denied.machine_count) ? denied.machine_count : undefined,
+          });
+      }
       throw err;
     }
-    return response.json();
+    const data = await response.json();
+    assertInstance();
+    if (baseUrl === getInsforgeRemoteUrl()) clearCloudPromptFailure(accountIdentity(accessToken), slug);
+    return slug === ACCOUNT_PATHS.heatmap ? expandHeatmapCompact(data) : data;
   });
+  assertInstance();
+  return result;
 }
 
 export async function fetchCloudUsageSummary({

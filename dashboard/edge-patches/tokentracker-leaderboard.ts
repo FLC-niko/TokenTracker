@@ -20,6 +20,7 @@
  * private data is exposed.
  */
 import { createClient } from "npm:@insforge/sdk";
+import { readProBadges } from "./cloud/pro.ts";
 
 const cors = {
   "Access-Control-Allow-Origin": "*",
@@ -33,6 +34,21 @@ const BLOCKED_LEADERBOARD_USER_IDS = new Set(
     .filter(Boolean),
 );
 
+/**
+ * Kept deliberately plain: do NOT add Content-Encoding here.
+ *
+ * This endpoint carried a gzip branch for a while (body over 1 KB and a caller
+ * advertising gzip got a compressed stream). It never reached a client. The
+ * InsForge gateway decompresses an encoded edge response and forwards it as
+ * identity: `Vary: Accept-Encoding` is passed through, `Content-Encoding` is
+ * stripped, and both `Content-Length` and the ETag are computed over the plain
+ * body. Verified end to end on 2026-09-20 against the public leaderboard
+ * endpoint with cache-busted requests: 77529 bytes on the wire either way, and
+ * a body starting with `{"en` rather than the gzip magic 1f 8b.
+ *
+ * So compressing here only burns CPU twice. The way to shrink these responses
+ * is fewer bytes (the *_compact RPCs) or fewer requests (client-side caches).
+ */
 function json(data: unknown, status = 200) {
   return new Response(JSON.stringify(data), {
     status,
@@ -154,7 +170,7 @@ export default async function (req: Request): Promise<Response> {
     .eq("to_day", to_day)
     .order("rank", { ascending: true })
     .range(offset, offset + limit - 1);
-  if (error) return json({ error: error.message }, 500);
+  if (error) return json({ error: "Failed to fetch leaderboard" }, 500);
 
   let me: unknown = null;
   if (requestedUserId) {
@@ -198,6 +214,7 @@ export default async function (req: Request): Promise<Response> {
         .filter((id): id is string => Boolean(id)),
     ),
   ];
+  const proBadgesPromise = readProBadges(client, badgeUserIds);
   if (badgeUserIds.length > 0) {
     try {
       const { data: badgeData, error: badgeErr } = await client.database.rpc(
@@ -215,6 +232,7 @@ export default async function (req: Request): Promise<Response> {
     badges: (e?.user_id && badgeMap[e.user_id]?.badges) || [],
     badge_count: (e?.user_id && badgeMap[e.user_id]?.badge_count) || 0,
   });
+  const proBadges = await proBadgesPromise;
   // `generated_at` belongs to the persisted snapshot, not to this read
   // request. Returning the request time made stale month/total snapshots look
   // fresh to both the dashboard and the freshness watchdog. Include `me` as a
@@ -230,9 +248,11 @@ export default async function (req: Request): Promise<Response> {
     entries: visibleEntries.map((e: { user_id?: string }) => ({
       ...e,
       ...badgesFor(e),
+      pro_active: Boolean(e.user_id && proBadges[e.user_id] === true),
       is_me: (visibleMe as { user_id?: string } | null)?.user_id === e.user_id,
     })),
-    me: visibleMe ? { ...(visibleMe as Record<string, unknown>), ...badgesFor(visibleMe as { user_id?: string }) } : null,
+    me: visibleMe ? { ...(visibleMe as Record<string, unknown>), ...badgesFor(visibleMe as { user_id?: string }),
+      pro_active: proBadges[(visibleMe as { user_id: string }).user_id] === true } : null,
     total_entries: count || 0,
     total_pages: Math.ceil((count || 0) / limit),
     from: from_day,

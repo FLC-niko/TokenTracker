@@ -1,11 +1,14 @@
 const os = require("node:os");
 const path = require("node:path");
 const fs = require("node:fs/promises");
+const { expandHome } = require("../lib/scan-roots");
 
 const {
   restoreCodexNotify,
+  restoreAcodeNotify,
   restoreEveryCodeNotify,
   buildCodexNotifyCmd,
+  buildAcodeNotifyCmd,
   buildEveryCodeNotifyCmd,
 } = require("../lib/codex-config");
 const {
@@ -33,6 +36,8 @@ async function cmdUninstall(argv) {
   const { trackerDir, binDir } = await resolveTrackerPaths({ home });
   const codexHome = process.env.CODEX_HOME || path.join(home, ".codex");
   const codexConfigPath = path.join(codexHome, "config.toml");
+  const acodeHome = process.env.TOKENTRACKER_ACODE_HOME || path.join(home, ".acode");
+  const acodeConfigPath = path.join(acodeHome, "config.toml");
   const codeHome = process.env.CODE_HOME || path.join(home, ".code");
   const codeConfigPath = path.join(codeHome, "config.toml");
   const claudeSettingsPath = path.join(home, ".claude", "settings.json");
@@ -40,24 +45,32 @@ async function cmdUninstall(argv) {
   const codebuddySettingsPath = path.join(codebuddyDir, "settings.json");
   const workbuddyDir = process.env.WORKBUDDY_HOME || path.join(home, ".workbuddy");
   const workbuddySettingsPath = path.join(workbuddyDir, "settings.json");
+  // WorkBuddy AI — international build, sibling home (~/.workbuddy-ai).
+  const workbuddyAiDir = expandHome(process.env.WORKBUDDY_AI_HOME, home) || path.join(home, ".workbuddy-ai");
+  const workbuddyAiSettingsPath = path.join(workbuddyAiDir, "settings.json");
   const geminiConfigDir = resolveGeminiConfigDir({ home, env: process.env });
   const geminiSettingsPath = resolveGeminiSettingsPath({ configDir: geminiConfigDir });
   const opencodeConfigDir = resolveOpencodeConfigDir({ home, env: process.env });
   const notifyPath = path.join(binDir, "notify.cjs");
   const notifyOriginalPath = path.join(trackerDir, "codex_notify_original.json");
+  const acodeNotifyOriginalPath = path.join(trackerDir, "acode_notify_original.json");
   const codeNotifyOriginalPath = path.join(trackerDir, "code_notify_original.json");
   const codexNotifyCmd = buildCodexNotifyCmd(notifyPath);
+  const acodeNotifyCmd = buildAcodeNotifyCmd(notifyPath);
   const codeNotifyCmd = buildEveryCodeNotifyCmd(notifyPath);
   const claudeHookCommand = buildClaudeHookCommand(notifyPath);
   const codebuddyHookCommand = buildHookCommand(notifyPath, "codebuddy");
   const workbuddyHookCommand = buildHookCommand(notifyPath, "workbuddy");
+  const workbuddyAiHookCommand = buildHookCommand(notifyPath, "workbuddy-ai");
   const geminiHookCommand = buildGeminiHookCommand(notifyPath);
 
   const codexConfigExists = await isFile(codexConfigPath);
+  const acodeConfigExists = await isFile(acodeConfigPath);
   const codeConfigExists = await isFile(codeConfigPath);
   const claudeConfigExists = await isFile(claudeSettingsPath);
   const codebuddyConfigExists = await isFile(codebuddySettingsPath);
   const workbuddyConfigExists = await isFile(workbuddySettingsPath);
+  const workbuddyAiConfigExists = await isFile(workbuddyAiSettingsPath);
   const geminiConfigExists = await isDir(geminiConfigDir);
   const opencodeConfigExists = await isDir(opencodeConfigDir);
   const codexRestore = codexConfigExists
@@ -65,6 +78,13 @@ async function cmdUninstall(argv) {
         codexConfigPath,
         notifyOriginalPath,
         notifyCmd: codexNotifyCmd,
+      })
+    : { restored: false, skippedReason: "config-missing" };
+  const acodeRestore = acodeConfigExists
+    ? await restoreAcodeNotify({
+        acodeConfigPath,
+        notifyOriginalPath: acodeNotifyOriginalPath,
+        notifyCmd: acodeNotifyCmd,
       })
     : { restored: false, skippedReason: "config-missing" };
   const codeRestore = codeConfigExists
@@ -90,6 +110,12 @@ async function cmdUninstall(argv) {
     ? await removeClaudeHook({
         settingsPath: workbuddySettingsPath,
         hookCommand: workbuddyHookCommand,
+      })
+    : { removed: false, skippedReason: "config-missing" };
+  const workbuddyAiRemove = workbuddyAiConfigExists
+    ? await removeClaudeHook({
+        settingsPath: workbuddyAiSettingsPath,
+        hookCommand: workbuddyAiHookCommand,
       })
     : { removed: false, skippedReason: "config-missing" };
   const geminiRemove = geminiConfigExists
@@ -138,6 +164,15 @@ async function cmdUninstall(argv) {
               ? "- Codex notify: skipped (current notify is not managed by TokenTracker)"
             : "- Codex notify: no change"
         : "- Codex notify: skipped (config.toml not found)",
+      acodeConfigExists
+        ? acodeRestore?.restored
+          ? `- AStudio notify restored: ${acodeConfigPath}`
+          : acodeRestore?.skippedReason === "no-backup-not-installed"
+            ? "- AStudio notify: skipped (no backup; not installed)"
+            : acodeRestore?.skippedReason === "current-not-managed"
+              ? "- AStudio notify: skipped (current notify is not managed by TokenTracker)"
+              : "- AStudio notify: no change"
+        : "- AStudio notify: skipped (config.toml not found)",
       codeConfigExists
         ? codeRestore?.restored
           ? `- Every Code notify restored: ${codeConfigPath}`
@@ -168,6 +203,13 @@ async function cmdUninstall(argv) {
             ? "- WorkBuddy hooks: no change"
             : "- WorkBuddy hooks: skipped"
         : "- WorkBuddy hooks: skipped (settings.json not found)",
+      workbuddyAiConfigExists
+        ? workbuddyAiRemove?.removed
+          ? `- WorkBuddy AI hooks removed: ${workbuddyAiSettingsPath}`
+          : workbuddyAiRemove?.skippedReason === "hook-missing"
+            ? "- WorkBuddy AI hooks: no change"
+            : "- WorkBuddy AI hooks: skipped"
+        : "- WorkBuddy AI hooks: skipped (settings.json not found)",
       geminiConfigExists
         ? geminiRemove?.removed
           ? `- Gemini hooks removed: ${geminiSettingsPath}`

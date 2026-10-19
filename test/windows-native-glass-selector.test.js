@@ -26,3 +26,11 @@ test("Windows glass reset targets only the desktop navigation sidebar", () => {
   assert.doesNotMatch(styles, /aside\[aria-label\]/);
   assert.doesNotMatch(dashboardWindow, /aside\[aria-label\]/);
 });
+
+test("Cloud routes keep their theme inside the shared application shell", () => {
+  const app = read("dashboard/src/App.jsx");
+  assert.doesNotMatch(app, /content\s*=\s*<div className="tt-cloud-theme"/);
+  for (const page of ["CloudPage", "CloudCheckoutPage", "SelfHostPage"]) {
+    assert.match(read(`dashboard/src/pages/${page}.jsx`), /className="tt-cloud-theme\b/);
+  }
+});

@@ -29,13 +29,14 @@ const LOCAL_INFERENCE_SOURCES = new Set(["lmstudio"]);
 // including cached tokens, never a session/day aggregate. Astra supports
 // a larger context window; only observed request subsets receive the premium.
 const OPENAI_LONG_CONTEXT_INPUT_THRESHOLD = 272_000;
-const SOURCES_WITH_AUTHORITATIVE_COST = new Set(["grok"]);
+const SOURCES_WITH_AUTHORITATIVE_COST = new Set(["grok", "cline"]);
 const SEED_SNAPSHOT_PATH = path.resolve(__dirname, "seed-snapshot.json");
 const DEEPSEEK_TIME_PRICED_MODELS = [
   "deepseek-v4-flash",
+  "deepseek-v4.1-flash",
+  "deepseek-flash",
   "deepseek-v4-pro",
 ];
-
 // Sync seed load. Done at require-time so callers that haven't awaited
 // ensurePricingLoaded() (e.g. tests, vite mock startup, edge functions) still
 // get LiteLLM-backed pricing instead of all-zero. ensurePricingLoaded() will
@@ -130,6 +131,50 @@ function getModelPricing(model, opts = {}) {
   return ZERO_PRICING;
 }
 
+// Callers hit this once per queue row, and a miss walks the whole LiteLLM map,
+// so results are memoized per pricing revision. Copies go out so a caller that
+// mutates its object cannot poison the cache.
+const pricingInfoCache = { revision: -1, entries: new Map() };
+
+// Preserve matcher provenance: a known zero rate is free, a missing model is
+// unpriced. Both return zero dollars, but they mean different things in the UI.
+function getModelPricingInfo(model, opts = {}) {
+  const source = typeof opts === "string" ? opts : opts.source;
+  const sourceKey = typeof source === "string" ? source.toLowerCase() : null;
+  if (pricingInfoCache.revision !== state.revision) {
+    pricingInfoCache.revision = state.revision;
+    pricingInfoCache.entries.clear();
+  }
+  const cacheKey = `${sourceKey || ""}\0${model || ""}`;
+  let info = pricingInfoCache.entries.get(cacheKey);
+  if (!info) {
+    info = computeModelPricingInfo(model, opts, sourceKey);
+    pricingInfoCache.entries.set(cacheKey, info);
+  }
+  return { ...info };
+}
+
+function computeModelPricingInfo(model, opts, sourceKey) {
+  if (LOCAL_INFERENCE_SOURCES.has(sourceKey) || PI_SUBSCRIPTION_SOURCES.has(sourceKey)) {
+    return { status: "free", source: LOCAL_INFERENCE_SOURCES.has(sourceKey) ? "local_inference" : "subscription", ...ZERO_PRICING };
+  }
+  const result = lookupPricing(model, {
+    curated: curatedOverrides,
+    litellm: state.litellmPerMillionMap,
+    source: sourceKey,
+  });
+  const rates = getModelPricing(model, opts);
+  return {
+    status: !result.hit ? "unpriced" : [rates.input, rates.output, rates.cache_read, rates.cache_write]
+      .some((value) => Number(value) > 0) ? "priced" : "free",
+    source: result.hit ? result.source : null,
+    input: Number(rates.input) || 0,
+    output: Number(rates.output) || 0,
+    cache_read: Number(rates.cache_read) || 0,
+    cache_write: Number(rates.cache_write) || 0,
+  };
+}
+
 function isDeepSeekTimePricedModel(model) {
   const lower = String(model || "").toLowerCase();
   return DEEPSEEK_TIME_PRICED_MODELS.some((name) => lower.includes(name));
@@ -163,6 +208,9 @@ function isDeepSeekOffPeak(row) {
 
 function getRowPricing(row) {
   const pricing = getModelPricing(row?.model, { source: row?.source });
+  // AStudio uses iFlytek MaaS fixed prices and does not inherit DeepSeek public API
+  // time-based discounts.
+  if (String(row?.source || "").toLowerCase() === "acode") return pricing;
   if (!isDeepSeekTimePricedModel(row?.model) || !isDeepSeekOffPeak(row)) return pricing;
   return {
     ...pricing,
@@ -192,12 +240,24 @@ function computeKnownRowCost(row) {
   // "unreported" sentinel and falls through to model pricing.
   const reportedCost = Number(row?.total_cost_usd);
   if (
+    !(require("../usage-accounting").unclassifiedInput(row) > 0) &&
     SOURCES_WITH_AUTHORITATIVE_COST.has(row?.source) &&
     Number.isFinite(reportedCost) &&
     reportedCost > 0
   ) return reportedCost;
   const pricing = getRowPricing(row);
-  const reasoningIncludedInOutput = row.source === "codex" || row.source === "every-code";
+  // OmO, like Codex, reports reasoning as a subset of `output` (its own
+  // usage.cost bills no separate reasoning component), so charging it again
+  // here would double-bill every reasoning token. Cline is the same: its
+  // `outputTokens` is the AI SDK total (text + reasoning), so
+  // reasoning_output_tokens is a subset marker, never a second line item.
+  const reasoningIncludedInOutput =
+    row.source === "codex" ||
+    row.source === "acode" ||
+    row.source === "every-code" ||
+    row.source === "omo" ||
+    row.source === "cline" ||
+    row.source === "muse";
   const reasoningCost = reasoningIncludedInOutput
     ? 0
     : (row.reasoning_output_tokens || 0) * (pricing.output || 0);
@@ -212,13 +272,25 @@ function computeKnownRowCost(row) {
 
   const model = String(row?.model || "").toLowerCase();
   const usesOpenAILongContextTier =
-    model === "gpt-5.6" || model.includes("gpt-5.6-sol") || model.includes("gpt-6-astra");
-  if (!usesOpenAILongContextTier) return baseCost;
+    model === "gpt-5.6" || model.includes("gpt-5.6-sol") || model.includes("gpt-6-astra") ||
+    model.includes("gpt-6-sol") || model.includes("gpt-6.1-sol");
+  // Only models whose curated entry carries an explicit Fast/priority rate get
+  // the tier premium. The other OpenAI tiers have no published priority price,
+  // and inventing one is worse than reporting Standard.
+  const priorityMultiplier = Number(pricing.priority_multiplier);
+  const hasPriorityRates = Number.isFinite(priorityMultiplier) && priorityMultiplier > 1;
+  if (!usesOpenAILongContextTier && !hasPriorityRates) return baseCost;
 
   const bounded = (value, total) => Math.min(
     Math.max(0, Number(value) || 0),
     Math.max(0, Number(total) || 0),
   );
+  // Both premium families below read "observed subset" columns: how much of the
+  // row's own token columns came from requests with a given property. They are
+  // annotations, never addends — total_tokens stays the sum of the base columns
+  // whether or not they are present, and a legacy row that omits them prices
+  // exactly as it did before.
+  //
   // The parser records only usage from requests whose cache-inclusive input
   // exceeded 272K. OpenAI prices the whole such request at 2x input and 1.5x
   // output, so add the premium over the standard-rate base exactly once.
@@ -232,14 +304,61 @@ function computeKnownRowCost(row) {
   const longReasoning = reasoningIncludedInOutput
     ? 0
     : bounded(row.long_context_reasoning_output_tokens, row.reasoning_output_tokens);
-  const longContextPremium = (
+  const longContextPremium = usesOpenAILongContextTier ? (
     longInput * (pricing.input || 0) +
     longCached * (pricing.cache_read || 0) +
     longCacheWrite * (pricing.cache_write || 0) +
     0.5 * longOutput * (pricing.output || 0) +
     0.5 * longReasoning * (pricing.output || 0)
+  ) / 1_000_000 : 0;
+
+  if (!hasPriorityRates) return baseCost + longContextPremium;
+
+  // Astra Fast is a flat multiple of whichever context tier the request was on
+  // (short 10/1/12.5/50 -> 20/2/25/100; long 20/2/25/75 -> 40/4/50/150), so the
+  // tier multiplier and the long-context premium are orthogonal: a request that
+  // is both bills at the LONG rate times the multiplier, not standard times the
+  // multiplier. That needs the intersection, which is why the parser records
+  // priority_long_context_* alongside priority_*; without it (queue rows, which
+  // carry no context-length subset at all) the overlap is 0 and the premium
+  // falls back to the short-context multiple, matching the row's own base.
+  const priorityInput = bounded(row.priority_input_tokens, row.input_tokens);
+  const priorityCached = bounded(row.priority_cached_input_tokens, row.cached_input_tokens);
+  const priorityCacheWrite = bounded(
+    row.priority_cache_creation_input_tokens,
+    row.cache_creation_input_tokens,
+  );
+  const priorityOutput = bounded(row.priority_output_tokens, row.output_tokens);
+  const priorityReasoning = reasoningIncludedInOutput
+    ? 0
+    : bounded(row.priority_reasoning_output_tokens, row.reasoning_output_tokens);
+  const priorityBase = (
+    priorityInput * (pricing.input || 0) +
+    priorityCached * (pricing.cache_read || 0) +
+    priorityCacheWrite * (pricing.cache_write || 0) +
+    priorityOutput * (pricing.output || 0) +
+    priorityReasoning * (pricing.output || 0)
   ) / 1_000_000;
-  return baseCost + longContextPremium;
+
+  const priorityLong = usesOpenAILongContextTier ? (
+    bounded(row.priority_long_context_input_tokens, Math.min(priorityInput, longInput)) *
+      (pricing.input || 0) +
+    bounded(row.priority_long_context_cached_input_tokens, Math.min(priorityCached, longCached)) *
+      (pricing.cache_read || 0) +
+    bounded(
+      row.priority_long_context_cache_creation_input_tokens,
+      Math.min(priorityCacheWrite, longCacheWrite),
+    ) * (pricing.cache_write || 0) +
+    0.5 * bounded(row.priority_long_context_output_tokens, Math.min(priorityOutput, longOutput)) *
+      (pricing.output || 0) +
+    0.5 * bounded(
+      row.priority_long_context_reasoning_output_tokens,
+      Math.min(priorityReasoning, longReasoning),
+    ) * (pricing.output || 0)
+  ) / 1_000_000 : 0;
+
+  const priorityPremium = (priorityMultiplier - 1) * (priorityBase + priorityLong);
+  return baseCost + longContextPremium + priorityPremium;
 }
 
 // Backwards-compatible MODEL_PRICING export. Test at
@@ -254,6 +373,7 @@ module.exports = {
   ensurePricingLoaded,
   getPricingRevision,
   getModelPricing,
+  getModelPricingInfo,
   getRowPricing,
   computeRowCost,
   computeKnownRowCost,

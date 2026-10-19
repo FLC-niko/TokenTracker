@@ -20,31 +20,9 @@ import { limitProviderIconKey, limitProviderName } from "../hooks/use-limits-dis
 import { copy } from "../lib/copy";
 import { cn } from "../lib/cn";
 import { ProviderIcon } from "../ui/dashboard/components/ProviderIcon.jsx";
+import { SegmentedControl, SettingsRow, ToggleSwitch } from "./settings/Controls.jsx";
 
 const LIMITS_SETTINGS_ICON_CLASS = "shrink-0 text-oai-gray-900 dark:text-oai-gray-200";
-
-function ToggleSwitch({ checked, onChange, ariaLabel }) {
-  return (
-    <button
-      type="button"
-      role="switch"
-      aria-checked={checked}
-      aria-label={ariaLabel}
-      onClick={onChange}
-      className={cn(
-        "relative inline-flex h-5 w-9 shrink-0 items-center rounded-full transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-oai-brand-500",
-        checked ? "bg-oai-brand-500" : "bg-oai-gray-300 dark:bg-oai-gray-700",
-      )}
-    >
-      <span
-        className={cn(
-          "inline-block h-3.5 w-3.5 rounded-full bg-white transition-transform",
-          checked ? "translate-x-[18px]" : "translate-x-[3px]",
-        )}
-      />
-    </button>
-  );
-}
 
 function ProviderRow({ id, visible, onToggle }) {
   const { attributes, listeners, setNodeRef, transform, transition, isDragging } = useSortable({
@@ -102,7 +80,7 @@ function ProviderRow({ id, visible, onToggle }) {
 
 /**
  * Bare drag-and-drop reorder + visibility list for usage-limit providers.
- * Renders only the row list — outer chrome (card, header) is supplied by the
+ * Renders bulk visibility controls and the row list; outer chrome is supplied by the
  * surrounding container (e.g. SettingsPage SectionCard).
  *
  * Reordering runs on @dnd-kit (pointer events), not HTML5 `draggable`: the
@@ -115,7 +93,10 @@ function ProviderRow({ id, visible, onToggle }) {
  * `prefs` is the return value of `useLimitsDisplayPrefs()`.
  */
 export function LimitsSettingsPanel({ prefs }) {
-  const { order, visibility, toggle, moveToward } = prefs;
+  const { order, visibility, toggle, setAllVisible, moveToward } = prefs;
+  const allVisible = order.every((id) => visibility[id] !== false);
+  const allHidden = order.every((id) => visibility[id] === false);
+  const enabledCount = order.filter((id) => visibility[id] !== false).length;
 
   const sensors = useSensors(
     useSensor(PointerSensor, { activationConstraint: { distance: 6 } }),
@@ -127,6 +108,21 @@ export function LimitsSettingsPanel({ prefs }) {
   };
 
   return (
+    <>
+    <SettingsRow
+      label={copy("limits.settings.bulk_visibility")}
+      hint={copy("limits.settings.enabled_count", { enabled: enabledCount, total: order.length })}
+      control={
+        <SegmentedControl
+          options={[
+            { value: "enabled", label: copy("limits.settings.enable_all") },
+            { value: "disabled", label: copy("limits.settings.disable_all") },
+          ]}
+          value={allVisible ? "enabled" : allHidden ? "disabled" : null}
+          onChange={(value) => setAllVisible(value === "enabled")}
+        />
+      }
+    />
     <DndContext
       sensors={sensors}
       collisionDetection={closestCenter}
@@ -146,5 +142,6 @@ export function LimitsSettingsPanel({ prefs }) {
         </div>
       </SortableContext>
     </DndContext>
+    </>
   );
 }

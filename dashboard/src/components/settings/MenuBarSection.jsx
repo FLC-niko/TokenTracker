@@ -10,6 +10,7 @@ import { copy } from "../../lib/copy";
 import { cn } from "../../lib/cn";
 import { isNativeWindowsApp } from "../../lib/native-bridge.js";
 import { SectionCard, SettingsRow, ToggleSwitch } from "./Controls.jsx";
+import { Button } from "../../ui/components/Button.jsx";
 
 export function MenuBarSection() {
   const { available, settings, setSetting, runAction } = useNativeSettings();
@@ -36,13 +37,16 @@ export function MenuBarSection() {
             label={copy("settings.menubar.appearance")}
             hint={copy("settings.menubar.appearanceHint")}
             control={
-              <Link
+              <Button
+                as={Link}
                 to="/widgets"
-                className="inline-flex h-8 items-center gap-1.5 rounded-md border border-oai-gray-200 px-3 text-xs font-medium text-oai-gray-700 no-underline transition-colors hover:bg-oai-gray-100 dark:border-oai-gray-800 dark:text-oai-gray-300 dark:hover:bg-oai-gray-800"
+                variant="secondary"
+                size="sm"
+                className="gap-1.5 no-underline"
               >
-                {copy("settings.menubar.appearanceLink")}
+                <span>{copy("settings.menubar.appearanceLink")}</span>
                 <ArrowUpRight className="h-3.5 w-3.5" aria-hidden />
-              </Link>
+              </Button>
             }
           />
           <SettingsRow
@@ -86,15 +90,16 @@ export function MenuBarSection() {
         label={copy("settings.menubar.syncNow")}
         hint={copy("settings.menubar.syncNowHint")}
         control={
-          <button
-            type="button"
+          <Button
+            variant="secondary"
+            size="sm"
             onClick={() => runAction("syncNow")}
             disabled={isSyncing}
-            className="inline-flex h-8 items-center gap-1.5 rounded-md border border-oai-gray-200 px-3 text-xs font-medium text-oai-gray-700 transition-colors hover:bg-oai-gray-100 disabled:cursor-not-allowed disabled:opacity-50 dark:border-oai-gray-800 dark:text-oai-gray-300 dark:hover:bg-oai-gray-800"
+            className="gap-1.5"
           >
             <RefreshCw className={cn("h-3.5 w-3.5", isSyncing && "animate-spin")} aria-hidden />
-            {isSyncing ? copy("settings.menubar.syncing") : copy("settings.menubar.syncNow")}
-          </button>
+            <span>{isSyncing ? copy("settings.menubar.syncing") : copy("settings.menubar.syncNow")}</span>
+          </Button>
         }
       />
       <SettingsRow
@@ -112,15 +117,16 @@ export function MenuBarSection() {
         label={copy("settings.menubar.updates")}
         hint={updateStatus || undefined}
         control={
-          <button
-            type="button"
+          <Button
+            variant="secondary"
+            size="sm"
             onClick={() => runAction("checkForUpdates")}
             disabled={updateBusy}
-            className="inline-flex h-8 items-center gap-1.5 rounded-md border border-oai-gray-200 px-3 text-xs font-medium text-oai-gray-700 transition-colors hover:bg-oai-gray-100 disabled:cursor-not-allowed disabled:opacity-50 dark:border-oai-gray-800 dark:text-oai-gray-300 dark:hover:bg-oai-gray-800"
+            className="gap-1.5"
           >
             <Download className="h-3.5 w-3.5" aria-hidden />
-            {copy("settings.menubar.checkUpdates")}
-          </button>
+            <span>{copy("settings.menubar.checkUpdates")}</span>
+          </Button>
         }
       />
     </SectionCard>

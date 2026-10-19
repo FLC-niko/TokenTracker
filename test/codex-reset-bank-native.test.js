@@ -43,9 +43,9 @@ test("Codex reset row accessibility is reset-specific and does not announce quot
   assert.match(source, /private static let rowColumnSpacing: CGFloat = 5/);
   assert.match(source, /private static let percentColumnWidth: CGFloat = 34/);
   assert.match(source, /private static let relativeResetColumnWidth: CGFloat = 24/);
-  assert.match(source, /private static var resetExpiryColumnWidth: CGFloat \{\s*percentColumnWidth \+ rowColumnSpacing \+ relativeResetColumnWidth\s*\}/);
+  assert.match(source, /private var resetExpiryColumnWidth: CGFloat \{\s*Self\.percentColumnWidth \+ Self\.rowColumnSpacing \+ effectiveResetColumnWidth\s*\}/);
   assert.match(resetRowSource, /\.monospacedDigit\(\)/);
-  assert.match(resetRowSource, /\.frame\(width: Self\.resetExpiryColumnWidth, alignment: \.trailing\)/);
+  assert.match(resetRowSource, /\.frame\(width: resetExpiryColumnWidth, alignment: \.trailing\)/);
   assert.doesNotMatch(resetRowSource, /displayPercentLabel/);
   assert.doesNotMatch(resetRowSource, /limitAccessibility/);
   assert.doesNotMatch(resetRowSource, /percent:\s*Int/);
@@ -65,6 +65,11 @@ test("native reset strings support labelled rows, minute expiry, and passive sta
   const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "tokentracker-reset-bank-native-"));
   const harnessPath = path.join(tempDir, "main.swift");
   const binaryPath = path.join(tempDir, "reset-bank-native");
+  const widgetFixture = path.join(tempDir, "WidgetSnapshot.swift");
+  const suiteName = "tokentracker.test." + path.basename(tempDir);
+  const widgetSource = readSource("TokenTrackerBar/Shared/WidgetSnapshot.swift");
+  assert.ok(widgetSource.includes('"group.com.tokentracker.bar"'));
+  fs.writeFileSync(widgetFixture, widgetSource.replace('"group.com.tokentracker.bar"', JSON.stringify(suiteName)));
 
   fs.writeFileSync(harnessPath, String.raw`
 import Foundation
@@ -108,6 +113,7 @@ do {
     NativeLocalization.storePreference(NativeLocalization.englishLocale)
     defer {
         UserDefaults.standard.removeObject(forKey: NativeLocalization.preferenceKey)
+        UserDefaults.standard.removePersistentDomain(forName: WidgetSharedConstants.appGroupIdentifier)
     }
 
     let date = ISO8601DateFormatter().date(from: "2026-07-01T02:13:21Z")!
@@ -163,8 +169,9 @@ do {
 
   try {
     const sources = [
-      repoPath("TokenTrackerBar/Shared/WidgetSnapshot.swift"),
+      widgetFixture,
       repoPath("TokenTrackerBar/Shared/NativeLocalization.swift"),
+      repoPath("TokenTrackerBar/Shared/NativeQAProfile.swift"),
       repoPath("TokenTrackerBar/TokenTrackerBar/Models/MenuBarDisplayPreferences.swift"),
       repoPath("TokenTrackerBar/TokenTrackerBar/Models/UsageLimits.swift"),
       repoPath("TokenTrackerBar/TokenTrackerBar/Utilities/Strings.swift"),
