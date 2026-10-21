@@ -19358,8 +19358,6 @@ function serializeVsCodeCopilotRequestMap(requestsByIndex) {
     .sort(([left], [right]) => left - right)
     .map(([index, request]) => ({
       index,
-      key: vsCodeCopilotRequestKey(request, index),
-      usageFingerprint: vsCodeCopilotRequestUsageFingerprint(request, index),
       request: slimVsCodeCopilotRequest(request),
     }));
 }
@@ -19553,29 +19551,6 @@ function applyVsCodeCopilotChatPatch(
     return true;
   }
   return false;
-}
-
-function vsCodeCopilotRequestUsageFingerprint(request, index) {
-  const usage = extractVsCodeCopilotUsage(request);
-  return crypto
-    .createHash("sha256")
-    .update(JSON.stringify([
-      vsCodeCopilotRequestKey(request, index),
-      usage
-        ? [
-            usage.model,
-            usage.bucketStart,
-            usage.totals.input_tokens,
-            usage.totals.unclassified_input_tokens,
-            usage.totals.cached_input_tokens,
-            usage.totals.cache_creation_input_tokens,
-            usage.totals.output_tokens,
-            usage.totals.reasoning_output_tokens,
-            usage.totals.total_tokens,
-          ]
-        : null,
-    ]))
-    .digest("hex");
 }
 
 async function fingerprintVsCodeCopilotFile(filePath) {

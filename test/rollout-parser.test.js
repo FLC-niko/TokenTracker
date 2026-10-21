@@ -7319,11 +7319,23 @@ test("parseVsCodeCopilotChatIncremental bounds JSONL cursor overlap and strips r
     );
     assert.equal(
       fileState.requestOverlap.every(
-        (entry) => /^[a-f0-9]{64}$/.test(entry.usageFingerprint) && typeof entry.key === "string",
+        (entry) => Object.keys(entry).sort().join(",") === "index,request",
       ),
       true,
     );
     assert.ok(JSON.stringify(fileState).length < raw.length);
+
+    // Older compact cursors include redundant derived fields. Ignore them:
+    // identity and usage are reconstructed from the retained request overlap.
+    for (const entry of fileState.requestOverlap) {
+      entry.key = "obsolete-derived-key";
+      entry.usageFingerprint = "obsolete-derived-fingerprint";
+    }
+    const unchanged = await parseVsCodeCopilotChatIncremental({ sessionPaths: [sessionPath], cursors, queuePath });
+    assert.equal(unchanged.bucketsQueued, 0);
+    assert.ok(cursors.copilotVsCode.files[sessionPath].requestOverlap.every(
+      entry => Object.keys(entry).sort().join(",") === "index,request",
+    ));
 
     // A same-size rewrite must reconcile the complete document against the
     // compact file aggregate, rather than replaying all 512 historical

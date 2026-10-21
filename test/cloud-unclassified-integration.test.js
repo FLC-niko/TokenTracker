@@ -4,7 +4,12 @@ const { before, after } = test;
 const assert = require("node:assert/strict");
 const { randomUUID } = require("node:crypto");
 const { setup, migration, functionSql } = require("./helpers/cloud-usage-archive-fixture");
-let db, canonicalPricing, legacyUser, legacyDevice;
+let db, canonicalPricing, legacyUser, legacyDevice, functionContracts;
+const contracts = pg => pg.query(`SELECT oid, proname, proowner, proacl::text, prosecdef, provolatile, proconfig
+  FROM pg_proc WHERE pronamespace='public'::regnamespace AND proname IN
+  ('account_usage_grouped', 'tokentracker_upsert_account_session_states', 'cloud_ingest_usage',
+   'leaderboard_rollup_total_v2_after_insert', 'leaderboard_rollup_total_v2_after_update',
+   'leaderboard_rollup_total_v2_after_delete') ORDER BY proname`).then(result => result.rows);
 const rpc = async (name, args = []) => (await db.query(
   `SELECT ${name}(${args.map((_, i) => "$" + (i + 1)).join(",")}) AS result`, args)).rows[0].result;
 const row = (unknown = 100, output = 20) => ({ hour_start: "2026-01-02T02:00:00Z", source: "vscode-copilot", model: "gpt-5.4",
@@ -26,8 +31,8 @@ async function archive(id, dev) {
   assert.ok(generation);
   await rpc("cloud_commit_usage_archive", [generation]);
 }
-before(async () => {
-  db = await setup();
+async function setupCurrentMain() {
+  const db = await setup();
   await db.exec("ALTER TABLE tokentracker_leaderboard_snapshots ADD COLUMN estimated_cost_usd numeric NOT NULL DEFAULT 0");
   await db.exec(migration("20261003120000_cloud-subscriptions.sql"));
   await db.exec(migration("20261004120000_cloud-machine-access.sql"));
@@ -43,6 +48,11 @@ before(async () => {
   }
   await db.exec("ALTER TABLE tokentracker_leaderboard_snapshots ADD COLUMN generated_at timestamptz NOT NULL DEFAULT now(); ALTER TABLE agentmeter_leaderboard_snapshots ADD COLUMN generated_at timestamptz NOT NULL DEFAULT now()");
   await db.exec(migration("20261015120000_cloud-device-usage-reset.sql"));
+  return db;
+}
+before(async () => {
+  db = await setupCurrentMain();
+  functionContracts = await contracts(db);
   canonicalPricing = (await db.query("SELECT pg_get_functiondef('leaderboard_pricing_tier(text,timestamptz)'::regprocedure) AS d")).rows[0].d;
   // A real pre-v3 pack has no unknown column; upgrading must not rewrite it.
   legacyUser = await user(); legacyDevice = await issue(legacyUser);
@@ -55,6 +65,48 @@ before(async () => {
   catch (error) { await db.exec("ROLLBACK"); throw error; }
 });
 after(async () => { await db?.close(); });
+
+test("guarded migration rejects missing, changed or duplicate anchors and rolls back the whole upgrade", async () => {
+  const pg = await setupCurrentMain();
+  try {
+    const signature = "account_usage_grouped(uuid,uuid[],timestamptz,timestamptz,text,text,integer)";
+    const original = (await pg.query("SELECT pg_get_functiondef($1::regprocedure) AS d", [signature])).rows[0].d;
+    const anchor = "      h.cached_input_tokens::bigint AS cached_input_tokens,";
+    const definitions = () => pg.query("SELECT pg_get_functiondef(oid) AS d FROM pg_proc WHERE pronamespace='public'::regnamespace ORDER BY oid").then(result => result.rows);
+    const baseline = await definitions();
+    for (const changed of [null, original.replace(anchor, anchor.replace(" AS ", "  AS ")),
+      original.replace(anchor, anchor + " -- " + anchor)]) {
+      await pg.exec("BEGIN");
+      try {
+        await pg.exec(changed || `DROP FUNCTION public.${signature}`);
+        await assert.rejects(pg.exec(migration("20261019120000_unclassified-input-tokens.sql")),
+          /Accounting v3 (SQL shape drift|requires current main function)/);
+      } finally { await pg.exec("ROLLBACK"); }
+      assert.deepEqual(await definitions(), baseline, "earlier function bodies must also roll back");
+      assert.equal((await pg.query("SELECT count(*)::int AS n FROM information_schema.columns WHERE table_name='tokentracker_hourly' AND column_name='unclassified_input_tokens'")).rows[0].n, 0);
+      assert.equal((await pg.query("SELECT to_regprocedure('public.tokentracker_accounting_capabilities()') AS f")).rows[0].f, null);
+    }
+  } finally { await pg.close(); }
+});
+
+test("device convergence retains unknown input in both hot rows and cold archives", async () => {
+  for (const cold of [false, true]) {
+    const id = await user(), canonical = await issue(id), legacy = randomUUID();
+    await db.query("INSERT INTO tokentracker_devices(id,user_id,device_name,platform) VALUES($1,$2,'legacy','web')", [legacy, id]);
+    await ingest(canonical, [row()]);
+    await db.query(`INSERT INTO tokentracker_hourly SELECT (jsonb_populate_record(NULL::tokentracker_hourly,
+      to_jsonb(h) || jsonb_build_object('device_id',$2::text,'unclassified_input_tokens',160,
+      'total_tokens',180,'billable_total_tokens',180))).* FROM tokentracker_hourly h WHERE user_id=$1`, [id, legacy]);
+    if (cold) await archive(id, legacy);
+    assert.equal(await rpc("refresh_tokentracker_device_identity", [id, canonical.device_id, "legacy", "web"]), true);
+    const usage = await grouped(id, [canonical.device_id]);
+    assert.equal(usage.length, 1);
+    assert.equal(usage[0].unclassified_input_tokens, 160);
+    assert.equal(usage[0].total_tokens, 180);
+    assert.equal((await db.query("SELECT count(*)::int AS n FROM tokentracker_hourly WHERE device_id=$1", [legacy])).rows[0].n, 0);
+    assert.ok((await db.query("SELECT revoked_at FROM tokentracker_devices WHERE id=$1", [legacy])).rows[0].revoked_at);
+  }
+});
 
 test("current-main transaction and every compact wire retain disjoint input across cold/hot corrections and restore", async () => {
   const id = await user(), device = await issue(id);
@@ -110,10 +162,12 @@ test("cross-machine dedup, session LWW and lifetime correction triggers retain t
 });
 
 test("upgrade retains canonical weekend pricing, access locks and project-admin-only read ACLs", async () => {
+  assert.deepEqual(await contracts(db), functionContracts, "in-place edits retain function OIDs, ACLs and execution settings");
   assert.equal((await db.query("SELECT pg_get_functiondef('leaderboard_pricing_tier(text,timestamptz)'::regprocedure) AS d")).rows[0].d, canonicalPricing);
   assert.equal(await rpc("leaderboard_pricing_tier", ["deepseek-v4-pro", "2026-08-23T02:00:00Z"]), "off_peak");
   for (const signature of ["tokentracker_accounting_capabilities()", "leaderboard_hourly_dedup_v2_unclassified(timestamptz,timestamptz)",
-    "cloud_restore_usage_archive(uuid,uuid,uuid,date)", "account_daily_wire(uuid,uuid,timestamptz,timestamptz,text,integer,text,text)"]) {
+    "cloud_restore_usage_archive(uuid,uuid,uuid,date)", "account_daily_wire(uuid,uuid,timestamptz,timestamptz,text,integer,text,text)",
+    "refresh_tokentracker_device_identity(uuid,uuid,text,text)", "account_usage_grouped_cached(uuid,uuid,timestamptz,timestamptz,text,text,integer)"]) {
     for (const role of ["anon", "authenticated"]) assert.equal((await db.query("SELECT has_function_privilege($1,$2,'EXECUTE') AS allowed", [role, signature])).rows[0].allowed, false);
   }
   const definition = (await db.query("SELECT pg_get_functiondef('cloud_ingest_usage(text,text,jsonb,jsonb,text)'::regprocedure) AS d")).rows[0].d;

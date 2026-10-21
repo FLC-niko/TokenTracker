@@ -164,19 +164,5 @@ for (const ready of [undefined, "0", "true"]) {
   });
 }
 
-test("device identity refresh carries disjoint input through hourly-row convergence", () => {
-  const sql = fs.readFileSync(
-    path.join(root, "migrations/20261019120000_unclassified-input-tokens.sql"),
-    "utf8",
-  );
-  const start = sql.indexOf("CREATE OR REPLACE FUNCTION public.refresh_tokentracker_device_identity");
-  const end = sql.indexOf("CREATE OR REPLACE FUNCTION public.tokentracker_upsert_account_session_states", start);
-  assert.ok(start >= 0 && end > start);
-  const refresh = sql.slice(start, end);
-  assert.match(refresh, /input_tokens,\s*unclassified_input_tokens,\s*cached_input_tokens/s);
-  assert.match(refresh, /ranked\.unclassified_input_tokens/);
-  assert.match(refresh, /unclassified_input_tokens = EXCLUDED\.unclassified_input_tokens/);
-});
-
 // Current-main PostgreSQL, wire and archive regressions run unconditionally
 // in cloud-unclassified-integration.test.js (no external database or secrets).
