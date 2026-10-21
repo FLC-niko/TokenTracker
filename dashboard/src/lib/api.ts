@@ -152,6 +152,7 @@ const PATHS = {
   userStatus: "tokentracker-user-status",
   localSync: "tokentracker-local-sync",
   usageLimits: "tokentracker-usage-limits",
+  providerKey: "tokentracker-provider-key",
   outcomes: "tokentracker-outcomes",
   sessionInsights: "tokentracker-session-insights",
   contextHealth: "tokentracker-context-health",
@@ -802,6 +803,32 @@ export async function getUsageLimits(opts: { refresh?: boolean; devinEnabled?: b
     };
   }
   return fetchLocalJson(PATHS.usageLimits, params, options);
+}
+
+/**
+ * Saves a provider API key in TokenTracker's own 0600 store (never the launch
+ * environment). Only the local backend implements this endpoint; the key is
+ * sent to the loopback server and is never logged or echoed back.
+ */
+export async function saveProviderApiKey(
+  provider: "opencode-go" | "command-code",
+  apiKey: string,
+): Promise<{ ok: boolean; configured: boolean; source: string }> {
+  const authHeaders = await getLocalApiAuthHeaders();
+  const response = await fetch(`/functions/${PATHS.providerKey}`, {
+    method: "POST",
+    headers: {
+      Accept: "application/json",
+      "Content-Type": "application/json",
+      ...authHeaders,
+    },
+    body: JSON.stringify({ provider, apiKey }),
+    cache: "no-store",
+  });
+  if (!response.ok) {
+    throw new Error(`Request failed with HTTP ${response.status}`);
+  }
+  return response.json();
 }
 
 export async function getUsageHeatmap({

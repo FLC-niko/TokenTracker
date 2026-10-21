@@ -40,6 +40,12 @@ if (applyResult && applyResult.unprotected === true) {
 }
 
 run(argv).catch((err) => {
+  try {
+    const { captureException } = require('../src/lib/sentry');
+    captureException(err, { tags: { surface: 'cli-unhandled' } });
+  } catch {
+    /* ignore */
+  }
   console.error(err?.stack || String(err));
   if (debug) {
     if (typeof err?.status === 'number') {

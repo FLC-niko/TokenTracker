@@ -30,6 +30,7 @@ const SOURCE_IDENTICAL_KEY_ALLOWLIST = [
   /^settings[.]menubar[.]iconStyle[.](?:clawd|bot)$/,
   /^settings[.]menubar[.]updates[.]footerCore$/,
   /^limits[.]provider[.]/,
+  /^limits[.]apiKey[.]env_unset_command$/,
   /^limits[.]agentPlan[.]setupHint[.]snippet_install$/,
   /^limits[.]commandCode[.]setupHint[.]snippet_(?:login|login_windows|env_windows|read|export|setenv)$/,
   /^provider[.]display[.](?:omp|omo|minimax_code|command_code|deepseek_harness|cline|trae|workbuddy_ai)$/,

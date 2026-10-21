@@ -1,9 +1,14 @@
-import { fireEvent, render, screen, within } from "@testing-library/react";
+import { act, fireEvent, render, screen, within } from "@testing-library/react";
 import { createElement } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { copy, setCopyLocale } from "../../../lib/copy";
 import { DE_LOCALE, EN_LOCALE, JA_LOCALE, KO_LOCALE, ZH_CN_LOCALE, ZH_TW_LOCALE } from "../../../lib/locale";
+import { saveProviderApiKey } from "../../../lib/api";
 import { UsageLimitsPanel } from "./UsageLimitsPanel.jsx";
+
+vi.mock("../../../lib/api", () => ({
+  saveProviderApiKey: vi.fn(),
+}));
 
 function formatExpiry(iso) {
   return new Intl.DateTimeFormat(EN_LOCALE, {
@@ -32,6 +37,12 @@ beforeEach(() => {
   getContextSpy = vi.spyOn(HTMLCanvasElement.prototype, "getContext").mockReturnValue({
     font: "",
     measureText: (text) => ({ width: String(text).length * 6 }),
+  });
+  vi.mocked(saveProviderApiKey).mockReset();
+  vi.mocked(saveProviderApiKey).mockResolvedValue({
+    ok: true,
+    configured: true,
+    source: "stored",
   });
 });
 
@@ -280,34 +291,54 @@ describe("UsageLimitsPanel", () => {
     expect(screen.getByText("OpenCode Go")).toBeInTheDocument();
     expect(screen.getByText("Not connected")).toBeInTheDocument();
 
-    // Setup hint teaches the official API key flow (follow-up to the closed
-    // PR about OpenCode Go direct fill).
+    // Setup hint teaches the official API key flow and saves the key in-app,
+    // never in the machine-wide launch environment.
     expect(screen.getByText("Connect OpenCode Go")).toBeInTheDocument();
     expect(screen.getByText(/Sign in at opencode.ai and subscribe to Go\./)).toBeInTheDocument();
     expect(screen.getByText(/Create and copy an API key in the console\./)).toBeInTheDocument();
-    expect(screen.getByText(/Run this command, paste your API key \(input stays invisible\)/)).toBeInTheDocument();
+    expect(screen.getByText(/Paste your API key below\./)).toBeInTheDocument();
+    expect(screen.getByPlaceholderText("Paste API key")).toBeInTheDocument();
+    expect(screen.queryByText(/launchctl/)).not.toBeInTheDocument();
   });
 
-  it("copies an API-key setup snippet without sending the key anywhere", async () => {
-    const writeText = vi.fn().mockResolvedValue(undefined);
-    vi.stubGlobal("navigator", { ...navigator, clipboard: { writeText } });
+  it("saves an OpenCode Go key from the panel and refreshes the limits", async () => {
+    const onProviderKeySaved = vi.fn();
+    render(
+      <UsageLimitsPanel
+        opencodeGo={{ configured: false }}
+        order={["opencodeGo"]}
+        onProviderKeySaved={onProviderKeySaved}
+      />,
+    );
 
-    render(<UsageLimitsPanel opencodeGo={{ configured: false }} order={["opencodeGo"]} />);
-
-    await fireEvent.click(screen.getByRole("button", { name: "Copy" }));
+    await fireEvent.change(screen.getByPlaceholderText("Paste API key"), {
+      target: { value: "  test-key-123  " },
+    });
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "Save key" }));
+    });
 
     await vi.waitFor(() => {
-      expect(writeText).toHaveBeenCalledTimes(1);
+      expect(saveProviderApiKey).toHaveBeenCalledWith("opencode-go", "test-key-123");
     });
-    const snippet = writeText.mock.calls[0][0];
-    // The snippet reads the key interactively (`read -r -s`) so it never lands
-    // in shell history, then exports it for both the shell profile path and
-    // the macOS app (launchctl) path. It is a template only: no real key.
-    expect(snippet).toContain("read -r -s OPENCODE_GO_API_KEY");
-    expect(snippet).toContain("export OPENCODE_GO_API_KEY");
-    expect(snippet).toContain('launchctl setenv OPENCODE_GO_API_KEY "$OPENCODE_GO_API_KEY"');
-    expect(snippet).not.toMatch(/sk-/);
-    expect(screen.getByRole("button", { name: "Copied" })).toBeInTheDocument();
+    expect(onProviderKeySaved).toHaveBeenCalledTimes(1);
+    expect(await screen.findByText("Saved")).toBeInTheDocument();
+  });
+
+  it("keeps the entered key and shows an error when saving fails", async () => {
+    vi.mocked(saveProviderApiKey).mockRejectedValueOnce(new Error("HTTP 500"));
+    render(<UsageLimitsPanel opencodeGo={{ configured: false }} order={["opencodeGo"]} />);
+
+    const input = screen.getByPlaceholderText("Paste API key");
+    await fireEvent.change(input, { target: { value: "test-key-123" } });
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "Save key" }));
+    });
+
+    expect(
+      await screen.findByText("Could not save the key. Check the key and try again."),
+    ).toBeInTheDocument();
+    expect(input).toHaveValue("test-key-123");
   });
 
   it("renders Command Code 5h / Weekly windows with the plan tier", () => {
@@ -346,50 +377,60 @@ describe("UsageLimitsPanel", () => {
     expect(screen.getByText("Not connected")).toBeInTheDocument();
     expect(screen.getByText("Connect Command Code")).toBeInTheDocument();
     expect(screen.getByText("cmd login")).toBeInTheDocument();
-    expect(screen.getByText(/COMMAND_CODE_API_KEY/)).toBeInTheDocument();
+    expect(screen.getByPlaceholderText("Paste API key")).toBeInTheDocument();
+    expect(screen.queryByText(/launchctl/)).not.toBeInTheDocument();
   });
 
-  it("copies the Command Code API-key snippet without sending the key anywhere", async () => {
-    const writeText = vi.fn().mockResolvedValue(undefined);
-    vi.stubGlobal("navigator", { ...navigator, clipboard: { writeText } });
-
-    render(<UsageLimitsPanel commandCode={{ configured: false }} order={["commandCode"]} />);
-
-    await fireEvent.click(screen.getByRole("button", { name: "Copy" }));
-
-    await vi.waitFor(() => {
-      expect(writeText).toHaveBeenCalledTimes(1);
-    });
-    const snippet = writeText.mock.calls[0][0];
-    // The snippet reads the key interactively (`read -r -s`) so it never lands
-    // in shell history, then exports it for both the shell profile path and
-    // the macOS app (launchctl) path. It is a template only: no real key.
-    expect(snippet).toContain("read -r -s COMMAND_CODE_API_KEY");
-    expect(snippet).toContain("export COMMAND_CODE_API_KEY");
-    expect(snippet).toContain('launchctl setenv COMMAND_CODE_API_KEY "$COMMAND_CODE_API_KEY"');
-    expect(snippet).not.toMatch(/sk-/);
-    expect(screen.getByRole("button", { name: "Copied" })).toBeInTheDocument();
-  });
-
-  it("uses Command Code's Windows binary and PowerShell setup", async () => {
-    const writeText = vi.fn().mockResolvedValue(undefined);
-    vi.stubGlobal("navigator", { userAgent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64)", clipboard: { writeText } });
-    render(<UsageLimitsPanel commandCode={{ configured: false }} order={["commandCode"]} />);
+  it("keeps the Command Code setup hint free of launchctl on every platform", () => {
+    vi.stubGlobal("navigator", { userAgent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64)" });
+    const first = render(
+      <UsageLimitsPanel commandCode={{ configured: false }} order={["commandCode"]} />,
+    );
     expect(screen.getByText("cmdc auth login")).toBeInTheDocument();
-    await fireEvent.click(screen.getByRole("button", { name: "Copy" }));
-    expect(writeText.mock.calls[0][0]).toContain("Read-Host -AsSecureString\n");
-    expect(writeText.mock.calls[0][0]).toContain("SetEnvironmentVariable");
-    expect(writeText.mock.calls[0][0]).not.toMatch(/launchctl|read -r/);
-  });
+    expect(screen.getByPlaceholderText("Paste API key")).toBeInTheDocument();
+    expect(screen.queryByText(/launchctl/)).not.toBeInTheDocument();
+    first.unmount();
 
-  it("omits macOS launchctl from the Command Code Linux setup", async () => {
-    const writeText = vi.fn().mockResolvedValue(undefined);
-    vi.stubGlobal("navigator", { userAgent: "Mozilla/5.0 (X11; Linux x86_64)", clipboard: { writeText } });
+    vi.stubGlobal("navigator", { userAgent: "Mozilla/5.0 (X11; Linux x86_64)" });
     render(<UsageLimitsPanel commandCode={{ configured: false }} order={["commandCode"]} />);
     expect(screen.getByText("cmd login")).toBeInTheDocument();
-    await fireEvent.click(screen.getByRole("button", { name: "Copy" }));
-    expect(writeText.mock.calls[0][0]).toContain("export COMMAND_CODE_API_KEY");
-    expect(writeText.mock.calls[0][0]).not.toContain("launchctl");
+    expect(screen.queryByText(/launchctl/)).not.toBeInTheDocument();
+  });
+
+  it("explains an environment-provided OpenCode Go key and lets the user save one from the notice", async () => {
+    vi.stubGlobal("navigator", { userAgent: "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)" });
+    const onProviderKeySaved = vi.fn();
+    render(
+      <UsageLimitsPanel
+        opencodeGo={{
+          configured: true,
+          error: null,
+          credential_source: "env",
+          primary_window: { used_percent: 12, reset_at: "2026-10-21T00:00:00.000Z" },
+        }}
+        order={["opencodeGo"]}
+        onProviderKeySaved={onProviderKeySaved}
+      />,
+    );
+
+    expect(
+      screen.getByText(/Using OPENCODE_GO_API_KEY from the environment\./),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByText("launchctl unsetenv OPENCODE_GO_API_KEY"),
+    ).toBeInTheDocument();
+
+    await fireEvent.change(screen.getByPlaceholderText("Paste API key"), {
+      target: { value: "stored-key-456" },
+    });
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "Save key" }));
+    });
+
+    await vi.waitFor(() => {
+      expect(saveProviderApiKey).toHaveBeenCalledWith("opencode-go", "stored-key-456");
+    });
+    expect(onProviderKeySaved).toHaveBeenCalledTimes(1);
   });
 
   it("does not describe a pace marker when the provider cannot render one (issue 445)", () => {

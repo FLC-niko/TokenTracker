@@ -12,16 +12,20 @@
 // (resetAt is epoch milliseconds) plus a `credits` balance object; the
 // subscription payload carries `{ data: { planId, status, ... } }`.
 //
-// Auth resolution mirrors the CLI: `COMMAND_CODE_API_KEY` wins, otherwise the
-// `apiKey` field of `~/.commandcode/auth.json` (prod; written 0600 by
-// `cmd login`, never edited by hand). No key -> `{ configured: false }` so the
-// Limits panel hides the section instead of erroring.
+// Auth resolution: `COMMAND_CODE_API_KEY` wins, then a key saved from
+// TokenTracker's Limits panel (provider-api-key-store.js), then the `apiKey`
+// field of `~/.commandcode/auth.json` (prod; written 0600 by `cmd login`,
+// never edited by hand). The panel store is preferred over the CLI file
+// because saving a key there is an explicit user action, while the CLI file
+// can be a stale session. No key -> `{ configured: false }` so the Limits
+// panel hides the section instead of erroring.
 //
 // The API exposes 5h + weekly rolling caps; extra pay-as-you-go credits
 // bypass the caps server-side, so the reported used/cap needs no adjustment.
 
 const fs = require("node:fs");
 const path = require("node:path");
+const { readStoredApiKey } = require("./provider-api-key-store");
 
 const COMMANDCODE_API_BASE_URL = "https://api.commandcode.ai";
 const COMMANDCODE_API_KEY_ENV = "COMMAND_CODE_API_KEY";
@@ -57,25 +61,33 @@ function resolveCommandcodeAuthPath({ home, env = process.env } = {}) {
   return path.join(dir, COMMANDCODE_AUTH_DIRNAME, COMMANDCODE_AUTH_FILENAME);
 }
 
-function readCommandcodeApiKey({ home, env = process.env } = {}) {
+function readCommandcodeCredential({ home, trackerDir, env = process.env } = {}) {
   const fromEnv =
     env && typeof env === "object" ? env[COMMANDCODE_API_KEY_ENV] : null;
-  if (isNonEmptyString(fromEnv)) return fromEnv.trim();
+  if (isNonEmptyString(fromEnv)) return { apiKey: fromEnv.trim(), source: "env" };
+  const stored = readStoredApiKey({ provider: "command-code", trackerDir, home });
+  if (stored) return { apiKey: stored, source: "stored" };
   const authPath = resolveCommandcodeAuthPath({ home, env });
-  if (!authPath) return null;
+  if (!authPath) return { apiKey: null, source: "none" };
   let raw;
   try {
     raw = fs.readFileSync(authPath, "utf8");
   } catch {
-    return null;
+    return { apiKey: null, source: "none" };
   }
   let parsed;
   try {
     parsed = JSON.parse(raw);
   } catch {
-    return null;
+    return { apiKey: null, source: "none" };
   }
-  return isNonEmptyString(parsed?.apiKey) ? parsed.apiKey.trim() : null;
+  return isNonEmptyString(parsed?.apiKey)
+    ? { apiKey: parsed.apiKey.trim(), source: "cli" }
+    : { apiKey: null, source: "none" };
+}
+
+function readCommandcodeApiKey(opts = {}) {
+  return readCommandcodeCredential(opts).apiKey;
 }
 
 function normalizeResetAt(value) {
@@ -246,11 +258,13 @@ function withOrgParam(route, orgId) {
 // usage-limits.js converts both into the panel row.
 async function fetchCommandcodeLimits({
   home,
+  trackerDir,
   env = process.env,
   fetchImpl = fetch,
   baseUrl = COMMANDCODE_API_BASE_URL,
 } = {}) {
-  const apiKey = readCommandcodeApiKey({ home, env });
+  const credential = readCommandcodeCredential({ home, trackerDir, env });
+  const apiKey = credential.apiKey;
   if (!apiKey) return { configured: false };
 
   const origin = resolveCommandcodeOrigin(baseUrl);
@@ -289,6 +303,7 @@ async function fetchCommandcodeLimits({
   return {
     configured: true,
     error: null,
+    credential_source: credential.source,
     plan_label: deriveCommandcodePlanLabel(planId),
     subscription_status: isNonEmptyString(subscription?.status)
       ? subscription.status.trim()
@@ -308,6 +323,7 @@ module.exports = {
   resolveCommandcodeHome,
   resolveCommandcodeAuthPath,
   readCommandcodeApiKey,
+  readCommandcodeCredential,
   deriveCommandcodePlanLabel,
   normalizeResetAt,
   normalizeCommandcodeWindow,

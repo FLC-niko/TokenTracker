@@ -44,6 +44,12 @@ function createIngestClient(req: Request) {
 }
 
 async function accountingCapabilities(client: ReturnType<typeof createClient> | null) {
+  // Schema readiness is not rollout readiness: account readers may still be
+  // on the old contract while this edge is being deployed. The maintainer
+  // enables admission only after every consumer passes staging acceptance.
+  if (Deno.env.get("TOKENTRACKER_ACCOUNTING_V3_READY") !== "1") {
+    return { accounting_version: 2, unclassified_input_tokens: false };
+  }
   try {
     if (client) {
       const { data, error } = await client.database.rpc("tokentracker_accounting_capabilities", {});
@@ -233,7 +239,7 @@ export default async function (req: Request): Promise<Response> {
 
   if ([...rows, ...stateRows].some(row => Number(row.unclassified_input_tokens) > 0)
     && (await accountingCapabilities(client)).accounting_version < 3) {
-    return json({ error: "Cloud accounting migration is not ready; retain usage locally", code: "cloud_accounting_not_ready" }, 503);
+    return json({ error: "Cloud accounting rollout is not ready; retain usage locally", code: "cloud_accounting_not_ready" }, 503);
   }
 
   try {

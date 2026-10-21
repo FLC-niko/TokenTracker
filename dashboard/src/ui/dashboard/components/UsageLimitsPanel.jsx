@@ -15,8 +15,19 @@ import { buildResetBankRows } from "./usage-limits-reset-bank.js";
 import { PROVIDER_LIMIT_SPECS } from "./usage-limits-provider-specs.js";
 import { HoverTooltip } from "../../components/HoverTooltip.jsx";
 import { cycleView, countdownText, remainingLabel } from "../../../lib/subscription-display.js";
+import { saveProviderApiKey } from "../../../lib/api";
 
 const LIMITS_PROVIDER_ICON_CLASS = "shrink-0 text-oai-black dark:text-oai-white";
+
+const PROVIDER_KEY_ENV = {
+  opencodeGo: "OPENCODE_GO_API_KEY",
+  commandCode: "COMMAND_CODE_API_KEY",
+};
+
+const PROVIDER_KEY_STORE_ID = {
+  opencodeGo: "opencode-go",
+  commandCode: "command-code",
+};
 
 function commandCodeSetupPlatform() {
   const ua = typeof navigator === "undefined" ? "" : navigator.userAgent || "";
@@ -718,7 +729,7 @@ function ZcodeStartPlanSection({ data, mode, now }) {
   );
 }
 
-function renderConfiguredProvider(id, data, title, mode, expanded, onToggle, badge = null, subscription = null, now = Date.now()) {
+function renderConfiguredProvider(id, data, title, mode, expanded, onToggle, badge = null, subscription = null, now = Date.now(), onKeySaved = null) {
   const spec = PROVIDER_LIMIT_SPECS[id];
   if (!spec) return null;
   // Pace is computed once per window here and shared by the bar + the detail.
@@ -740,6 +751,9 @@ function renderConfiguredProvider(id, data, title, mode, expanded, onToggle, bad
       toggleOnHeader={id === "zcode"}
     >
       <LimitWindowSection mode={mode} rows={rows} extra={extra} />
+      {id === "opencodeGo" || id === "commandCode" ? (
+        <EnvCredentialNotice providerId={id} data={data} onSaved={onKeySaved} />
+      ) : null}
       {subscription ? <SubscriptionBar subscription={subscription} now={now} mode={mode} /> : null}
       {expanded ? <LimitDetail rows={rows} mode={mode} now={now} /> : null}
       {expanded && subscription ? (
@@ -779,15 +793,15 @@ function renderUnlinkedProvider(id, statusNodes, expanded, onToggle, subscriptio
   );
 }
 
-function renderProviderGroup(id, data, mode, expanded, onToggle, subscription = null, now = Date.now()) {
+function renderProviderGroup(id, data, mode, expanded, onToggle, subscription = null, now = Date.now(), onKeySaved = null) {
   if (!PROVIDER_LIMIT_SPECS[id]) return null;
   if (!data?.configured) {
     return renderUnlinkedProvider(
       id,
       <>
         <StatusLine>{copy("limits.status.not_connected")}</StatusLine>
-        {id === "opencodeGo" ? <OpenCodeGoSetupHint /> : null}
-        {id === "commandCode" ? <CommandCodeSetupHint /> : null}
+        {id === "opencodeGo" ? <OpenCodeGoSetupHint onSaved={onKeySaved} /> : null}
+        {id === "commandCode" ? <CommandCodeSetupHint onSaved={onKeySaved} /> : null}
         {id === "codingPlan" ? <ArkCodingPlanSetupHint /> : null}
         {id === "agentPlan" ? <ArkAgentPlanSetupHint /> : null}
         {id === "devin" ? <DevinSetupHint /> : null}
@@ -818,8 +832,8 @@ function renderProviderGroup(id, data, mode, expanded, onToggle, subscription = 
         {id === "kiro"
           ? renderProviderExtra(PROVIDER_LIMIT_SPECS.kiro.extra, data)
           : null}
-        {id === "opencodeGo" ? <OpenCodeGoSetupHint /> : null}
-        {id === "commandCode" ? <CommandCodeSetupHint /> : null}
+        {id === "opencodeGo" ? <OpenCodeGoSetupHint onSaved={onKeySaved} /> : null}
+        {id === "commandCode" ? <CommandCodeSetupHint onSaved={onKeySaved} /> : null}
         {id === "codingPlan" ? <ArkCodingPlanSetupHint /> : null}
         {id === "agentPlan" ? <ArkAgentPlanSetupHint /> : null}
         {id === "devin" ? <DevinSetupHint /> : null}
@@ -898,7 +912,18 @@ function renderProviderGroup(id, data, mode, expanded, onToggle, subscription = 
       tooltip={copy("limits.provenance.tooltip", { source: provenance.source, confidence: provenance.confidence })}
     />;
   }
-  return renderConfiguredProvider(id, data, title, mode, expanded, onToggle, badge, subscription, now);
+  return renderConfiguredProvider(
+    id,
+    data,
+    title,
+    mode,
+    expanded,
+    onToggle,
+    badge,
+    subscription,
+    now,
+    onKeySaved,
+  );
 }
 
 function CopilotOtelHint({ defaultDir }) {
@@ -956,31 +981,102 @@ function ExternalArrow() {
   );
 }
 
-// OpenCode Go limits come from OpenCode's official authenticated usage API
-// (GET /zen/go/v1/usage, Bearer OPENCODE_GO_API_KEY) once the user subscribes.
-// The macOS/Windows apps have no settings field for it yet, so this inline
-// guide shows up wherever OpenCode Go is enabled but unconfigured (or errored):
-// sign in, create an API key in the console, paste it into a copyable command.
-// No credential ever passes through TokenTracker itself.
-function OpenCodeGoSetupHint() {
-  const [copied, setCopied] = useState(false);
-  const snippet = [
-    "read -r -s OPENCODE_GO_API_KEY",
-    "export OPENCODE_GO_API_KEY",
-    'launchctl setenv OPENCODE_GO_API_KEY "$OPENCODE_GO_API_KEY"',
-  ].join("\n");
+// Saves the key through the loopback backend, which writes a 0600 file next to
+// the queue. The key is never placed in the launch environment: on macOS a
+// global `launchctl setenv` is visible to every launchd app (issue 837).
+function ProviderKeyInput({ provider, onSaved }) {
+  const [apiKey, setApiKey] = useState("");
+  const [status, setStatus] = useState("idle");
+  const [error, setError] = useState(false);
 
-  const onCopy = async (e) => {
+  const onSubmit = async (e) => {
+    e.preventDefault();
     e.stopPropagation();
+    const value = apiKey.trim();
+    if (!value || status === "saving") return;
+    setStatus("saving");
+    setError(false);
     try {
-      await navigator.clipboard.writeText(snippet);
-      setCopied(true);
-      setTimeout(() => setCopied(false), 1600);
+      await saveProviderApiKey(provider, value);
+      setApiKey("");
+      setStatus("saved");
+      onSaved?.();
     } catch (_e) {
-      // Clipboard can be unavailable in embedded or restricted contexts.
+      setStatus("idle");
+      setError(true);
     }
   };
 
+  return (
+    <form
+      className="mt-1.5 space-y-1.5"
+      onSubmit={onSubmit}
+      onClick={(e) => e.stopPropagation()}
+    >
+      <div className="flex items-center gap-2">
+        <input
+          type="password"
+          value={apiKey}
+          onChange={(e) => {
+            setApiKey(e.target.value);
+            setStatus("idle");
+            setError(false);
+          }}
+          placeholder={copy("limits.apiKey.placeholder")}
+          aria-label={copy("limits.apiKey.placeholder")}
+          autoComplete="new-password"
+          spellCheck={false}
+          className="min-w-0 flex-1 rounded-md border border-oai-gray-300 bg-white px-2 py-1 font-mono text-[11px] text-oai-gray-800 outline-none focus:border-oai-brand dark:border-oai-gray-700 dark:bg-oai-gray-900 dark:text-oai-gray-100"
+        />
+        <button
+          type="submit"
+          disabled={!apiKey.trim() || status === "saving"}
+          className="shrink-0 rounded-md bg-oai-brand/10 px-2 py-1 font-medium text-oai-brand hover:bg-oai-brand/15 disabled:opacity-50 transition-colors"
+        >
+          {status === "saving"
+            ? copy("limits.apiKey.saving")
+            : status === "saved"
+              ? copy("limits.apiKey.saved")
+              : copy("limits.apiKey.save")}
+        </button>
+      </div>
+      <div className="text-[10px] text-oai-gray-400 dark:text-oai-gray-500">
+        {error ? copy("limits.apiKey.save_failed") : copy("limits.apiKey.local_note")}
+      </div>
+    </form>
+  );
+}
+
+// A key can still arrive through the process environment (wrapper scripts,
+// headless installs). Show where it came from and how to stop exporting it
+// globally, because the env value shadows any key saved in the panel.
+function EnvCredentialNotice({ providerId, data, onSaved }) {
+  if (data?.credential_source !== "env") return null;
+  const envName = PROVIDER_KEY_ENV[providerId];
+  const storeId = PROVIDER_KEY_STORE_ID[providerId];
+  if (!envName || !storeId) return null;
+  return (
+    <div className="mt-1.5 rounded-md border border-amber-300/60 bg-amber-50/60 px-2 py-1.5 text-[10.5px] leading-snug text-amber-800 dark:border-amber-500/30 dark:bg-amber-500/10 dark:text-amber-200">
+      <div>{copy("limits.apiKey.env_note", { env: envName })}</div>
+      <ProviderKeyInput provider={storeId} onSaved={onSaved} />
+      {commandCodeSetupPlatform() === "macos" ? (
+        <div className="mt-1 flex flex-wrap items-center gap-1.5">
+          <code className="rounded bg-white/70 px-1 py-0.5 font-mono text-[10px] dark:bg-oai-gray-900/60">
+            {copy("limits.apiKey.env_unset_command", { env: envName })}
+          </code>
+          <span>{copy("limits.apiKey.env_unset_note")}</span>
+        </div>
+      ) : null}
+    </div>
+  );
+}
+
+// OpenCode Go limits come from OpenCode's official authenticated usage API
+// (GET /zen/go/v1/usage, Bearer OPENCODE_GO_API_KEY) once the user subscribes.
+// The key is entered here and stored by the backend in a 0600 file — never in
+// the launch environment, whose global scope is what leaked it into other apps
+// (issue 837). The panel only ever sends the key to the loopback backend.
+function OpenCodeGoSetupHint({ onSaved }) {
   return (
     <div className="mt-1.5 rounded-lg border border-oai-gray-200 dark:border-oai-gray-700/60 bg-oai-gray-50/50 dark:bg-oai-gray-900/20 p-3 text-[11px] text-oai-gray-600 dark:text-oai-gray-300">
       <div className="text-[12px] font-semibold text-oai-gray-800 dark:text-oai-gray-100">{copy("limits.opencodeGo.setupHint.title")}</div>
@@ -1004,18 +1100,8 @@ function OpenCodeGoSetupHint() {
           <div>{copy("limits.opencodeGo.setupHint.step2")}</div>
         </HintStep>
         <HintStep n="3">
-          <div className="flex items-center gap-2">
-            <span>{copy("limits.opencodeGo.setupHint.step3")}</span>
-            <button
-              type="button"
-              onClick={onCopy}
-              className="shrink-0 rounded-md border border-oai-gray-300 dark:border-oai-gray-700 px-2 py-0.5 text-[10.5px] text-oai-gray-700 dark:text-oai-gray-200 hover:bg-oai-gray-100 dark:hover:bg-oai-gray-800 transition-colors"
-            >
-              {copied ? copy("limits.opencodeGo.setupHint.copied") : copy("limits.opencodeGo.setupHint.copy")}
-            </button>
-          </div>
-          <pre className="mt-1.5 overflow-x-auto rounded-md bg-oai-gray-100 dark:bg-oai-gray-900/60 px-2 py-1.5 font-mono text-[10.5px] leading-relaxed whitespace-pre">{snippet}</pre>
-          <div className="mt-1 text-[10px] text-oai-gray-400 dark:text-oai-gray-500">{copy("limits.opencodeGo.setupHint.note_app")}</div>
+          <div>{copy("limits.opencodeGo.setupHint.step3")}</div>
+          <ProviderKeyInput provider="opencode-go" onSaved={onSaved} />
         </HintStep>
       </ol>
     </div>
@@ -1023,36 +1109,15 @@ function OpenCodeGoSetupHint() {
 }
 
 // Command Code subscription usage comes from the CLI's own alpha endpoints,
-// authenticated exactly like the `cmd` CLI itself. Two supported logins: the
-// `cmd login` session the CLI stores in ~/.commandcode/auth.json (picked up
-// with no restart), or a COMMAND_CODE_API_KEY env var. TokenTracker never
-// exposes the credential to the dashboard; the local backend sends it only to
-// Command Code's API.
-function CommandCodeSetupHint() {
-  const [copied, setCopied] = useState(false);
+// authenticated exactly like the `cmd` CLI itself: the key entered here (or the
+// `cmd login` session the CLI stores in ~/.commandcode/auth.json). TokenTracker
+// never exposes the credential to the dashboard; the local backend sends it
+// only to Command Code's API.
+function CommandCodeSetupHint({ onSaved }) {
   // Command lines stay identical across locales; they are copy keys per the
   // repo i18n convention (review 594) so the setup guide and the reauth
   // tooltip share one source of truth for `cmd login`.
-  const platform = commandCodeSetupPlatform();
   const loginSnippet = commandCodeLoginSnippet();
-  const snippet = platform === "windows"
-    ? copy("limits.commandCode.setupHint.snippet_env_windows").replaceAll("\\n", "\n")
-    : [
-    copy("limits.commandCode.setupHint.snippet_read"),
-    copy("limits.commandCode.setupHint.snippet_export"),
-    ...(platform === "macos" ? [copy("limits.commandCode.setupHint.snippet_setenv")] : []),
-  ].join("\n");
-
-  const onCopy = async (e) => {
-    e.stopPropagation();
-    try {
-      await navigator.clipboard.writeText(snippet);
-      setCopied(true);
-      setTimeout(() => setCopied(false), 1600);
-    } catch (_e) {
-      // Clipboard can be unavailable in embedded or restricted contexts.
-    }
-  };
 
   return (
     <div className="mt-1.5 rounded-lg border border-oai-gray-200 dark:border-oai-gray-700/60 bg-oai-gray-50/50 dark:bg-oai-gray-900/20 p-3 text-[11px] text-oai-gray-600 dark:text-oai-gray-300">
@@ -1072,25 +1137,7 @@ function CommandCodeSetupHint() {
         </HintStep>
         <HintStep n="2">
           <div>{copy("limits.commandCode.setupHint.step2")}</div>
-          <div className="mt-1.5 flex items-center gap-2">
-            <button
-              type="button"
-              onClick={onCopy}
-              className="shrink-0 rounded-md border border-oai-gray-300 dark:border-oai-gray-700 px-2 py-0.5 text-[10.5px] text-oai-gray-700 dark:text-oai-gray-200 hover:bg-oai-gray-100 dark:hover:bg-oai-gray-800 transition-colors"
-            >
-              {copied
-                ? copy("limits.commandCode.setupHint.copied")
-                : copy("limits.commandCode.setupHint.copy")}
-            </button>
-          </div>
-          <pre className="mt-1.5 overflow-x-auto rounded-md bg-oai-gray-100 dark:bg-oai-gray-900/60 px-2 py-1.5 font-mono text-[10.5px] leading-relaxed whitespace-pre">
-            {snippet}
-          </pre>
-          <div className="mt-1 text-[10px] text-oai-gray-400 dark:text-oai-gray-500">
-            {platform === "windows" ? copy("limits.commandCode.setupHint.note_windows")
-              : platform === "linux" ? copy("limits.commandCode.setupHint.note_linux")
-                : copy("limits.commandCode.setupHint.note_app")}
-          </div>
+          <ProviderKeyInput provider="command-code" onSaved={onSaved} />
         </HintStep>
       </ol>
     </div>
@@ -1292,7 +1339,7 @@ function useWidestLabelWidth(containerRef) {
   return labelWidth;
 }
 
-export function UsageLimitsPanel({ claude, codex, cursor, gemini, kimi, kiro, grok, antigravity, copilot, zcode, opencodeGo, commandCode, qoder, qoderCn, codingPlan, agentPlan, devin, order, visibility, displayMode, subscriptions = [], showSubscriptions = true }) {
+export function UsageLimitsPanel({ claude, codex, cursor, gemini, kimi, kiro, grok, antigravity, copilot, zcode, opencodeGo, commandCode, qoder, qoderCn, codingPlan, agentPlan, devin, order, visibility, displayMode, subscriptions = [], showSubscriptions = true, onProviderKeySaved = null }) {
   const dataById = { claude, codex, cursor, gemini, kimi, kiro, grok, antigravity, copilot, zcode, opencodeGo, commandCode, qoder, qoderCn, codingPlan, agentPlan, devin };
   const containerRef = useRef(null);
   const labelWidth = useWidestLabelWidth(containerRef);
@@ -1354,6 +1401,7 @@ export function UsageLimitsPanel({ claude, codex, cursor, gemini, kimi, kiro, gr
         () => setExpandedId((prev) => (prev === id ? null : id)),
         subscriptionByProvider.get(id) || null,
         now,
+        onProviderKeySaved,
       );
     })
     .filter(Boolean);

@@ -2993,6 +2993,84 @@ function createLocalApiHandler({ queuePath, serverVersion = null, trackerDataDir
       return true;
     }
 
+    // --- provider API keys saved from the Limits panel ---
+    // The key lives in a 0600 file next to the queue, never in the launch
+    // environment: a global `launchctl setenv` reaches every launchd app on
+    // macOS, which is exactly the cross-app leak in #837. GET only reports
+    // whether a key exists and where it came from; it never echoes the secret.
+    if (p === "/functions/tokentracker-provider-key") {
+      const {
+        envNameForProvider,
+        isProviderId,
+        normalizeApiKey,
+        readStoredApiKey,
+        writeStoredApiKey,
+      } = require("./provider-api-key-store");
+      const method = String(req.method || "GET").toUpperCase();
+      if (method === "GET") {
+        const provider = String(url.searchParams.get("provider") || "").trim();
+        if (!isProviderId(provider)) {
+          json(res, { error: "Unknown provider" }, 400);
+          return true;
+        }
+        const envName = envNameForProvider(provider);
+        const envValue = envName ? process.env[envName] : "";
+        const hasEnvKey = typeof envValue === "string" && Boolean(envValue.trim());
+        const hasStoredKey = Boolean(readStoredApiKey({ provider, trackerDir: trackerDataDir }));
+        json(res, {
+          provider,
+          configured: hasEnvKey || hasStoredKey,
+          source: hasEnvKey ? "env" : hasStoredKey ? "stored" : "none",
+        });
+        return true;
+      }
+      if (method === "POST" || method === "PUT") {
+        if (!isAuthorizedLocalMutation(req)) {
+          json(res, { ok: false, error: "Unauthorized" }, 401);
+          return true;
+        }
+        let body;
+        try {
+          body = await readJsonBody(req);
+        } catch {
+          json(res, { ok: false, error: "Invalid JSON body" }, 400);
+          return true;
+        }
+        const provider = typeof body?.provider === "string" ? body.provider.trim() : "";
+        if (!isProviderId(provider)) {
+          json(res, { ok: false, error: "Unknown provider" }, 400);
+          return true;
+        }
+        if (!normalizeApiKey(body?.apiKey)) {
+          json(res, { ok: false, error: "Invalid API key" }, 400);
+          return true;
+        }
+        try {
+          await writeStoredApiKey({ provider, trackerDir: trackerDataDir, apiKey: body.apiKey });
+        } catch {
+          json(res, { ok: false, error: "Could not save the API key" }, 500);
+          return true;
+        }
+        // The in-memory aggregate would otherwise keep serving the previous
+        // credential's row (or "not configured") until its TTL expires.
+        try {
+          const { resetUsageLimitsCache, resolveOpencodeGoLimitsCachePath } = require("./usage-limits");
+          resetUsageLimitsCache({ invalidateInFlight: true });
+          if (provider === "opencode-go") {
+            // The disk snapshot is the stale-bars fallback; it must not
+            // outlive the key that produced it.
+            await fs.promises.unlink(resolveOpencodeGoLimitsCachePath({ trackerDir: trackerDataDir }));
+          }
+        } catch {
+          /* cache invalidation is best effort; the stored key is authoritative */
+        }
+        json(res, { ok: true, configured: true, source: "stored" });
+        return true;
+      }
+      json(res, { error: "Method Not Allowed" }, 405);
+      return true;
+    }
+
     // --- cloud-sync preference mirror ---
     // The dashboard's Settings → Account → Cloud sync toggle (a WebView
     // localStorage flag) is mirrored here so the auth-unaware native popover can
@@ -3563,6 +3641,7 @@ function createLocalApiHandler({ queuePath, serverVersion = null, trackerDataDir
         }
         const data = await getUsageLimits({
           home: os.homedir(),
+          trackerDir: trackerDataDir,
           env: process.env,
           platform: process.platform,
           // Punches through the Claude disk fresh-cache (but not the 429

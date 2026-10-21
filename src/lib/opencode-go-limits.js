@@ -2,8 +2,14 @@ const crypto = require("node:crypto");
 const fssync = require("node:fs");
 const path = require("node:path");
 const { readSqliteJsonRowsAsync } = require("./sqlite-reader");
+const { readStoredApiKey } = require("./provider-api-key-store");
 
 // OpenCode Go usage limits.
+//
+// The API key comes from OPENCODE_GO_API_KEY when set, otherwise from the key
+// saved in the Limits panel (provider-api-key-store.js). The stored key exists
+// so users never need a machine-wide `launchctl setenv`, which reaches every
+// launchd app on macOS and not just TokenTracker (#837).
 //
 // Three data sources are available, in priority order:
 //
@@ -732,13 +738,17 @@ async function scrapeOpencodeGoWeb({ cfg, fetchImpl, nowMs, timeoutMs }) {
 
 async function fetchOpencodeGoLimits({
   home,
+  trackerDir,
   env = process.env,
   fetchImpl = fetch,
   nowMs = Date.now(),
   timeoutMs = DEFAULT_REQUEST_TIMEOUT_MS,
   sqliteOptions = {},
 } = {}) {
-  const apiKey = readApiKey(env);
+  const envApiKey = readApiKey(env);
+  const apiKey =
+    envApiKey || readStoredApiKey({ provider: "opencode-go", trackerDir, home });
+  const credentialSource = envApiKey ? "env" : apiKey ? "stored" : null;
   const cfg = readConfig(env);
   const allowLocalEstimate = localEstimateEnabled(env);
 
@@ -748,13 +758,14 @@ async function fetchOpencodeGoLimits({
   // existing cookie remains a compatibility fallback.
   if (apiKey) {
     const api = await fetchOpencodeGoApiLimits({ apiKey, fetchImpl, nowMs, timeoutMs });
-    if (!api?.error && (api.primary_window || api.secondary_window || api.tertiary_window)) {
-      return { ...api, source: "api" };
+    const sourcedApi = credentialSource ? { ...api, credential_source: credentialSource } : api;
+    if (!sourcedApi?.error && (sourcedApi.primary_window || sourcedApi.secondary_window || sourcedApi.tertiary_window)) {
+      return { ...sourcedApi, source: "api" };
     }
-    if (api?.auth_error) {
-      return { ...api, source: "api" };
+    if (sourcedApi?.auth_error) {
+      return { ...sourcedApi, source: "api" };
     }
-    if (!cfg) return api || { configured: true, error: "OpenCode Go unavailable" };
+    if (!cfg) return sourcedApi || { configured: true, error: "OpenCode Go unavailable" };
   }
 
   // Keep the cookie-backed dashboard path for existing configurations and as a

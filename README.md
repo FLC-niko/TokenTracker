@@ -357,7 +357,7 @@ TokenTracker processes your usage data locally. It never collects or uploads pro
 | **No code or prompt collection** | TokenTracker parses local log files for token counts and timestamps. Prompts, completions, code, and conversation bodies are never saved or uploaded. |
 | **Local-first by default** | Usage tracking runs entirely on your machine. No account, login, or API keys required. Cloud sync and the public leaderboard are strictly opt-in. |
 | **Auditable** | Open source. Check [`src/lib/rollout.js`](src/lib/rollout.js) — only numbers, timestamps, and model names are extracted. |
-| **Transparent network activity** | Fully documented in the [Privacy Policy](docs/PRIVACY.md). Default requests are limited to direct provider quota checks (using credentials already on your machine), GitHub star counts, update checks, pricing data refreshes (`raw.githubusercontent.com`), and anonymous telemetry (daily heartbeat + PostHog pageviews, both disabled with `TOKENTRACKER_NO_TELEMETRY=1` or `DO_NOT_TRACK=1`). Telemetry never includes tokens, models, prompts, or code. |
+| **Transparent network activity** | Fully documented in the [Privacy Policy](docs/PRIVACY.md). Default requests are limited to direct provider quota checks (using credentials already on your machine), GitHub star counts, update checks, pricing data refreshes (`raw.githubusercontent.com`), and anonymous telemetry (daily heartbeat + PostHog pageviews, plus optional Sentry error reports when a DSN is configured — all disabled with `TOKENTRACKER_NO_TELEMETRY=1` or `DO_NOT_TRACK=1`). Telemetry never includes tokens, models, prompts, or code. |
 
 ---
 

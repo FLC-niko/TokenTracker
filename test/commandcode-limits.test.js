@@ -7,12 +7,14 @@ const path = require("node:path");
 const {
   fetchCommandcodeLimits,
   readCommandcodeApiKey,
+  readCommandcodeCredential,
   resolveCommandcodeAuthPath,
   resolveCommandcodeOrigin,
   deriveCommandcodePlanLabel,
   normalizeResetAt,
   normalizeCommandcodeWindowLimits,
 } = require("../src/lib/commandcode-limits");
+const { writeStoredApiKey } = require("../src/lib/provider-api-key-store");
 const {
   getUsageLimits,
   resetUsageLimitsCache,
@@ -117,6 +119,71 @@ describe("readCommandcodeApiKey", () => {
         "utf8",
       );
       assert.equal(readCommandcodeApiKey({ home, env: {} }), null);
+    } finally {
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  it("prefers a key saved in the Limits panel over the CLI auth file", async () => {
+    const { tmp, home } = makeAuthHome({ apiKey: "file-key-123" });
+    try {
+      await writeStoredApiKey({
+        provider: "command-code",
+        home,
+        apiKey: "stored-key-456",
+      });
+      assert.equal(readCommandcodeApiKey({ home, env: {} }), "stored-key-456");
+      assert.equal(
+        readCommandcodeCredential({ home, env: {} }).source,
+        "stored",
+      );
+    } finally {
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  it("reads the stored key from an explicit tracker directory", async () => {
+    const { tmp, home } = makeAuthHome({ apiKey: "file-key-123" });
+    const trackerDir = fs.mkdtempSync(path.join(os.tmpdir(), "tt-commandcode-tracker-"));
+    try {
+      await writeStoredApiKey({
+        provider: "command-code",
+        trackerDir,
+        apiKey: "tracker-key-456",
+      });
+      assert.equal(
+        readCommandcodeApiKey({ home, trackerDir, env: {} }),
+        "tracker-key-456",
+      );
+      assert.equal(
+        readCommandcodeCredential({ home, trackerDir, env: {} }).source,
+        "stored",
+      );
+    } finally {
+      fs.rmSync(tmp, { recursive: true, force: true });
+      fs.rmSync(trackerDir, { recursive: true, force: true });
+    }
+  });
+
+  it("keeps COMMAND_CODE_API_KEY above the panel store and reports sources", async () => {
+    const { tmp, home } = makeAuthHome({ apiKey: "file-key-123" });
+    try {
+      await writeStoredApiKey({
+        provider: "command-code",
+        home,
+        apiKey: "stored-key-456",
+      });
+      assert.deepEqual(
+        readCommandcodeCredential({
+          home,
+          env: { COMMAND_CODE_API_KEY: "env-key-789" },
+        }),
+        { apiKey: "env-key-789", source: "env" },
+      );
+      assert.equal(
+        readCommandcodeCredential({ home: null, env: {} }).source,
+        "none",
+      );
     } finally {
       fs.rmSync(tmp, { recursive: true, force: true });
     }
@@ -261,6 +328,7 @@ describe("fetchCommandcodeLimits", () => {
       });
       assert.equal(out.configured, true);
       assert.equal(out.error, null);
+      assert.equal(out.credential_source, "cli");
       assert.equal(out.plan_label, "Pro");
       assert.equal(out.subscription_status, "active");
       assert.equal(out.primary_window.used_percent, 50);

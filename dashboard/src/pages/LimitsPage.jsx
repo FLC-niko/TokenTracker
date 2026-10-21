@@ -323,6 +323,11 @@ export function LimitsPage() {
                 displayMode={prefs.displayMode}
                 subscriptions={subscriptions}
                 showSubscriptions={prefs.showSubscriptions !== false}
+                onProviderKeySaved={() => {
+                  // A freshly saved key must be used immediately; the hook's
+                  // forced refresh replaces the cached "not connected" row.
+                  void refresh();
+                }}
               />
             </>
           )}

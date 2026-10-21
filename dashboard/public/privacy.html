@@ -86,6 +86,12 @@
 <td>While the dashboard is open</td>
 </tr>
 <tr>
+<td><strong>Error reporting</strong></td>
+<td><code>*.ingest.sentry.io</code> (Sentry)</td>
+<td>Crash and exception events from the dashboard: stack traces, release, environment, and shell tag. <strong>Off unless a DSN is configured.</strong> Session Replay and performance tracing are off; common secret patterns are scrubbed and console breadcrumbs are dropped. Browser Do-Not-Track / Global Privacy Control is respected on the hosted site.</td>
+<td>On uncaught errors only</td>
+</tr>
+<tr>
 <td><strong>Provider quota reads</strong></td>
 <td>The provider's own API (<code>api.anthropic.com</code>, <code>chatgpt.com</code>, <code>cursor.com</code>, <code>api.github.com</code>, <code>api.kimi.com</code>, <code>api.z.ai</code>, <code>qoder.com</code>, <code>qoder.com.cn</code>, <code>openapi.qoder.sh</code>, <code>openapi.qoder.com.cn</code>, <code>cloudcode-pa.googleapis.com</code>, …)</td>
 <td>Whatever that provider's own endpoint requires, authenticated with the credentials <strong>that provider already stored on your machine</strong>. These requests go directly from your machine to the provider — they never pass through our servers, and we never see the response.</td>
@@ -117,11 +123,11 @@
 </tr>
 </tbody>
 </table>
-<p>Both telemetry items are disabled together by a single switch:</p>
+<p>Heartbeat, dashboard analytics, and Sentry error reporting are disabled together by a single switch:</p>
 <pre><code class="language-bash">export TOKENTRACKER_NO_TELEMETRY=1     # or DO_NOT_TRACK=1
 </code></pre>
 <p>You can also set <code>"telemetry": false</code> in <code>~/.tokentracker/tracker/config.json</code>. On localhost and inside the desktop apps, the dashboard asks the local server for this preference before initialising analytics — and if the answer cannot be confirmed, analytics stays <strong>off</strong> (fail-closed).</p>
-<p>Audit: <a href="https://github.com/xiufengsun/TokenTracker/blob/main/src/lib/telemetry.js"><code>src/lib/telemetry.js</code></a>, <a href="https://github.com/xiufengsun/TokenTracker/blob/main/dashboard/src/lib/analytics.js"><code>dashboard/src/lib/analytics.js</code></a>, <a href="https://github.com/xiufengsun/TokenTracker/blob/main/src/lib/pricing/litellm-fetcher.js"><code>src/lib/pricing/litellm-fetcher.js</code></a>.</p>
+<p>Audit: <a href="https://github.com/xiufengsun/TokenTracker/blob/main/src/lib/telemetry.js"><code>src/lib/telemetry.js</code></a>, <a href="https://github.com/xiufengsun/TokenTracker/blob/main/dashboard/src/lib/analytics.js"><code>dashboard/src/lib/analytics.js</code></a>, <a href="https://github.com/xiufengsun/TokenTracker/blob/main/src/lib/sentry.js"><code>src/lib/sentry.js</code></a>, <a href="https://github.com/xiufengsun/TokenTracker/blob/main/dashboard/src/lib/sentry.js"><code>dashboard/src/lib/sentry.js</code></a>, <a href="https://github.com/xiufengsun/TokenTracker/blob/main/src/lib/pricing/litellm-fetcher.js"><code>src/lib/pricing/litellm-fetcher.js</code></a>.</p>
 <h3>3.2 Only after you opt in or click something</h3>
 <table>
 <thead>

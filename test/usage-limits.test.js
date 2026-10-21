@@ -5849,3 +5849,178 @@ describe("cacheExpiresAtMs", () => {
     assert.equal(cacheExpiresAtMs(data, fetchedAt), fetchedAt + MIN_TTL_MS);
   });
 });
+
+describe("OpenCode Go limits cache credential provenance", () => {
+  afterEach(() => {
+    resetUsageLimitsCache();
+  });
+
+  it("persists env provenance and restores it from the stale fallback", async () => {
+    resetUsageLimitsCache();
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "tokentracker-opencode-cache-"));
+    const trackerDir = path.join(tmp, ".tokentracker", "tracker");
+    fs.mkdirSync(trackerDir, { recursive: true });
+    const baseOptions = {
+      home: tmp,
+      trackerDir,
+      env: { OPENCODE_GO_API_KEY: "env-key-123456" },
+      platform: "linux",
+      providerTimeoutMs: 1000,
+      securityRunner() {
+        return { status: 1, stdout: "" };
+      },
+      commandRunner() {
+        return { status: 1, stdout: "" };
+      },
+    };
+    try {
+      const live = await getUsageLimits({
+        ...baseOptions,
+        fetchImpl: async () => ({
+          ok: true,
+          status: 200,
+          async json() {
+            return {};
+          },
+          async text() {
+            return JSON.stringify({
+              useBalance: false,
+              rollingUsage: { status: "ok", usagePercent: 42, resetInSec: 12345 },
+              weeklyUsage: { status: "ok", usagePercent: 18, resetInSec: 678901 },
+              monthlyUsage: { status: "ok", usagePercent: 7, resetInSec: 2592000 },
+            });
+          },
+        }),
+      });
+      assert.equal(live.opencodeGo.credential_source, "env");
+      assert.equal(live.opencodeGo.stale, false);
+
+      const cache = JSON.parse(
+        fs.readFileSync(
+          path.join(trackerDir, "opencode-go-usage-limits-cache.json"),
+          "utf8",
+        ),
+      );
+      assert.equal(cache.opencodeGo.credential_source, "env");
+
+      resetUsageLimitsCache();
+      const stale = await getUsageLimits({
+        ...baseOptions,
+        fetchImpl: async () => ({
+          ok: false,
+          status: 500,
+          async json() {
+            return {};
+          },
+          async text() {
+            return "upstream unavailable";
+          },
+        }),
+      });
+      assert.equal(stale.opencodeGo.stale, true);
+      assert.equal(stale.opencodeGo.credential_source, "env");
+      assert.equal(stale.opencodeGo.primary_window?.used_percent, 42);
+    } finally {
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  it("does not let an old in-flight fetch repopulate caches after key replacement", async () => {
+    resetUsageLimitsCache();
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "tokentracker-opencode-inflight-"));
+    const trackerDir = path.join(tmp, ".tokentracker", "tracker");
+    fs.mkdirSync(trackerDir, { recursive: true });
+    const options = {
+      home: tmp,
+      trackerDir,
+      env: { OPENCODE_GO_API_KEY: "env-key-123456" },
+      platform: "linux",
+      // No aggregate/provider timeout: the old fetch must stay pending until
+      // releaseFirst(), not race a timeout and settle early.
+      providerTimeoutMs: 0,
+      securityRunner() {
+        return { status: 1, stdout: "" };
+      },
+      commandRunner() {
+        return { status: 1, stdout: "" };
+      },
+    };
+    const usageResponse = (percent) => ({
+      ok: true,
+      status: 200,
+      async json() {
+        return {};
+      },
+      async text() {
+        return JSON.stringify({
+          useBalance: false,
+          rollingUsage: { status: "ok", usagePercent: percent, resetInSec: 12345 },
+          weeklyUsage: { status: "ok", usagePercent: 18, resetInSec: 678901 },
+          monthlyUsage: { status: "ok", usagePercent: 7, resetInSec: 2592000 },
+        });
+      },
+    });
+    const opencodeUsageUrl = "https://opencode.ai/zen/go/v1/usage";
+    let opencodeFetchCalls = 0;
+    let releaseFirst;
+    let markFirstStarted;
+    const firstStarted = new Promise((resolve) => {
+      markFirstStarted = resolve;
+    });
+    const firstGate = new Promise((resolve) => {
+      releaseFirst = () => resolve(usageResponse(42));
+    });
+    const fetchImpl = (url) => {
+      if (url !== opencodeUsageUrl) {
+        return Promise.resolve({
+          ok: false,
+          status: 500,
+          async json() {
+            return {};
+          },
+          async text() {
+            return "unexpected provider request";
+          },
+        });
+      }
+      opencodeFetchCalls += 1;
+      if (opencodeFetchCalls === 1) {
+        markFirstStarted();
+        return firstGate;
+      }
+      return Promise.resolve(usageResponse(7));
+    };
+    try {
+      const firstPromise = getUsageLimits({ ...options, fetchImpl });
+      await firstStarted;
+      resetUsageLimitsCache({ invalidateInFlight: true });
+      const fresh = await getUsageLimits({ ...options, fetchImpl });
+      assert.equal(fresh.opencodeGo.primary_window?.used_percent, 7);
+      const firstSettled = await Promise.race([
+        firstPromise.then(
+          () => true,
+          () => true,
+        ),
+        // Give an early settlement a later turn to be observed, so the
+        // false branch cannot win by draining first.
+        new Promise((resolve) => setTimeout(() => resolve(false), 0)),
+      ]);
+      assert.equal(firstSettled, false, "the old fetch must still be pending");
+
+      releaseFirst();
+      await firstPromise;
+
+      const after = await getUsageLimits({ ...options, fetchImpl });
+      assert.equal(after.opencodeGo.primary_window?.used_percent, 7);
+      const disk = JSON.parse(
+        fs.readFileSync(
+          path.join(trackerDir, "opencode-go-usage-limits-cache.json"),
+          "utf8",
+        ),
+      );
+      assert.equal(disk.opencodeGo.primary_window?.used_percent, 7);
+    } finally {
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+});

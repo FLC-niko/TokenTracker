@@ -8,7 +8,7 @@ const { transformSync } = require("esbuild");
 const root = path.join(__dirname, "..");
 const readEdge = (name) => fs.readFileSync(path.join(root, "dashboard/edge-patches", `tokentracker-${name}.ts`), "utf8");
 
-function loadEdge(name, client = {}, extra = "") {
+function loadEdge(name, client = {}, extra = "", env = {}) {
   let source = readEdge(name).replace(/import \{ createClient \} from "npm:@insforge\/sdk";/, "const createClient = () => globalThis.client;") + extra;
   const access = fs.readFileSync(path.join(root, "dashboard/edge-patches/cloud/access.ts"), "utf8")
     .replace(/^import type .*;$/m, "").replaceAll("export ", "");
@@ -17,7 +17,7 @@ function loadEdge(name, client = {}, extra = "") {
     fs.readFileSync(path.join(root, "dashboard/edge-patches/cloud/pro.ts"), "utf8").replaceAll("export ", ""));
   const context = { module: { exports: {} }, client, console, Request, Response, Headers, URL, TextEncoder,
     crypto: require("node:crypto").webcrypto, atob, btoa,
-    Deno: { env: { get: (key) => ({ INSFORGE_BASE_URL: "https://test.invalid", INSFORGE_SERVICE_ROLE_KEY: "test" })[key] } } };
+    Deno: { env: { get: (key) => ({ INSFORGE_BASE_URL: "https://test.invalid", INSFORGE_SERVICE_ROLE_KEY: "test", TOKENTRACKER_ACCOUNTING_V3_READY: "1", ...env })[key] } } };
   vm.runInNewContext(transformSync(source, { loader: "ts", format: "cjs" }).code, context);
   return context.module.exports;
 }
@@ -131,6 +131,38 @@ test("ingestion fails closed for an old or unavailable database, including clien
   assert.equal(response.status, 503);
   assert.equal(writes, 0);
 });
+
+for (const ready of [undefined, "0", "true"]) {
+  test(`migration alone cannot enable v3; gate=${String(ready)} preserves complete uploads and rejects partial admission`, async () => {
+    let writes = 0, probes = 0;
+    const client = { database: {
+      rpc: async (name, args) => {
+        if (name === "tokentracker_accounting_capabilities") {
+          probes++;
+          return { data: { accounting_version: 3, unclassified_input_tokens: true } };
+        }
+        assert.equal(name, "cloud_ingest_usage");
+        writes++;
+        assert.equal(args.p_rows[0].unclassified_input_tokens, 0);
+        return { data: { ok: true, inserted: 1 } };
+      },
+      from: () => {
+        const q = { select: () => q, eq: () => q, is: () => q, maybeSingle: async () => ({ data: { user_id: "u", device_id: "d" } }) };
+        return q;
+      },
+    } };
+    const api = loadEdge("ingest", client, "", { TOKENTRACKER_ACCOUNTING_V3_READY: ready });
+    const caps = await api.default(new Request("https://test/?capabilities=1"));
+    assert.deepEqual(await caps.json(), { accounting_version: 2, unclassified_input_tokens: false });
+    const send = rows => api.default(new Request("https://test/", { method: "POST", headers: { Authorization: "Bearer test" }, body: JSON.stringify({ hourly: rows }) }));
+    assert.equal((await send([complete])).status, 200);
+    assert.equal(writes, 1, "normal complete traffic still reaches the real transaction boundary");
+    assert.equal((await send([partial])).status, 503);
+    assert.equal((await send([complete, { ...partial, model: "other-model" }])).status, 503);
+    assert.equal(writes, 1, "a mixed batch must never partially commit without an acknowledgement contract");
+    assert.equal(probes, 0, "the disabled gate does not mistake a migrated schema for deployed consumers");
+  });
+}
 
 test("device identity refresh carries disjoint input through hourly-row convergence", () => {
   const sql = fs.readFileSync(

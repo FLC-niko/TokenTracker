@@ -1,6 +1,6 @@
 # Privacy Policy
 
-_Last updated: 2026-10-04 · Applies to the `tokentracker-cli` npm package, the macOS app, the Windows app, the Linux app, and [www.tokentracker.cc](https://www.tokentracker.cc)._
+_Last updated: 2026-10-20 · Applies to the `tokentracker-cli` npm package, the macOS app, the Windows app, the Linux app, and [www.tokentracker.cc](https://www.tokentracker.cc)._
 
 TokenTracker reads the local logs that AI coding tools already write to your disk, and turns them into token counts and cost estimates. It is local-first: the dashboard, the parsers and the database all run on your machine.
 
@@ -55,13 +55,14 @@ To erase everything TokenTracker knows about you, delete that directory. `tokent
 |---|---|---|---|
 | **Anonymous heartbeat** | `srctyff5.us-east.insforge.app` | A one-way hash of the machine id, plus the app version, OS platform, and app shell (`cli` / `macos` / `windows` / `linux`) as separate plain fields. Nothing else. | At most once per day |
 | **Dashboard analytics** | `us.i.posthog.com` (PostHog) | Pageviews and explicitly instrumented feature events, plus which shell you use. Autocapture and session recording are **off**; browser Do-Not-Track is respected. | While the dashboard is open |
+| **Error reporting** | `*.ingest.sentry.io` (Sentry) | Crash/exception events from the dashboard and (when enabled) the Node CLI/EmbeddedServer: stack traces, release, environment, and shell tag. **Off unless a DSN is configured.** Session Replay and performance tracing are off. Common secret patterns (tokens, Authorization headers, JWTs) are scrubbed before send; console breadcrumbs are dropped. On the hosted dashboard, browser Do-Not-Track / Global Privacy Control is respected (same idea as PostHog). | On uncaught errors only |
 | **Provider quota reads** | The provider's own API (`api.anthropic.com`, `chatgpt.com`, `cursor.com`, `api.github.com`, `api.kimi.com`, `api.z.ai`, `qoder.com`, `qoder.com.cn`, `openapi.qoder.sh`, `openapi.qoder.com.cn`, `cloudcode-pa.googleapis.com`, …) | Whatever that provider's own endpoint requires, authenticated with the credentials **that provider already stored on your machine**. These requests go directly from your machine to the provider — they never pass through our servers, and we never see the response. | While quota bars are visible |
 | **TRAE Work CN usage read** | TRAE's internal API | Transmits the existing sign-in authorization from the locally signed-in TRAE Work CN app to TRAE; reads usage metadata only. TokenTracker never persists or logs the auth token or prompt/response content. | Off unless you set `TOKENTRACKER_TRAE_CN_USAGE=1`; then during eligible non-background sync when local TRAE Work CN auth exists |
 | **GitHub star count** | `api.github.com` | Nothing but the request itself (public repo metadata) | On dashboard load |
 | **Update check** | `api.github.com` | Nothing but the request itself | Windows: once at launch. macOS: only when you click "Check for Updates" |
 | **Pricing data refresh** | `raw.githubusercontent.com` | Nothing but the request itself (public model pricing JSON from BerriAI/litellm) | At most once every 24 hours when the local pricing cache is missing or stale |
 
-Both telemetry items are disabled together by a single switch:
+Heartbeat, dashboard analytics, and Sentry error reporting are disabled together by a single switch:
 
 ```bash
 export TOKENTRACKER_NO_TELEMETRY=1     # or DO_NOT_TRACK=1
@@ -69,7 +70,7 @@ export TOKENTRACKER_NO_TELEMETRY=1     # or DO_NOT_TRACK=1
 
 You can also set `"telemetry": false` in `~/.tokentracker/tracker/config.json`. On localhost and inside the desktop apps, the dashboard asks the local server for this preference before initialising analytics — and if the answer cannot be confirmed, analytics stays **off** (fail-closed).
 
-Audit: [`src/lib/telemetry.js`](../src/lib/telemetry.js), [`dashboard/src/lib/analytics.js`](../dashboard/src/lib/analytics.js), [`src/lib/pricing/litellm-fetcher.js`](../src/lib/pricing/litellm-fetcher.js).
+Audit: [`src/lib/telemetry.js`](../src/lib/telemetry.js), [`dashboard/src/lib/analytics.js`](../dashboard/src/lib/analytics.js), [`src/lib/sentry.js`](../src/lib/sentry.js), [`dashboard/src/lib/sentry.js`](../dashboard/src/lib/sentry.js), [`src/lib/pricing/litellm-fetcher.js`](../src/lib/pricing/litellm-fetcher.js).
 
 ### 3.2 Only after you opt in or click something
 

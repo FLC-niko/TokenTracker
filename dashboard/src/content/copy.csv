@@ -1278,10 +1278,16 @@ limits.opencodeGo.setupHint.subtitle,ui,LimitsPage,UsageLimitsPanel,opencode_go_
 limits.opencodeGo.setupHint.step1,ui,LimitsPage,UsageLimitsPanel,opencode_go_hint_step1,"Sign in at opencode.ai and subscribe to Go.",,active
 limits.opencodeGo.setupHint.cta,ui,LimitsPage,UsageLimitsPanel,opencode_go_hint_cta,"Open opencode.ai",,active
 limits.opencodeGo.setupHint.step2,ui,LimitsPage,UsageLimitsPanel,opencode_go_hint_step2,"Create and copy an API key in the console.",,active
-limits.opencodeGo.setupHint.step3,ui,LimitsPage,UsageLimitsPanel,opencode_go_hint_step3,"Run this command, paste your API key (input stays invisible), then restart TokenTracker:",,active
-limits.opencodeGo.setupHint.note_app,ui,LimitsPage,UsageLimitsPanel,opencode_go_hint_note_app,"macOS app: use the launchctl setenv line, then reopen the app.",,active
-limits.opencodeGo.setupHint.copy,ui,LimitsPage,UsageLimitsPanel,opencode_go_hint_copy,"Copy",,active
-limits.opencodeGo.setupHint.copied,ui,LimitsPage,UsageLimitsPanel,opencode_go_hint_copied,"Copied",,active
+limits.opencodeGo.setupHint.step3,ui,LimitsPage,UsageLimitsPanel,opencode_go_hint_step3,"Paste your API key below. TokenTracker stores it on this device and uses it only to read your Go usage.",,active
+limits.apiKey.placeholder,ui,LimitsPage,UsageLimitsPanel,api_key_placeholder,"Paste API key",,active
+limits.apiKey.save,ui,LimitsPage,UsageLimitsPanel,api_key_save,"Save key",,active
+limits.apiKey.saving,ui,LimitsPage,UsageLimitsPanel,api_key_saving,"Saving...",,active
+limits.apiKey.saved,ui,LimitsPage,UsageLimitsPanel,api_key_saved,"Saved",,active
+limits.apiKey.save_failed,ui,LimitsPage,UsageLimitsPanel,api_key_save_failed,"Could not save the key. Check the key and try again.",,active
+limits.apiKey.local_note,ui,LimitsPage,UsageLimitsPanel,api_key_local_note,"Stored only on this device (owner-only permissions). TokenTracker sends it only to the provider's usage API.",,active
+limits.apiKey.env_note,ui,LimitsPage,UsageLimitsPanel,api_key_env_note,"Using {{env}} from the environment. Save a key here so you can stop exporting it globally.",,active
+limits.apiKey.env_unset_command,ui,LimitsPage,UsageLimitsPanel,api_key_env_unset_command,"launchctl unsetenv {{env}}",,active
+limits.apiKey.env_unset_note,ui,LimitsPage,UsageLimitsPanel,api_key_env_unset_note,"Then reopen TokenTracker.",,active
 settings.menubar.updates.checking,ui,SettingsPage,NativeAppFooter,updates_checking,"Checking...","正在检测...",active
 settings.menubar.updates.upToDate,ui,SettingsPage,NativeAppFooter,updates_uptodate,"You are up to date!","已是最新版本",active
 settings.menubar.updates.failed,ui,SettingsPage,NativeAppFooter,updates_failed,"Failed to check for updates. Please try again.","检查更新失败，请重试",active
@@ -1629,18 +1635,9 @@ limits.label.command_code_weekly,ui,LimitsPage,UsageLimitsPanel,command_code_wee
 limits.commandCode.setupHint.title,ui,LimitsPage,UsageLimitsPanel,command_code_hint_title,"Connect Command Code",,active
 limits.commandCode.setupHint.subtitle,ui,LimitsPage,UsageLimitsPanel,command_code_hint_subtitle,"Reads your subscription usage from the official Command Code API with the same login as the cmd CLI.",,active
 limits.commandCode.setupHint.step1,ui,LimitsPage,UsageLimitsPanel,command_code_hint_step1,"Option 1 — sign in with the Command Code CLI (recommended): run the login command below. TokenTracker reuses that login with no restart.",,active
-limits.commandCode.setupHint.step2,ui,LimitsPage,UsageLimitsPanel,command_code_hint_step2,"Option 2 — use an API key instead: run this command, paste your key (input stays invisible), then restart TokenTracker:",,active
-limits.commandCode.setupHint.copy,ui,LimitsPage,UsageLimitsPanel,command_code_hint_copy,"Copy",,active
-limits.commandCode.setupHint.copied,ui,LimitsPage,UsageLimitsPanel,command_code_hint_copied,"Copied",,active
-limits.commandCode.setupHint.note_app,ui,LimitsPage,UsageLimitsPanel,command_code_hint_note_app,"macOS app: use the launchctl setenv line, then reopen the app.",,active
+limits.commandCode.setupHint.step2,ui,LimitsPage,UsageLimitsPanel,command_code_hint_step2,"Or save an API key here — TokenTracker uses it only for usage requests.",,active
 limits.commandCode.setupHint.snippet_login,ui,LimitsPage,UsageLimitsPanel,command_code_hint_snippet_login,"cmd login",,active
-limits.commandCode.setupHint.snippet_read,ui,LimitsPage,UsageLimitsPanel,command_code_hint_snippet_read,"read -r -s COMMAND_CODE_API_KEY",,active
-limits.commandCode.setupHint.snippet_export,ui,LimitsPage,UsageLimitsPanel,command_code_hint_snippet_export,"export COMMAND_CODE_API_KEY",,active
-limits.commandCode.setupHint.snippet_setenv,ui,LimitsPage,UsageLimitsPanel,command_code_hint_snippet_setenv,"launchctl setenv COMMAND_CODE_API_KEY ""$COMMAND_CODE_API_KEY""",,active
 limits.commandCode.setupHint.snippet_login_windows,ui,LimitsPage,UsageLimitsPanel,command_code_hint_snippet_login_windows,"cmdc auth login",,active
-limits.commandCode.setupHint.snippet_env_windows,ui,LimitsPage,UsageLimitsPanel,command_code_hint_snippet_env_windows,"$token = Read-Host -AsSecureString\n$env:COMMAND_CODE_API_KEY = [System.Net.NetworkCredential]::new('', $token).Password\n[Environment]::SetEnvironmentVariable('COMMAND_CODE_API_KEY', $env:COMMAND_CODE_API_KEY, 'User')",,active
-limits.commandCode.setupHint.note_windows,ui,LimitsPage,UsageLimitsPanel,command_code_hint_note_windows,"Windows: run in PowerShell, then restart TokenTracker.",,active
-limits.commandCode.setupHint.note_linux,ui,LimitsPage,UsageLimitsPanel,command_code_hint_note_linux,"Linux: start TokenTracker from this terminal to inherit the environment variable.",,active
 landing.discovery.tracked_usage,landing,LandingPage,index.html,tracked_usage,"Token Tracker tracks input, output, cached, and cache-creation tokens per model, project, and time window. It also detects usage limits for 17 providers, including Claude, Codex, Cursor, Gemini, Antigravity, Qoder, Qoder CN, Command Code, and Devin.",Build-time static discovery copy,active
 landing.discovery.limits_summary,landing,LandingPage,index.html,limits_summary,"live quota and subscription status for 17 providers, with last-good caching for local providers such as Antigravity and Qoder.",Build-time static discovery copy,active
 landing.discovery.faq_usage,landing,LandingPage,index.html,faq_usage,"Input, output, cached, and cache-creation tokens per model, project, and time window. It also surfaces usage limits for 17 providers, including Claude, Codex, Cursor, Gemini, Antigravity, Qoder, Qoder CN, Command Code, and Devin.",Build-time static discovery copy,active

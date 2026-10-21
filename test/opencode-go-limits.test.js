@@ -616,3 +616,108 @@ describe("parseWorkspaceIds", () => {
     assert.deepEqual(parseWorkspaceIds('[{"id":"wrk_dup"},{"id":"wrk_dup"}]'), ["wrk_dup"]);
   });
 });
+
+describe("stored API key", () => {
+  const fs = require("node:fs");
+  const os = require("node:os");
+  const path = require("node:path");
+  const { writeStoredApiKey } = require("../src/lib/provider-api-key-store");
+
+  function makeHome() {
+    return fs.mkdtempSync(path.join(os.tmpdir(), "tt-opencode-go-store-"));
+  }
+
+  function jsonResponse(status, body) {
+    return {
+      status,
+      ok: status >= 200 && status < 300,
+      async text() {
+        return typeof body === "string" ? body : JSON.stringify(body);
+      },
+    };
+  }
+
+  it("uses the key saved in the Limits panel when the env var is absent", async () => {
+    const home = makeHome();
+    try {
+      await writeStoredApiKey({ provider: "opencode-go", home, apiKey: "stored-key-12345" });
+      let authHeader = null;
+      const out = await fetchOpencodeGoLimits({
+        home,
+        env: {},
+        fetchImpl: async (_url, init) => {
+          authHeader = init?.headers?.Authorization;
+          return jsonResponse(200, apiUsagePayload());
+        },
+        nowMs: 1_700_000_000_000,
+      });
+
+      assert.equal(authHeader, "Bearer stored-key-12345");
+      assert.equal(out.source, "api");
+      assert.equal(out.credential_source, "stored");
+      assert.equal(out.primary_window?.used_percent, 42);
+    } finally {
+      fs.rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  it("reads the stored key from an explicit tracker directory", async () => {
+    const home = makeHome();
+    const trackerDir = fs.mkdtempSync(path.join(os.tmpdir(), "tt-opencode-go-tracker-"));
+    try {
+      await writeStoredApiKey({ provider: "opencode-go", trackerDir, apiKey: "tracker-key-12345" });
+      let authHeader = null;
+      const out = await fetchOpencodeGoLimits({
+        home,
+        trackerDir,
+        env: {},
+        fetchImpl: async (_url, init) => {
+          authHeader = init?.headers?.Authorization;
+          return jsonResponse(200, apiUsagePayload());
+        },
+        nowMs: 1_700_000_000_000,
+      });
+
+      assert.equal(authHeader, "Bearer tracker-key-12345");
+      assert.equal(out.credential_source, "stored");
+    } finally {
+      fs.rmSync(home, { recursive: true, force: true });
+      fs.rmSync(trackerDir, { recursive: true, force: true });
+    }
+  });
+
+  it("prefers OPENCODE_GO_API_KEY over the stored key", async () => {
+    const home = makeHome();
+    try {
+      await writeStoredApiKey({ provider: "opencode-go", home, apiKey: "stored-key-12345" });
+      let authHeader = null;
+      const out = await fetchOpencodeGoLimits({
+        home,
+        env: { OPENCODE_GO_API_KEY: "env-key-123456" },
+        fetchImpl: async (_url, init) => {
+          authHeader = init?.headers?.Authorization;
+          return jsonResponse(200, apiUsagePayload());
+        },
+        nowMs: 1_700_000_000_000,
+      });
+
+      assert.equal(authHeader, "Bearer env-key-123456");
+      assert.equal(out.credential_source, "env");
+    } finally {
+      fs.rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  it("never reads the developer's real store when no home is provided", async () => {
+    let fetched = false;
+    const out = await fetchOpencodeGoLimits({
+      env: {},
+      fetchImpl: async () => {
+        fetched = true;
+        return jsonResponse(200, apiUsagePayload());
+      },
+    });
+    assert.equal(fetched, false);
+    assert.deepEqual(out, { configured: false });
+  });
+});
