@@ -204,6 +204,18 @@ const {
   scanRootDirState,
 } = require("../lib/scan-roots");
 const { resolveRuntimeConfig, isLegacyInsforgeBaseUrl } = require("../lib/runtime-config");
+const { resolveDeviceTokenPresence } = require("../lib/cloud-device-token");
+
+function formatSyncUploadSummaryLine({ runtimeDeviceToken, uploadResult, tokenPresentOnDisk }) {
+  if (runtimeDeviceToken) {
+    return `- Uploaded: ${uploadResult.inserted} inserted, ${uploadResult.skipped} skipped`;
+  }
+  if (tokenPresentOnDisk) {
+    return "- Uploaded: skipped (handled by local server; device token is set)";
+  }
+  return "- Uploaded: skipped (no device token)";
+}
+
 const { extractTokenCount } = require("../lib/codex-rollout-parser");
 const {
   consumeUsageDelta,
@@ -3808,9 +3820,11 @@ async function cmdSync(argv, context = {}) {
           "Sync finished:",
           `- Parsed files: ${totalParsed}`,
           `- New 30-min buckets queued: ${totalBuckets}`,
-          runtime.deviceToken
-            ? `- Uploaded: ${uploadResult.inserted} inserted, ${uploadResult.skipped} skipped`
-            : "- Uploaded: skipped (no device token)",
+          formatSyncUploadSummaryLine({
+            runtimeDeviceToken: runtime.deviceToken,
+            uploadResult,
+            tokenPresentOnDisk: resolveDeviceTokenPresence({ trackerDir, config, runtime }).set,
+          }),
           runtime.deviceToken && pendingBytes > 0 && !opts.drain
             ? `- Remaining: ${formatBytes(pendingBytes)} pending (run sync again, or use --drain)`
             : null,
@@ -3945,6 +3959,7 @@ function recordCodexColdScanAudit(
 }
 
 module.exports = {
+  formatSyncUploadSummaryLine,
   cmdSync,
   acquireSyncLock,
   readQueueBatch,

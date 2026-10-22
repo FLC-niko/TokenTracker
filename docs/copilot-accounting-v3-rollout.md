@@ -8,7 +8,7 @@ subtotal in `known_cost_usd`. A discovery-only split would not fix visible
 usage totals; putting these counts into uncached input would invent billing.
 
 This PR retains full accounting pending the maintainer's scope/contract decision.
-It is integrated with upstream `4cb82c70` (v1.4.7), which lacks this session
+It is integrated with upstream `d3946d4a` (including v1.4.8), which lacks this session
 reader. Private OpenCode adapters are excluded. No production deployment,
 activation, client installation, version bump or release has been performed.
 CI green is not product approval; assign deployment and rollback owners first.

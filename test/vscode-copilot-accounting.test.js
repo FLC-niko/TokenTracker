@@ -3,7 +3,7 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs/promises');
 const os = require('node:os');
 const path = require('node:path');
-const { parseVsCodeCopilotChatIncremental } = require('../src/lib/rollout');
+const { parseVsCodeCopilotChatIncremental, parseRolloutIncremental } = require('../src/lib/rollout');
 const { createLocalApiHandler } = require('../src/lib/local-api');
 const { computeRowCost, computeKnownRowCost } = require('../src/lib/pricing');
 
@@ -15,6 +15,51 @@ async function request(handler, endpoint) {
   assert.equal(await handler({ method: 'GET', headers: {host: 'localhost'}, url: url.pathname + url.search }, res, url), true);
   return JSON.parse(body);
 }
+
+test('shared cursors retain Fast/Ultrafast premiums alongside unknown Copilot input across repeated scans', async (t) => {
+  const tmp = await fs.mkdtemp(path.join(os.tmpdir(), 'tt-copilot-speed-tiers-'));
+  t.mock.method(os, 'homedir', () => tmp);
+  try {
+    const queuePath = path.join(tmp, 'queue.jsonl');
+    const cursors = {};
+    const rolloutFiles = [];
+    for (const tier of ['priority', 'ultrafast']) {
+      const file = path.join(tmp, `${tier}.jsonl`);
+      const usage = { input_tokens: 100, cached_input_tokens: 40, output_tokens: 10,
+        reasoning_output_tokens: 0, total_tokens: 110 };
+      await fs.writeFile(file, [
+        { type: 'session_meta', timestamp: '2026-09-01T10:00:00Z', payload: { id: tier, cwd: tmp, model: 'gpt-6.1-sol' } },
+        { type: 'event_msg', timestamp: '2026-09-01T10:00:01Z', payload: { type: 'thread_settings_applied',
+          thread_settings: { model: 'gpt-6.1-sol', service_tier: tier } } },
+        { type: 'event_msg', timestamp: '2026-09-01T10:00:02Z', payload: { type: 'token_count',
+          info: { total_token_usage: usage, last_token_usage: usage } } },
+      ].map(value => JSON.stringify(value)).join('\n') + '\n');
+      rolloutFiles.push(file);
+    }
+    await parseRolloutIncremental({ rolloutFiles, cursors, queuePath });
+    const codex = (await fs.readFile(queuePath, 'utf8')).trim().split('\n').map(JSON.parse).at(-1);
+    assert.equal(codex.priority_input_tokens, 60);
+    assert.equal(codex.ultrafast_input_tokens, 60);
+    const standard = computeRowCost({ ...codex, priority_input_tokens: 0, priority_cached_input_tokens: 0,
+      priority_output_tokens: 0, ultrafast_input_tokens: 0, ultrafast_cached_input_tokens: 0, ultrafast_output_tokens: 0 });
+    assert.ok(Math.abs(computeRowCost(codex) - standard * 4) < 1e-9, 'two equal requests cost 2x + 6x their individual base');
+    const sessionPath = path.join(tmp, 'copilot.json');
+    await fs.writeFile(sessionPath, JSON.stringify({ requests: [{ requestId: 'unknown',
+      modelId: 'customendpoint/vendor/gpt-6.1-sol', timestamp: Date.parse('2026-09-01T10:15:00Z'),
+      promptTokens: 1000, completionTokens: 100 }] }));
+    await parseVsCodeCopilotChatIncremental({ sessionPaths: [sessionPath], cursors, queuePath });
+    const copilot = JSON.parse((await fs.readFile(queuePath, 'utf8')).trim().split('\n').at(-1));
+    const summary = await request(createLocalApiHandler({ queuePath }), 'usage-summary');
+    assert.equal(summary.totals.total_tokens, 1320);
+    assert.equal(summary.totals.unclassified_input_tokens, 1000);
+    assert.equal(summary.totals.total_cost_usd, null);
+    assert.equal(summary.totals.cost_status, 'partial');
+    assert.ok(Math.abs(Number(summary.totals.known_cost_usd) - computeRowCost(codex) - computeKnownRowCost(copilot)) < 1e-9);
+    const restored = JSON.parse(JSON.stringify(cursors));
+    assert.equal((await parseRolloutIncremental({ rolloutFiles, cursors: restored, queuePath })).bucketsQueued, 0);
+    assert.equal((await parseVsCodeCopilotChatIncremental({ sessionPaths: [sessionPath], cursors: restored, queuePath })).bucketsQueued, 0);
+  } finally { await fs.rm(tmp, { recursive: true, force: true }); }
+});
 
 test('VS Code aggregate input survives parser, real pricing and local API without claiming a full cost', async (t) => {
   const tmp = await fs.mkdtemp(path.join(os.tmpdir(), 'tt-vscode-accounting-'));

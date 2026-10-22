@@ -6,7 +6,8 @@ import {
   waitFor,
 } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { useCloudAccount } from "./use-cloud-billing.js";
+import { useCloudAccount, useCloudCatalog } from "./use-cloud-billing.js";
+import { writeCloudCatalogCache, clearCloudCatalogCache, readCloudCatalogCache } from "../lib/cloud-catalog-cache.js";
 
 const mocks = vi.hoisted(() => ({
   auth: { signedIn: true, user: { id: "account-1" }, getAccessToken: vi.fn() },
@@ -17,12 +18,19 @@ vi.mock("../contexts/InsforgeAuthContext.jsx", () => ({
   useInsforgeAuth: () => mocks.auth,
 }));
 vi.mock("../lib/cloud-billing", () => ({ cloudBillingRequest: mocks.request }));
+vi.mock("../lib/cloud-prompt-policy.js", async (importOriginal) => {
+  const actual = await importOriginal();
+  return { ...actual };
+});
 vi.mock("../lib/insforge-config", () => ({
   getInsforgeInstanceFingerprint: () => mocks.backend,
+  getInsforgeRemoteUrl: () => "https://cache.example",
   INSFORGE_INSTANCE_CHANGED_EVENT: "tt.insforgeInstanceChanged",
 }));
 
 beforeEach(() => {
+  sessionStorage.clear();
+  clearCloudCatalogCache();
   mocks.auth.signedIn = true;
   mocks.auth.user = { id: "account-1" };
   mocks.auth.getAccessToken = vi.fn();
@@ -231,3 +239,58 @@ describe("Cloud account refresh", () => {
     expect(mocks.request).toHaveBeenCalledTimes(2);
   });
 });
+
+
+describe("Cloud catalog cache", () => {
+  const catalog = {
+    environment: "live",
+    policy: { phase: "active", launch_at: "2000-01-01", hosting_mode: "hosted" },
+    prices: [{ sku: "cloud_usd_yearly", currency: "USD", amount_cents: 3999, term_months: 12, billing_mode: "recurring" }],
+    providers: { waffo: true },
+    limits: { trial_days: 7 },
+  };
+
+  it("useCloudCatalog seeds from session cache and keeps it when refresh fails", async () => {
+    writeCloudCatalogCache(catalog);
+    const outage = Object.assign(new Error("offline"), { code: "billing_network_error" });
+    mocks.request.mockRejectedValueOnce(outage);
+    const view = renderHook(() => useCloudCatalog());
+    expect(view.result.current.catalog).toEqual(catalog);
+    expect(view.result.current.loading).toBe(false);
+    await waitFor(() => expect(view.result.current.error?.code).toBe("billing_catalog_unavailable"));
+    expect(view.result.current.catalog).toEqual(catalog);
+  });
+
+  it("writes a successful catalog fetch into session cache", async () => {
+    mocks.request.mockResolvedValue(catalog);
+    const view = renderHook(() => useCloudCatalog());
+    await waitFor(() => expect(view.result.current.catalog).toEqual(catalog));
+    expect(view.result.current.loading).toBe(false);
+    view.unmount();
+    const again = renderHook(() => useCloudCatalog());
+    expect(again.result.current.catalog).toEqual(catalog);
+    expect(again.result.current.loading).toBe(false);
+  });
+
+  it("rejects a delayed catalog from the previous instance", async () => {
+    let resolvePrevious;
+    const previousCatalog = { ...catalog, prices: [{ ...catalog.prices[0], amount_cents: 1111 }] };
+    mocks.request.mockImplementationOnce(
+      () => new Promise((resolve) => { resolvePrevious = resolve; }),
+    ).mockResolvedValue(catalog);
+    const view = renderHook(() => useCloudCatalog());
+    await waitFor(() => expect(mocks.request).toHaveBeenCalledTimes(1));
+    mocks.backend = "other-instance";
+    await act(async () => {
+      window.dispatchEvent(new Event("tt.insforgeInstanceChanged"));
+    });
+    await waitFor(() => expect(mocks.request).toHaveBeenCalledTimes(2));
+    await act(async () => {
+      resolvePrevious(previousCatalog);
+    });
+    await waitFor(() => expect(view.result.current.catalog).toEqual(catalog));
+    expect(view.result.current.catalog.prices[0].amount_cents).toBe(3999);
+    expect(readCloudCatalogCache()).toEqual(catalog);
+  });
+});
+

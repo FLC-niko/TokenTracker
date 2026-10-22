@@ -65,6 +65,16 @@ beforeEach(() => {
 afterEach(() => { cleanup(); vi.restoreAllMocks(); });
 
 describe("Cloud paid-term renewal", () => {
+
+  it("does not append a billing period to a pending price", () => {
+    state.catalogPrices = [];
+    render(<Page />);
+    expect(screen.getByRole("status", { name: copy("cloud.price.waiting") })).toBeInTheDocument();
+    expect(screen.queryByText(copy("cloud.price.pending"))).not.toBeInTheDocument();
+    expect(screen.queryByText(copy("cloud.price.per_year"))).not.toBeInTheDocument();
+    expect(screen.queryByText(copy("cloud.price.per_month"))).not.toBeInTheDocument();
+    expect(screen.getByText(copy("cloud.price.waiting"))).toBeInTheDocument();
+  });
   it("puts device scope first in both comparison columns and keeps all local features in Cloud", () => {
     render(<Page />);
     const localScope = screen.getByText(copy("cloud.free.device_scope"));

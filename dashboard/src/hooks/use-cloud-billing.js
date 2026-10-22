@@ -1,33 +1,60 @@
-import { useCallback, useEffect, useState, useSyncExternalStore } from "react";
+import { useCallback, useEffect, useRef, useState, useSyncExternalStore } from "react";
 import { useInsforgeAuth } from "../contexts/InsforgeAuthContext.jsx";
 import { cloudBillingRequest } from "../lib/cloud-billing";
+import { seedCloudCatalog, writeCloudCatalogCache } from "../lib/cloud-catalog-cache.js";
 import { getInsforgeInstanceFingerprint, INSFORGE_INSTANCE_CHANGED_EVENT } from "../lib/insforge-config";
 
 export function useCloudCatalog() {
-  const [catalog, setCatalog] = useState(null);
-  const [loading, setLoading] = useState(true);
+  const [catalog, setCatalog] = useState(seedCloudCatalog);
+  const [loading, setLoading] = useState(() => seedCloudCatalog() == null);
   const [error, setError] = useState(null);
   const [revision, setRevision] = useState(0);
+  const requestRef = useRef(null);
+  useEffect(() => {
+    const onInstanceChange = () => {
+      // Abort before React re-runs effects so a late A response cannot write under B.
+      requestRef.current?.abort();
+      const next = seedCloudCatalog();
+      setCatalog(next);
+      setError(null);
+      setLoading(next == null);
+      setRevision((value) => value + 1);
+    };
+    window.addEventListener(INSFORGE_INSTANCE_CHANGED_EVENT, onInstanceChange);
+    return () => window.removeEventListener(INSFORGE_INSTANCE_CHANGED_EVENT, onInstanceChange);
+  }, []);
   useEffect(() => {
     const controller = new AbortController();
-    setLoading(true);
+    requestRef.current = controller;
+    const requestFingerprint = getInsforgeInstanceFingerprint();
+    const stillCurrent = () =>
+      !controller.signal.aborted && requestFingerprint === getInsforgeInstanceFingerprint();
+    const seeded = seedCloudCatalog();
+    if (seeded) {
+      setCatalog((current) => current || seeded);
+      setLoading(false);
+    } else {
+      setLoading(true);
+    }
     cloudBillingRequest("catalog", { signal: controller.signal })
       .then((value) => {
-        if (!controller.signal.aborted) {
-          setCatalog(value);
-          setError(null);
-        }
+        if (!stillCurrent()) return;
+        setCatalog(value);
+        writeCloudCatalogCache(value, Date.now(), requestFingerprint);
+        setError(null);
       })
       .catch((reason) => {
-        if (!controller.signal.aborted) {
-          setCatalog(null);
-          setError({ ...reason, code: "billing_catalog_unavailable" });
-        }
+        if (!stillCurrent()) return;
+        setError({ ...reason, code: "billing_catalog_unavailable" });
+        setCatalog((current) => current || seedCloudCatalog() || null);
       })
       .finally(() => {
-        if (!controller.signal.aborted) setLoading(false);
+        if (stillCurrent()) setLoading(false);
       });
-    return () => controller.abort();
+    return () => {
+      controller.abort();
+      if (requestRef.current === controller) requestRef.current = null;
+    };
   }, [revision]);
   return {
     catalog,

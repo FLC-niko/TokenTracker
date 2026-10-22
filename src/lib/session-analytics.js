@@ -87,7 +87,9 @@ const {
 // v23 excludes database updates and user records from request durations.
 // v24 keeps OpenCode usage dates at event time and fork history on its ancestor.
 // v25 adds Kimi wire sessions, including official/legacy migration dedup.
-const SIDECAR_VERSION = 25;
+// v26 retains Codex Ultrafast (service_tier ultrafast) subset columns so
+// date-filtered session views and cached sidecars keep the 6x premium.
+const SIDECAR_VERSION = 26;
 const EDIT_TOOLS = new Set([
   "apply_patch",
   "edit",
@@ -141,7 +143,7 @@ function addTotals(target, delta) {
     target[key] = finite(target[key]) + finite(delta?.[key]);
   }
   for (const key of MODEL_USAGE_SUM_FIELDS) {
-    if (!/^(?:long_context_|priority_)|^(?:usage_events|rerouted_usage_events)$/.test(key)) continue;
+    if (!/^(?:long_context_|priority_|ultrafast_)|^(?:usage_events|rerouted_usage_events|long_context_usage_events|priority_usage_events|ultrafast_usage_events)$/.test(key)) continue;
     if (delta?.[key]) target[key] = finite(target[key]) + finite(delta[key]);
   }
 }
@@ -179,10 +181,21 @@ const MODEL_USAGE_SUM_FIELDS = [
   "priority_long_context_cache_creation_input_tokens",
   "priority_long_context_output_tokens",
   "priority_long_context_reasoning_output_tokens",
+  "ultrafast_input_tokens",
+  "ultrafast_cached_input_tokens",
+  "ultrafast_cache_creation_input_tokens",
+  "ultrafast_output_tokens",
+  "ultrafast_reasoning_output_tokens",
+  "ultrafast_long_context_input_tokens",
+  "ultrafast_long_context_cached_input_tokens",
+  "ultrafast_long_context_cache_creation_input_tokens",
+  "ultrafast_long_context_output_tokens",
+  "ultrafast_long_context_reasoning_output_tokens",
   "usage_events",
   "rerouted_usage_events",
   "long_context_usage_events",
   "priority_usage_events",
+  "ultrafast_usage_events",
   // Not a token counter: an edit turn is a turn, and turn_context both marks
   // where a turn begins and names its model, so an edit turn has exactly one
   // owner. Splitting it here keeps by_model.tokens_per_edit a ratio over one

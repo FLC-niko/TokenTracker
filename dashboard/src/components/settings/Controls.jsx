@@ -53,7 +53,7 @@ export function SectionCard({ title, subtitle, action, children }) {
             {title}
           </h2>
           {subtitle ? (
-            <p className="mt-1 truncate text-xs text-oai-gray-500 dark:text-oai-gray-400">
+            <p className="mt-1 text-xs leading-5 text-oai-gray-500 dark:text-oai-gray-400">
               {subtitle}
             </p>
           ) : null}

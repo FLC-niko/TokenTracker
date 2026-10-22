@@ -184,8 +184,20 @@ export function CloudPlanView({ catalogState, accountState, initialSelection, se
             </div>
             <div className="border-b border-oai-gray-200 pb-6 pt-7 dark:border-oai-gray-800" aria-live="polite">
               <p className="flex flex-wrap items-baseline gap-2">
-                <span className="text-3xl font-semibold tracking-tight tabular-nums sm:text-4xl">{price ? formatCloudMoney(price.amount_cents, currency) : copy("cloud.price.pending")}</span>
-                <span className="text-sm text-oai-gray-500 dark:text-oai-gray-400">{copy(term === 12 ? "cloud.price.per_year" : "cloud.price.per_month")}</span>
+                {price ? (
+                  <>
+                    <span className="text-3xl font-semibold tracking-tight tabular-nums sm:text-4xl">{formatCloudMoney(price.amount_cents, currency)}</span>
+                    <span className="text-sm text-oai-gray-500 dark:text-oai-gray-400">{copy(term === 12 ? "cloud.price.per_year" : "cloud.price.per_month")}</span>
+                  </>
+                ) : (
+                  <span
+                    className="inline-flex h-9 min-w-[7.5rem] items-center sm:h-10 sm:min-w-[8.5rem]"
+                    role="status"
+                    aria-label={copy("cloud.price.waiting")}
+                  >
+                    <span className="h-8 w-28 animate-pulse rounded-md bg-oai-gray-200 dark:bg-oai-gray-800 sm:h-9 sm:w-32" aria-hidden />
+                  </span>
+                )}
               </p>
               <p className="mt-3 text-sm leading-6 text-oai-gray-500 dark:text-oai-gray-400">
                 <span>{price ? term === 12

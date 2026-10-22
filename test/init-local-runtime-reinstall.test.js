@@ -27,7 +27,7 @@ function runLocalTracker(trackerBinPath, args, env) {
   });
 }
 
-test("init first sync keeps local data and credentials without uploading when not opted in", async (t) => {
+test("init first sync keeps local data and credentials without uploading when not opted in", { timeout: 300_000 }, async (t) => {
   let uploads = 0;
   const server = http.createServer((_req, res) => {
     uploads += 1;
@@ -73,7 +73,7 @@ test("init first sync keeps local data and credentials without uploading when no
   }
 });
 
-test("init can rerun from installed local runtime without self-deleting app source", async () => {
+test("init can rerun from installed local runtime without self-deleting app source", { timeout: 300_000 }, async () => {
   const tmp = await fs.mkdtemp(path.join(os.tmpdir(), "tokentracker-init-local-runtime-"));
   const env = {
     ...process.env,
@@ -118,7 +118,7 @@ test("init can rerun from installed local runtime without self-deleting app sour
   }
 });
 
-test("installLocalTrackerApp replaces stale installed runtime and writes a package marker", async () => {
+test("installLocalTrackerApp replaces stale installed runtime and writes a package marker", { timeout: 300_000 }, async () => {
   const tmp = await fs.mkdtemp(path.join(os.tmpdir(), "tokentracker-runtime-refresh-"));
   try {
     const appDir = path.join(tmp, "app");
